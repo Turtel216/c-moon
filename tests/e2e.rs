@@ -392,3 +392,51 @@ fn test_complex_expression_with_opt() {
     ";
     run_e2e_test_with_opt("test_not_equal_with_opt", code, 12);
 }
+
+#[test]
+fn test_array_basic() {
+    let code = "
+        int main() {
+            int arr[3];
+            int i = 1;
+            arr[0] = 10;
+            arr[i] = 20;
+            int x = arr[0] + arr[1];
+            return x;
+        }
+    ";
+    run_e2e_test("test_array_basic", code, 30);
+}
+
+#[test]
+fn test_array_basic_with_opt() {
+    let code = "
+        int main() {
+            int arr[3];
+            int i = 1;
+            arr[0] = 10;
+            arr[i] = 20;
+            int x = arr[0] + arr[1];
+            return x;
+        }
+    ";
+    run_e2e_test_with_opt("test_array_basic_with_opt", code, 30);
+}
+
+#[test]
+fn test_array_loop_sum() {
+    let code = "
+        int main() {
+            int arr[5];
+            int i = 0;
+            while (i < 5) {
+                arr[i] = i + 1;
+                i = i + 1;
+            }
+            int sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4];
+            return sum;
+        }
+    ";
+    // sum = 1 + 2 + 3 + 4 + 5 = 15
+    run_e2e_test("test_array_loop_sum", code, 15);
+}
