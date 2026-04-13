@@ -170,6 +170,8 @@ impl std::error::Error for SemanticError {}
 pub enum Type {
     Int,
     Void,
+    /// A fixed-size array of a primitive type, e.g. `int arr[3]` → `Array(Int, 3)`.
+    Array(Box<Type>, usize),
 }
 
 impl fmt::Display for Type {
@@ -177,6 +179,7 @@ impl fmt::Display for Type {
         match self {
             Type::Int => write!(f, "int"),
             Type::Void => write!(f, "void"),
+            Type::Array(elem, size) => write!(f, "{}[{}]", elem, size),
         }
     }
 }
@@ -191,6 +194,10 @@ fn ctype_to_type(ty: &CType, span: Span, context: &'static str) -> SemanticResul
     match ty {
         CType::Int => Ok(Type::Int),
         CType::Void => Ok(Type::Void),
+        CType::Array(elem_ctype, Some(size)) => {
+            let elem_ty = ctype_to_type(elem_ctype, span, context)?;
+            Ok(Type::Array(Box::new(elem_ty), *size))
+        }
         _ => Err(SemanticError::UnsupportedType {
             ty: ty.clone(),
             span,
@@ -337,7 +344,15 @@ impl SemanticAnalyzer {
                     });
                 }
 
+                // Array declarations have no scalar initializer.
                 if let Some(init) = initializer {
+                    if matches!(var_ty, Type::Array(_, _)) {
+                        return Err(SemanticError::UnsupportedType {
+                            ty: ty.clone(),
+                            span: decl.span,
+                            context: "array initializer lists are not yet supported",
+                        });
+                    }
                     let init_ty = self.analyze_expr(init)?;
                     self.expect_type(&var_ty, &init_ty, init.span, "initializer")?;
                 }
@@ -500,8 +515,28 @@ impl SemanticAnalyzer {
 
             ExprKind::Call { callee, args } => self.analyze_call(callee, args, expr.span),
 
+            ExprKind::Index { array, index } => {
+                let base_ty = self.analyze_expr(array)?;
+                // The base must be an array type; extract its element type.
+                let elem_ty = match base_ty {
+                    Type::Array(elem, _) => *elem,
+                    _ => {
+                        return Err(SemanticError::TypeError {
+                            expected: Type::Array(Box::new(Type::Int), 0),
+                            found: base_ty,
+                            span: array.span,
+                            context: "subscript operator requires an array type",
+                        });
+                    }
+                };
+                // The index must be an integer.
+                let idx_ty = self.analyze_expr(index)?;
+                self.expect_type(&Type::Int, &idx_ty, index.span, "array index")?;
+                Ok(elem_ty)
+            }
+
             // Out of current language scope: reject with clear unsupported diagnostics.
-            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::SizeOf(_) => {
+            ExprKind::MemberAccess { .. } | ExprKind::SizeOf(_) => {
                 Err(SemanticError::UnsupportedType {
                     ty: CType::Int,
                     span: expr.span,
@@ -618,7 +653,7 @@ impl SemanticAnalyzer {
     }
 
     fn is_assignable(expr: &Expr) -> bool {
-        matches!(expr.kind, ExprKind::Identifier(_))
+        matches!(expr.kind, ExprKind::Identifier(_) | ExprKind::Index { .. })
     }
 }
 
