@@ -65,6 +65,14 @@ pub enum Opcode {
     Ret,
     /// Get incoming parameter at index e.g. dest = get_param 0
     GetParam,
+
+    /// Store a value into an array element.
+    /// dest = base array var, arg1 = index, arg2 = value
+    ArrayStore,
+
+    /// Load a value from an array element.
+    /// dest = destination, arg1 = base array var, arg2 = index
+    ArrayLoad,
 }
 
 /// TAC Instruction representation
@@ -746,5 +754,6 @@ fn has_side_effects(opcode: &Opcode) -> bool {
             | Opcode::Call
             | Opcode::Param
             | Opcode::Ret
+            | Opcode::ArrayStore
     )
 }
