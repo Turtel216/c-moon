@@ -20,10 +20,9 @@ impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Operand::Var(name) => write!(f, "%r{}", name),
-            // Prefix temps with '%' to easily distinguish them from source variables
             Operand::Temp(name) => write!(f, "%{}", name),
             Operand::ImmInt(val) => write!(f, "{}", val),
-            // Prefix labels with '.' (standard assembly convention)
+            // Prefix labels with '.'
             Operand::Label(name) => write!(f, ".{}", name),
         }
     }
@@ -51,6 +50,8 @@ impl fmt::Display for Opcode {
             Opcode::Param => "param",
             Opcode::Ret => "ret",
             Opcode::GetParam => "get_param",
+            Opcode::ArrayStore => "array_store",
+            Opcode::ArrayLoad => "array_load",
         };
         write!(f, "{}", op_str)
     }
@@ -116,6 +117,28 @@ impl fmt::Display for TACInstruction {
                     f,
                     "{} {} goto {}",
                     self.opcode,
+                    format_op(&self.arg1),
+                    format_op(&self.arg2)
+                )
+            }
+
+            // Array operations
+            Opcode::ArrayStore => {
+                // array_store base[index] = value
+                write!(
+                    f,
+                    "array_store {}[{}] = {}",
+                    format_op(&self.dest),
+                    format_op(&self.arg1),
+                    format_op(&self.arg2)
+                )
+            }
+            Opcode::ArrayLoad => {
+                // dest = array_load base[index]
+                write!(
+                    f,
+                    "{} = array_load {}[{}]",
+                    format_op(&self.dest),
                     format_op(&self.arg1),
                     format_op(&self.arg2)
                 )

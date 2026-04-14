@@ -8,6 +8,7 @@
 //!   - Unreachable code elimination
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use crate::frontend::ast::{
     BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, Stmt, StmtKind,
@@ -20,12 +21,16 @@ use crate::middle::ir::*;
 pub struct ProgramIr {
     /// Program Functions
     pub functions: BTreeMap<String, CFG>,
+    /// Maps variable id → array element count for each local array.
+    /// Used by the backend to allocate stack space.
+    pub array_sizes: HashMap<usize, usize>,
 }
 
 impl ProgramIr {
     pub fn new() -> Self {
         Self {
             functions: BTreeMap::new(),
+            array_sizes: HashMap::new(),
         }
     }
 
@@ -54,6 +59,8 @@ pub struct LoweringContext<'a> {
     current_block: String,
     temp_counter: usize,
     label_counter: usize,
+    /// Tracks local array sizes: var_id → element count.
+    array_sizes: HashMap<usize, usize>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -65,6 +72,7 @@ impl<'a> LoweringContext<'a> {
             current_block: String::new(),
             temp_counter: 0,
             label_counter: 0,
+            array_sizes: HashMap::new(),
         }
     }
 
@@ -140,6 +148,11 @@ impl<'a> LoweringContext<'a> {
             self.program
                 .functions
                 .insert(name.to_string(), finished_cfg);
+        }
+
+        // Transfer array size metadata to ProgramIr
+        for (var_id, size) in &self.array_sizes {
+            self.program.array_sizes.insert(*var_id, *size);
         }
     }
 
@@ -301,18 +314,27 @@ impl<'a> LoweringContext<'a> {
                     match item {
                         BlockItem::Stmt(s) => self.lower_statement(s),
                         BlockItem::Decl(d) => {
-                            // Minimal handling for variable decl initializer in this phase.
+                            let stmt_id = self
+                                .res_map
+                                .decl_to_var
+                                .get(&d.id)
+                                .expect("Compiler Bug: Renamer failed to map declaration");
+
                             if let DeclKind::Variable {
+                                ty: crate::frontend::ast::CType::Array(_, Some(size)),
+                                ..
+                            } = &d.kind
+                            {
+                                // Record the array size for backend stack allocation.
+                                // No TAC instructions needed — the array lives
+                                // entirely on the stack.
+                                self.array_sizes.insert(*stmt_id, *size);
+                            } else if let DeclKind::Variable {
                                 initializer: Some(init),
                                 ..
                             } = &d.kind
                             {
-                                let stmt_id = self
-                                    .res_map
-                                    .decl_to_var
-                                    .get(&d.id)
-                                    .expect("Compiler Bug: Renamer failed to map declaration");
-
+                                // Scalar variable with initializer.
                                 let rhs = self.lower_expression(init);
                                 self.emit(TACInstruction::new(
                                     Opcode::Mov,
@@ -321,6 +343,7 @@ impl<'a> LoweringContext<'a> {
                                     None,
                                 ));
                             }
+                            // Scalar variable without initializer — no code needed.
                         }
                     }
                 }
@@ -344,8 +367,10 @@ impl<'a> LoweringContext<'a> {
                 self.set_current_block(dead_block);
             }
 
-            // Not in current scope; no-op for now
-            StmtKind::For { .. } => {}
+            // Not in current scope;
+            StmtKind::For { .. } => {
+                todo!("For loops are not implemented yet")
+            }
         }
     }
 
@@ -360,6 +385,32 @@ impl<'a> LoweringContext<'a> {
                     .get(&expr.id)
                     .expect("Compiler Bug: Renamer failed to map lhs of expression");
                 Operand::Var(*idf_id)
+            }
+
+            // arr[idx] = rhs
+            ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
+                if matches!(lhs.kind, ExprKind::Index { .. }) =>
+            {
+                let rhs_op = self.lower_expression(rhs);
+
+                // Extract the array base variable and index from the LHS.
+                let (array_base, index_expr) = match &lhs.kind {
+                    ExprKind::Index { array, index } => (array, index),
+                    _ => unreachable!(),
+                };
+
+                let base_var = self.lower_expression(array_base);
+                let idx_op = self.lower_expression(index_expr);
+
+                // ArrayStore: dest=base_var, arg1=index, arg2=value
+                self.emit(TACInstruction::new(
+                    Opcode::ArrayStore,
+                    Some(base_var.clone()),
+                    Some(idx_op),
+                    Some(rhs_op.clone()),
+                ));
+
+                rhs_op
             }
 
             // x = rhs
@@ -441,6 +492,23 @@ impl<'a> LoweringContext<'a> {
                 ));
 
                 ret_temp
+            }
+
+            // arr[idx] — rvalue array element access
+            ExprKind::Index { array, index } => {
+                let base_var = self.lower_expression(array);
+                let idx_op = self.lower_expression(index);
+                let dest = self.fresh_temp();
+
+                // ArrayLoad: dest = base_var[idx_op]
+                self.emit(TACInstruction::new(
+                    Opcode::ArrayLoad,
+                    Some(dest.clone()),
+                    Some(base_var),
+                    Some(idx_op),
+                ));
+
+                dest
             }
 
             _ => panic!("Expr {:?} not supported in this lowering phase", expr.kind),
