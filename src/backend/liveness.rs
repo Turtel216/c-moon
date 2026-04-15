@@ -194,6 +194,40 @@ pub fn instruction_uses(instr: &TACInstruction) -> Vec<VirtualReg> {
         }
         // GetParam: arg1 is an immediate index — no vreg use
         Opcode::GetParam => {}
+
+        // ArrayStore: reads base (dest field), index (arg1), and value (arg2).
+        // Note: dest is used as the *base address*, not a true definition.
+        Opcode::ArrayStore => {
+            if let Some(ref op) = instr.dest {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+            if let Some(ref op) = instr.arg1 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+            if let Some(ref op) = instr.arg2 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+        }
+
+        // ArrayLoad: reads base (arg1) and index (arg2).
+        Opcode::ArrayLoad => {
+            if let Some(ref op) = instr.arg1 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+            if let Some(ref op) = instr.arg2 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+        }
     }
 
     uses
@@ -214,8 +248,17 @@ pub fn instruction_def(instr: &TACInstruction) -> Option<VirtualReg> {
         | Opcode::Gte
         | Opcode::Mov
         | Opcode::Call
-        | Opcode::GetParam => instr.dest.as_ref().and_then(operand_to_vreg),
-        Opcode::Jump | Opcode::BranchIf | Opcode::BranchIfNot | Opcode::Param | Opcode::Ret => None,
+        | Opcode::GetParam
+        | Opcode::ArrayLoad => instr.dest.as_ref().and_then(operand_to_vreg),
+
+        // ArrayStore does NOT define its dest — dest holds the base array
+        // variable which is read, not written.
+        Opcode::Jump
+        | Opcode::BranchIf
+        | Opcode::BranchIfNot
+        | Opcode::Param
+        | Opcode::Ret
+        | Opcode::ArrayStore => None,
     }
 }
 

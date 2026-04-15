@@ -21,7 +21,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 - [x] **Semantic Analysis:** Symbol table generation, variable scoping, and basic type checking.
 - [x] **Renamer:** Name resolution (Scope Renamer) pass.
 
-**Phase 2: The Middle-End (In progress)**
+**Phase 2: The Middle-End (Done)**
 - [x] **IR Generation:** Lowering the AST into Three-Address Code (TAC).
 - [x] **Control Flow Graph (CFG):** Building basic blocks for optimization analysis.
 - [x] **Optimization - Constant Folding:** Evaluating static expressions at compile time.
@@ -36,11 +36,17 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 - [x] **Code Emission:** Generating valid `.s` files assembled via GCC.
 
 **Phase 4: Support more C language features (In Progress)**
+- [ ] Preprocessor macros
+- [x] Static sized arrays
+- [ ] Pointers
+- [ ] `char` data type
+- [ ] `strings`
+- [ ] `extern` keyword and linking to GCC compiled C programs and standard library
 
 ## Supported Language Subset (Target)
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
-* **Data Types:** `int`
+* **Data Types:** `int`, `int[size]`;
 * **Control Flow:** `if` / `else`, `while` loops, `return`
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
 * **Functions:** Declarations, definitions, and calls with arguments.

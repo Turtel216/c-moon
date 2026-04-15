@@ -10,6 +10,8 @@
 //! - Callee-saved: RBX, R12–R15
 //! - 16-byte stack alignment before every `call`
 
+use std::collections::HashMap;
+
 use crate::backend::liveness::operand_to_vreg;
 use crate::backend::regalloc::AllocationResult;
 use crate::backend::x86::*;
@@ -43,6 +45,9 @@ pub struct LoweringContext {
     epilogue_label: String,
     /// Buffered Param operands for the next Call instruction.
     param_buffer: Vec<Operand>,
+    /// Maps array variable id → RBP offset of element[0].
+    /// element[i] is at `[rbp + offset - i*8]` (stack grows downward).
+    array_offsets: HashMap<usize, i32>,
 }
 
 impl LoweringContext {
@@ -51,10 +56,38 @@ impl LoweringContext {
         name: &str,
         instructions: &[(TACInstruction, String)],
         block_order: &[String],
-        alloc: AllocationResult,
+        mut alloc: AllocationResult,
+        array_sizes: &HashMap<usize, usize>,
     ) -> X86Function {
         let epilogue_label = format!(".{}_epilogue", name);
         let num_callee_pushes = alloc.callee_saved_used.len();
+
+        // Pre-allocate contiguous stack slots for each local array
+        //
+        // Arrays live below the scalar spill area.  For each array of
+        // `n` elements reserve `n * 8` bytes.  The element at index 0
+        // is stored at the *highest* address (closest to RBP) so that
+        // increasing indices move toward lower addresses, consistent
+        // with the downward-growing stack.
+        //
+        // Stack layout (relative to RBP, growing downward):
+        //   [rbp - 8*1 .. rbp - 8*C]   callee-saved registers (C pushes)
+        //   [rbp - 8*(C+1) .. ...]      scalar spill slots
+        //   [rbp - 8*(C+S+1) .. ...]    array storage  <-- NEW
+        //
+        let mut array_offsets: HashMap<usize, i32> = HashMap::new();
+        let mut extra_slots: usize = 0;
+
+        for (var_id, elem_count) in array_sizes {
+            // element[0] offset = -(callee_pushes + existing_spill + extra_so_far + 1) * 8
+            let elem0_slot = alloc.stack_slots + extra_slots + 1;
+            let elem0_offset = -((num_callee_pushes as i32) * 8 + (elem0_slot as i32) * 8);
+            array_offsets.insert(*var_id, elem0_offset);
+            extra_slots += *elem_count;
+        }
+
+        // Grow the total stack_slots so the prologue allocates enough space.
+        alloc.stack_slots += extra_slots;
 
         let mut ctx = LoweringContext {
             out: Vec::new(),
@@ -62,6 +95,7 @@ impl LoweringContext {
             num_callee_pushes,
             epilogue_label,
             param_buffer: Vec::new(),
+            array_offsets,
         };
 
         ctx.emit_prologue();
@@ -190,6 +224,9 @@ impl LoweringContext {
             Opcode::Call => self.lower_call(instr),
             Opcode::Ret => self.lower_ret(instr),
             Opcode::GetParam => self.lower_get_param(instr),
+
+            Opcode::ArrayStore => self.lower_array_store(instr),
+            Opcode::ArrayLoad => self.lower_array_load(instr),
         }
     }
 
@@ -504,6 +541,131 @@ impl LoweringContext {
                 X86Operand::Reg(scratch)
             }
         }
+    }
+
+    // ### Array instruction lowering ###
+
+    /// Lower `ArrayStore base_var, index, value`.
+    ///
+    /// Generates x86 that computes the element address and stores into it:
+    ///
+    /// ```text
+    ///   ; element_addr = rbp + base_offset - index * 8
+    ///   ;   base_offset is the RBP offset of element[0] (negative)
+    ///   ;   Subtracting index*8 moves to lower addresses for higher indices,
+    ///   ;   consistent with downward stack growth.
+    ///
+    ///   mov  SCRATCH1, <index>       ; load the index into a register
+    ///   imul SCRATCH1, SCRATCH1, 8   ; byte offset = index * sizeof(int64)
+    ///   lea  SCRATCH2, [rbp + base_offset]  ; address of element[0]
+    ///   sub  SCRATCH2, SCRATCH1      ; address of element[index]
+    ///   mov  SCRATCH1, <value>       ; load the value to store
+    ///   mov  [SCRATCH2], SCRATCH1    ; store value into the array slot
+    /// ```
+    fn lower_array_store(&mut self, instr: &TACInstruction) {
+        // dest = base array var, arg1 = index, arg2 = value
+        let base = instr.dest.as_ref().unwrap();
+        let index = instr.arg1.as_ref().unwrap();
+        let value = instr.arg2.as_ref().unwrap();
+
+        // Look up the RBP offset for element[0] of this array.
+        let var_id = match base {
+            Operand::Var(id) => *id,
+            _ => panic!("ArrayStore base must be a Var"),
+        };
+        let base_offset = *self
+            .array_offsets
+            .get(&var_id)
+            .expect("Compiler Bug: array base variable has no allocated stack offset");
+
+        // Compute byte offset = index * 8
+        let idx_op = self.resolve(index, SCRATCH1);
+        if idx_op != X86Operand::Reg(SCRATCH1) {
+            self.emit(X86Instruction::Mov(X86Operand::Reg(SCRATCH1), idx_op));
+        }
+        // SCRATCH1 = index * 8  (each element is 8 bytes wide)
+        self.emit(X86Instruction::Imul(
+            X86Operand::Reg(SCRATCH1),
+            X86Operand::Imm(8),
+        ));
+
+        // Compute element address
+        //   lea SCRATCH2, [rbp + base_offset]  — address of arr[0]
+        self.emit(X86Instruction::Lea(
+            X86Operand::Reg(SCRATCH2),
+            X86Operand::Mem(X86Register::Rbp, base_offset),
+        ));
+        // sub SCRATCH2, SCRATCH1  — arr[0] - index*8 = addr of arr[index]
+        self.emit(X86Instruction::Sub(
+            X86Operand::Reg(SCRATCH2),
+            X86Operand::Reg(SCRATCH1),
+        ));
+
+        // Store the value
+        let val_op = self.resolve(value, SCRATCH1);
+        let val_op = self.ensure_reg(val_op, SCRATCH1);
+        //   mov [SCRATCH2], value_reg  — write value into computed array slot
+        self.emit(X86Instruction::Mov(X86Operand::Mem(SCRATCH2, 0), val_op));
+    }
+
+    /// Lower `ArrayLoad dest, base_var, index`.
+    ///
+    /// Generates x86 that computes the element address and loads from it:
+    ///
+    /// ```text
+    ///   ; Same addressing math as ArrayStore:
+    ///   ;   element_addr = rbp + base_offset - index * 8
+    ///
+    ///   mov  SCRATCH1, <index>
+    ///   imul SCRATCH1, SCRATCH1, 8
+    ///   lea  SCRATCH2, [rbp + base_offset]
+    ///   sub  SCRATCH2, SCRATCH1
+    ///   mov  <dest_reg>, [SCRATCH2]  ; load the array element
+    /// ```
+    fn lower_array_load(&mut self, instr: &TACInstruction) {
+        // dest = destination, arg1 = base array var, arg2 = index
+        let dest = instr.dest.as_ref().unwrap();
+        let base = instr.arg1.as_ref().unwrap();
+        let index = instr.arg2.as_ref().unwrap();
+
+        // Look up the RBP offset for element[0].
+        let var_id = match base {
+            Operand::Var(id) => *id,
+            _ => panic!("ArrayLoad base must be a Var"),
+        };
+        let base_offset = *self
+            .array_offsets
+            .get(&var_id)
+            .expect("Compiler Bug: array base variable has no allocated stack offset");
+
+        // byte offset = index * 8
+        let idx_op = self.resolve(index, SCRATCH1);
+        if idx_op != X86Operand::Reg(SCRATCH1) {
+            self.emit(X86Instruction::Mov(X86Operand::Reg(SCRATCH1), idx_op));
+        }
+        self.emit(X86Instruction::Imul(
+            X86Operand::Reg(SCRATCH1),
+            X86Operand::Imm(8),
+        ));
+
+        //  element address = base_of_arr[0] - byte_offset
+        self.emit(X86Instruction::Lea(
+            X86Operand::Reg(SCRATCH2),
+            X86Operand::Mem(X86Register::Rbp, base_offset),
+        ));
+        self.emit(X86Instruction::Sub(
+            X86Operand::Reg(SCRATCH2),
+            X86Operand::Reg(SCRATCH1),
+        ));
+
+        // load the value from the computed address into dest.
+        let dest_reg = self.dest_reg(dest);
+        self.emit(X86Instruction::Mov(
+            X86Operand::Reg(dest_reg),
+            X86Operand::Mem(SCRATCH2, 0),
+        ));
+
+        self.store_if_spilled(dest, dest_reg);
     }
 }
 

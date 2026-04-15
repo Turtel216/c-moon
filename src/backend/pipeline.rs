@@ -29,8 +29,13 @@ pub fn compile_program(ir: &ProgramIr) -> X86Program {
         let alloc = linear_scan(&intervals);
 
         // Instruction selection
-        let x86_fn =
-            LoweringContext::lower_function(name, &linear.instructions, &linear.block_order, alloc);
+        let x86_fn = LoweringContext::lower_function(
+            name,
+            &linear.instructions,
+            &linear.block_order,
+            alloc,
+            &ir.array_sizes,
+        );
 
         functions.push(x86_fn);
     }

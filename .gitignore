@@ -1,2 +1,6 @@
 /target
+
+# Common file names used for testing
 output
+test.c
+output.s
