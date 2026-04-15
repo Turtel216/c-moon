@@ -440,3 +440,55 @@ fn test_array_loop_sum() {
     // sum = 1 + 2 + 3 + 4 + 5 = 15
     run_e2e_test("test_array_loop_sum", code, 15);
 }
+
+#[test]
+fn test_array_loop_sum_with_opt() {
+    let code = "
+        int main() {
+            int arr[5];
+            int i = 0;
+            while (i < 5) {
+                arr[i] = i + 1;
+                i = i + 1;
+            }
+            int sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4];
+            return sum;
+        }
+    ";
+    // sum = 1 + 2 + 3 + 4 + 5 = 15
+    run_e2e_test_with_opt("test_array_loop_sum_with_opt", code, 15);
+}
+
+#[test]
+fn test_function_call() {
+    let code = "
+        int add(int a, int b) {
+          return a + b;
+        }
+
+        int main() {
+          int a = 1;
+          int b = 1;
+
+          return add(a, b);
+        }
+    ";
+    run_e2e_test("test_function_call", code, 2);
+}
+
+#[test]
+fn test_function_call_with_opt() {
+    let code = "
+        int add(int a, int b) {
+          return a + b;
+        }
+
+        int main() {
+          int a = 1;
+          int b = 1;
+
+          return add(a, b);
+        }
+    ";
+    run_e2e_test_with_opt("test_function_call_with_opt", code, 2);
+}
