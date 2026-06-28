@@ -477,6 +477,24 @@ fn test_function_call() {
 }
 
 #[test]
+fn test_diagraphs() {
+    let code = "
+        int main() {
+        int arr<:3:>;
+        int i = 0;
+        while (i < 3) <%
+            arr<:i:> = i;
+            i = i + 1;
+        %>
+
+        return arr<:2:>;
+        }
+    ";
+
+    run_e2e_test("test_diagraphs", code, 2);
+}
+
+#[test]
 fn test_function_call_with_opt() {
     let code = "
         int add(int a, int b) {
@@ -491,4 +509,60 @@ fn test_function_call_with_opt() {
         }
     ";
     run_e2e_test_with_opt("test_function_call_with_opt", code, 2);
+}
+
+#[test]
+fn test_marco_object() {
+    let code = "
+        #define x 5
+        int main() {
+          int a = x;
+          int b = x;
+
+          return a + b + x;
+        }
+    ";
+    run_e2e_test("test_macro_object", code, 15);
+}
+
+#[test]
+fn test_marco_object_with_opt() {
+    let code = "
+        #define x 5
+        int main() {
+          int a = x;
+          int b = x;
+
+          return a + b + x;
+        }
+    ";
+    run_e2e_test_with_opt("test_macro_object_with_opt", code, 15);
+}
+
+#[test]
+fn test_marco_function() {
+    let code = "
+        #define ADD(a, b) (a + b)
+        int main() {
+          int a = 1;
+          int b = 1;
+
+          return ADD(a, b);
+        }
+    ";
+    run_e2e_test("test_macro_function", code, 2);
+}
+
+#[test]
+fn test_marco_function_with_opt() {
+    let code = "
+        #define ADD(a, b) (a + b)
+        int main() {
+          int a = 1;
+          int b = 1;
+
+          return ADD(a, b);
+        }
+    ";
+    run_e2e_test_with_opt("test_macro_function_with_opt", code, 2);
 }

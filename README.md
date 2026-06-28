@@ -36,7 +36,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 - [x] **Code Emission:** Generating valid `.s` files assembled via GCC.
 
 **Phase 4: Support more C language features (In Progress)**
-- [ ] Preprocessor macros
+- [x] Preprocessor macros (Partially)
 - [x] Static sized arrays
 - [ ] Pointers
 - [ ] `char` data type
@@ -50,6 +50,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 * **Control Flow:** `if` / `else`, `while` loops, `return`
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
 * **Functions:** Declarations, definitions, and calls with arguments.
+* **Preprocessor macros** object like macros such as ``#define X 5`` and simple non-recursive function like macros.
 
 ## Getting Started
 
