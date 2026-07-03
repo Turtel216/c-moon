@@ -130,8 +130,9 @@ impl fmt::Display for CType {
         match self {
             CType::Int => write!(f, "int"),
             CType::Void => write!(f, "void"),
+            CType::Pointer(inner) => write!(f, "{}*", inner),
             _ => todo!("Other types not supported yet"),
-        } // TODO: implement missing types
+        }
     }
 }
 

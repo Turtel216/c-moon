@@ -170,8 +170,10 @@ impl std::error::Error for SemanticError {}
 pub enum Type {
     Int,
     Void,
-    /// A fixed-size array of a primitive type, e.g. `int arr[3]` → `Array(Int, 3)`.
+    /// A fixed-size array of a primitive type, e.g. `int arr[3]` -> `Array(Int, 3)`.
     Array(Box<Type>, usize),
+    /// A pointer to another type, e.g. `int *p` -> `Pointer(Int)`.
+    Pointer(Box<Type>),
 }
 
 impl fmt::Display for Type {
@@ -180,6 +182,7 @@ impl fmt::Display for Type {
             Type::Int => write!(f, "int"),
             Type::Void => write!(f, "void"),
             Type::Array(elem, size) => write!(f, "{}[{}]", elem, size),
+            Type::Pointer(inner) => write!(f, "{}*", inner),
         }
     }
 }
@@ -197,6 +200,10 @@ fn ctype_to_type(ty: &CType, span: Span, context: &'static str) -> SemanticResul
         CType::Array(elem_ctype, Some(size)) => {
             let elem_ty = ctype_to_type(elem_ctype, span, context)?;
             Ok(Type::Array(Box::new(elem_ty), *size))
+        }
+        CType::Pointer(inner_ctype) => {
+            let inner_ty = ctype_to_type(inner_ctype, span, context)?;
+            Ok(Type::Pointer(Box::new(inner_ty)))
         }
         _ => Err(SemanticError::UnsupportedType {
             ty: ty.clone(),
@@ -625,12 +632,34 @@ impl SemanticAnalyzer {
                 self.expect_type(&Type::Int, &ity, span, "unary operation")?;
                 Ok(Type::Int)
             }
-            UnaryOp::Deref | UnaryOp::AddressOf => Err(SemanticError::UnsupportedType {
-                ty: CType::Pointer(Box::new(CType::Int)),
-                span,
-                context: "pointer unary operation",
-            }),
+            UnaryOp::AddressOf => {
+                // The operand must be an lvalue (addressable).
+                if !Self::is_addressable(inner) {
+                    return Err(SemanticError::InvalidAssignmentTarget { span: inner.span });
+                }
+                Ok(Type::Pointer(Box::new(ity)))
+            }
+            UnaryOp::Deref => {
+                // The operand must be a pointer type.
+                match ity {
+                    Type::Pointer(pointee) => Ok(*pointee),
+                    _ => Err(SemanticError::TypeError {
+                        expected: Type::Pointer(Box::new(Type::Int)),
+                        found: ity,
+                        span,
+                        context: "dereference requires a pointer type",
+                    }),
+                }
+            }
         }
+    }
+
+    /// Check whether an expression can have its address taken.
+    fn is_addressable(expr: &Expr) -> bool {
+        matches!(
+            expr.kind,
+            ExprKind::Identifier(_) | ExprKind::Index { .. } | ExprKind::Unary(UnaryOp::Deref, _)
+        )
     }
 
     fn expect_type(
@@ -641,19 +670,27 @@ impl SemanticAnalyzer {
         context: &'static str,
     ) -> SemanticResult<()> {
         if expected == found {
-            Ok(())
-        } else {
-            Err(SemanticError::TypeError {
-                expected: expected.clone(),
-                found: found.clone(),
-                span,
-                context,
-            })
+            return Ok(());
         }
+        // Allow assigning integer literal 0 (NULL) to any pointer type.
+        if matches!(expected, Type::Pointer(_)) && *found == Type::Int {
+            return Ok(());
+        }
+        Err(SemanticError::TypeError {
+            expected: expected.clone(),
+            found: found.clone(),
+            span,
+            context,
+        })
     }
 
     fn is_assignable(expr: &Expr) -> bool {
-        matches!(expr.kind, ExprKind::Identifier(_) | ExprKind::Index { .. })
+        matches!(
+            expr.kind,
+            ExprKind::Identifier(_)
+                | ExprKind::Index { .. }
+                | ExprKind::Unary(UnaryOp::Deref, _)
+        )
     }
 }
 
