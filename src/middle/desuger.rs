@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::frontend::ast::{
-    BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, Stmt, StmtKind,
+    BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, Stmt, StmtKind, UnaryOp,
 };
 use crate::frontend::renamer::ResolutionMap;
 use crate::middle::ir::*;
@@ -387,6 +387,31 @@ impl<'a> LoweringContext<'a> {
                 Operand::Var(*idf_id)
             }
 
+            // *ptr = rhs (assignment through pointer dereference)
+            ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
+                if matches!(lhs.kind, ExprKind::Unary(UnaryOp::Deref, _)) =>
+            {
+                let rhs_op = self.lower_expression(rhs);
+
+                // Extract the pointer expression from the LHS dereference.
+                let ptr_expr = match &lhs.kind {
+                    ExprKind::Unary(UnaryOp::Deref, inner) => inner,
+                    _ => unreachable!(),
+                };
+
+                let addr_op = self.lower_expression(ptr_expr);
+
+                // Store: *addr_op = rhs_op
+                self.emit(TACInstruction::new(
+                    Opcode::Store,
+                    None,
+                    Some(addr_op),
+                    Some(rhs_op.clone()),
+                ));
+
+                rhs_op
+            }
+
             // arr[idx] = rhs
             ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
                 if matches!(lhs.kind, ExprKind::Index { .. }) =>
@@ -506,6 +531,38 @@ impl<'a> LoweringContext<'a> {
                     Some(dest.clone()),
                     Some(base_var),
                     Some(idx_op),
+                ));
+
+                dest
+            }
+
+            // &x -- address-of
+            ExprKind::Unary(UnaryOp::AddressOf, inner) => {
+                let inner_op = self.lower_expression(inner);
+                let dest = self.fresh_temp();
+
+                // AddrOf: dest = addr_of inner_op
+                self.emit(TACInstruction::new(
+                    Opcode::AddrOf,
+                    Some(dest.clone()),
+                    Some(inner_op),
+                    None,
+                ));
+
+                dest
+            }
+
+            // *p -- rvalue dereference (read through pointer)
+            ExprKind::Unary(UnaryOp::Deref, inner) => {
+                let ptr_op = self.lower_expression(inner);
+                let dest = self.fresh_temp();
+
+                // Load: dest = *ptr_op
+                self.emit(TACInstruction::new(
+                    Opcode::Load,
+                    Some(dest.clone()),
+                    Some(ptr_op),
+                    None,
                 ));
 
                 dest

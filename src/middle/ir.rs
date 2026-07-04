@@ -73,6 +73,13 @@ pub enum Opcode {
     /// Load a value from an array element.
     /// dest = destination, arg1 = base array var, arg2 = index
     ArrayLoad,
+
+    /// Load a value through a pointer: dest = *arg1
+    Load,
+    /// Store a value through a pointer: *arg1 = arg2
+    Store,
+    /// Take address of a variable: dest = addr_of arg1(Var)
+    AddrOf,
 }
 
 /// TAC Instruction representation
@@ -755,5 +762,6 @@ fn has_side_effects(opcode: &Opcode) -> bool {
             | Opcode::Param
             | Opcode::Ret
             | Opcode::ArrayStore
+            | Opcode::Store
     )
 }
