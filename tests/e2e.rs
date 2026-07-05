@@ -566,3 +566,86 @@ fn test_marco_function_with_opt() {
     ";
     run_e2e_test_with_opt("test_macro_function_with_opt", code, 2);
 }
+
+// === Pointer Tests ===
+
+#[test]
+fn test_pointer_basic() {
+    let code = "
+        int main() {
+            int x = 42;
+            int *p = &x;
+            return *p;
+        }
+    ";
+    run_e2e_test("test_pointer_basic", code, 42);
+}
+
+#[test]
+fn test_pointer_write_through() {
+    let code = "
+        int main() {
+            int x = 10;
+            int *p = &x;
+            *p = 55;
+            return x;
+        }
+    ";
+    run_e2e_test("test_pointer_write_through", code, 55);
+}
+
+#[test]
+fn test_pointer_function_param() {
+    let code = "
+        int deref(int *p) {
+            return *p;
+        }
+        int main() {
+            int x = 99;
+            return deref(&x);
+        }
+    ";
+    run_e2e_test("test_pointer_function_param", code, 99);
+}
+
+#[test]
+fn test_pointer_to_pointer() {
+    let code = "
+        int main() {
+            int x = 7;
+            int *p = &x;
+            int **pp = &p;
+            return **pp;
+        }
+    ";
+    run_e2e_test("test_pointer_to_pointer", code, 7);
+}
+
+#[test]
+fn test_pointer_multiple_deref() {
+    let code = "
+        int main() {
+            int a = 30;
+            int b = 12;
+            int *p = &a;
+            int *q = &b;
+            return *p + *q;
+        }
+    ";
+    run_e2e_test("test_pointer_multiple_deref", code, 42);
+}
+
+#[test]
+fn test_pointer_write_via_function() {
+    let code = "
+        void set_val(int *p, int v) {
+            *p = v;
+        }
+        int main() {
+            int x = 0;
+            set_val(&x, 33);
+            return x;
+        }
+    ";
+    run_e2e_test("test_pointer_write_via_function", code, 33);
+}

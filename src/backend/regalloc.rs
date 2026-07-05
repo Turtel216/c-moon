@@ -1,8 +1,7 @@
 //! Linear Scan Register Allocator
 //!
 //! Maps each `VirtualReg` to either a physical x86-64 register or a
-//! stack spill slot.  Implements the classic linear-scan algorithm
-//! from Poletto & Sarkar (1999).
+//! stack spill slot.  Implements the linear-scan algorithm
 //!
 //! ## Register budget
 //!

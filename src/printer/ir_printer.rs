@@ -52,6 +52,9 @@ impl fmt::Display for Opcode {
             Opcode::GetParam => "get_param",
             Opcode::ArrayStore => "array_store",
             Opcode::ArrayLoad => "array_load",
+            Opcode::Load => "load",
+            Opcode::Store => "store",
+            Opcode::AddrOf => "addr_of",
         };
         write!(f, "{}", op_str)
     }
@@ -141,6 +144,35 @@ impl fmt::Display for TACInstruction {
                     format_op(&self.dest),
                     format_op(&self.arg1),
                     format_op(&self.arg2)
+                )
+            }
+
+            // Pointer operations
+            Opcode::Load => {
+                // dest = load addr
+                write!(
+                    f,
+                    "{} = load {}",
+                    format_op(&self.dest),
+                    format_op(&self.arg1)
+                )
+            }
+            Opcode::Store => {
+                // store addr, value
+                write!(
+                    f,
+                    "store {}, {}",
+                    format_op(&self.arg1),
+                    format_op(&self.arg2)
+                )
+            }
+            Opcode::AddrOf => {
+                // dest = addr_of var
+                write!(
+                    f,
+                    "{} = addr_of {}",
+                    format_op(&self.dest),
+                    format_op(&self.arg1)
                 )
             }
         }

@@ -10,7 +10,7 @@
 //! - Callee-saved: RBX, R12–R15
 //! - 16-byte stack alignment before every `call`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::backend::liveness::operand_to_vreg;
 use crate::backend::regalloc::AllocationResult;
@@ -41,13 +41,16 @@ pub struct LoweringContext {
     alloc: AllocationResult,
     /// Number of callee-saved push instructions (for frame offset maths).
     num_callee_pushes: usize,
-    /// Epilogue label — all `ret` TAC instructions jump here.
+    /// Epilogue label -- all `ret` TAC instructions jump here.
     epilogue_label: String,
     /// Buffered Param operands for the next Call instruction.
     param_buffer: Vec<Operand>,
-    /// Maps array variable id → RBP offset of element[0].
+    /// Maps array variable id -> RBP offset of element[0].
     /// element[i] is at `[rbp + offset - i*8]` (stack grows downward).
     array_offsets: HashMap<usize, i32>,
+    /// Maps address-taken variable id -> RBP offset.
+    /// Variables whose address is taken with AddrOf must live on the stack.
+    addr_taken_offsets: HashMap<usize, i32>,
 }
 
 impl LoweringContext {
@@ -58,6 +61,7 @@ impl LoweringContext {
         block_order: &[String],
         mut alloc: AllocationResult,
         array_sizes: &HashMap<usize, usize>,
+        addr_taken_vars: &HashSet<usize>,
     ) -> X86Function {
         let epilogue_label = format!(".{}_epilogue", name);
         let num_callee_pushes = alloc.callee_saved_used.len();
@@ -89,6 +93,21 @@ impl LoweringContext {
         // Grow the total stack_slots so the prologue allocates enough space.
         alloc.stack_slots += extra_slots;
 
+        // Allocate dedicated stack slots for address-taken variables.
+        // These variables must live on the stack so that AddrOf can
+        // compute their address with LEA.
+        let mut addr_taken_offsets: HashMap<usize, i32> = HashMap::new();
+        let mut addr_extra: usize = 0;
+        for var_id in addr_taken_vars {
+            addr_extra += 1;
+            let slot = alloc.stack_slots + addr_extra;
+            let offset = -((num_callee_pushes as i32) * 8 + (slot as i32) * 8);
+            addr_taken_offsets.insert(*var_id, offset);
+        }
+
+        // Update total stack slots to include address-taken vars.
+        alloc.stack_slots += addr_extra;
+
         let mut ctx = LoweringContext {
             out: Vec::new(),
             alloc,
@@ -96,6 +115,7 @@ impl LoweringContext {
             epilogue_label,
             param_buffer: Vec::new(),
             array_offsets,
+            addr_taken_offsets,
         };
 
         ctx.emit_prologue();
@@ -227,6 +247,10 @@ impl LoweringContext {
 
             Opcode::ArrayStore => self.lower_array_store(instr),
             Opcode::ArrayLoad => self.lower_array_load(instr),
+
+            Opcode::Load => self.lower_load(instr),
+            Opcode::Store => self.lower_store(instr),
+            Opcode::AddrOf => self.lower_addr_of(instr),
         }
     }
 
@@ -335,6 +359,8 @@ impl LoweringContext {
         }
 
         self.store_if_spilled(dest, dest_reg);
+        // If dest is an address-taken variable, also write to its stack slot.
+        self.sync_addr_taken_if_needed(dest, dest_reg);
     }
 
     fn lower_jump(&mut self, instr: &TACInstruction) {
@@ -470,6 +496,8 @@ impl LoweringContext {
         }
 
         self.store_if_spilled(dest, dest_reg);
+        // If this param is address-taken, sync to its dedicated slot.
+        self.sync_addr_taken_if_needed(dest, dest_reg);
     }
 
     // ### Helpers ###
@@ -488,6 +516,19 @@ impl LoweringContext {
     /// If the operand is a spilled vreg, a `mov` into `scratch` is emitted
     /// and the scratch register is returned.
     fn resolve(&mut self, op: &Operand, scratch: X86Register) -> X86Operand {
+        // For address-taken variables, always load from their dedicated
+        // stack slot. This ensures pointer writes are visible when reading
+        // the variable by name.
+        if let Operand::Var(id) = op {
+            if let Some(&offset) = self.addr_taken_offsets.get(id) {
+                self.emit(X86Instruction::Mov(
+                    X86Operand::Reg(scratch),
+                    X86Operand::Mem(X86Register::Rbp, offset),
+                ));
+                return X86Operand::Reg(scratch);
+            }
+        }
+
         match op {
             Operand::ImmInt(v) => X86Operand::Imm(*v),
             Operand::Label(l) => X86Operand::Label(l.clone()),
@@ -666,6 +707,110 @@ impl LoweringContext {
         ));
 
         self.store_if_spilled(dest, dest_reg);
+    }
+
+    // ### Pointer instruction lowering ###
+
+    /// Lower `AddrOf dest, var`.
+    ///
+    /// Computes the stack address of the variable and loads it into dest:
+    /// ```text
+    ///   lea dest_reg, [rbp + var_offset]
+    /// ```
+    fn lower_addr_of(&mut self, instr: &TACInstruction) {
+        let dest = instr.dest.as_ref().unwrap();
+        let src = instr.arg1.as_ref().unwrap();
+
+        let var_id = match src {
+            Operand::Var(id) => *id,
+            _ => panic!("AddrOf source must be a Var"),
+        };
+
+        // Look up the dedicated stack offset for this address-taken variable.
+        let var_offset = *self
+            .addr_taken_offsets
+            .get(&var_id)
+            .expect("Compiler Bug: AddrOf on variable without allocated stack slot");
+
+        let dest_reg = self.dest_reg(dest);
+        self.emit(X86Instruction::Lea(
+            X86Operand::Reg(dest_reg),
+            X86Operand::Mem(X86Register::Rbp, var_offset),
+        ));
+
+        self.store_if_spilled(dest, dest_reg);
+    }
+
+    /// Lower `Load dest, ptr_addr`.
+    ///
+    /// Reads a value from the memory address held in ptr_addr:
+    /// ```text
+    ///   mov scratch, ptr_addr    ; get the pointer value into a register
+    ///   mov dest_reg, [scratch]  ; dereference
+    /// ```
+    fn lower_load(&mut self, instr: &TACInstruction) {
+        let dest = instr.dest.as_ref().unwrap();
+        let addr = instr.arg1.as_ref().unwrap();
+
+        // Resolve the pointer address into a register.
+        let addr_op = self.resolve(addr, SCRATCH2);
+        let addr_op = self.ensure_reg(addr_op, SCRATCH2);
+
+        let addr_reg = match addr_op {
+            X86Operand::Reg(r) => r,
+            _ => unreachable!(),
+        };
+
+        // Dereference: dest_reg = [addr_reg]
+        let dest_reg = self.dest_reg(dest);
+        self.emit(X86Instruction::Mov(
+            X86Operand::Reg(dest_reg),
+            X86Operand::Mem(addr_reg, 0),
+        ));
+
+        self.store_if_spilled(dest, dest_reg);
+    }
+
+    /// Lower `Store addr, value`.
+    ///
+    /// Writes a value to the memory address:
+    /// ```text
+    ///   mov scratch2, addr       ; get the pointer into a register
+    ///   mov scratch1, value      ; get the value into a register
+    ///   mov [scratch2], scratch1 ; write through the pointer
+    /// ```
+    fn lower_store(&mut self, instr: &TACInstruction) {
+        let addr = instr.arg1.as_ref().unwrap();
+        let value = instr.arg2.as_ref().unwrap();
+
+        // Resolve the pointer address into SCRATCH2.
+        let addr_op = self.resolve(addr, SCRATCH2);
+        if addr_op != X86Operand::Reg(SCRATCH2) {
+            self.emit(X86Instruction::Mov(X86Operand::Reg(SCRATCH2), addr_op));
+        }
+
+        // Resolve the value into SCRATCH1.
+        let val_op = self.resolve(value, SCRATCH1);
+        let val_op = self.ensure_reg(val_op, SCRATCH1);
+
+        // Write through the pointer: [SCRATCH2] = val_reg
+        self.emit(X86Instruction::Mov(
+            X86Operand::Mem(SCRATCH2, 0),
+            val_op,
+        ));
+    }
+
+    /// When a `Mov` targets an address-taken variable, sync the value to the
+    /// dedicated stack slot so that subsequent `AddrOf` + `Load` can see it.
+    fn sync_addr_taken_if_needed(&mut self, dest: &Operand, value_reg: X86Register) {
+        if let Operand::Var(id) = dest {
+            if let Some(&offset) = self.addr_taken_offsets.get(id) {
+                self.emit(X86Instruction::Mov(
+                    X86Operand::Mem(X86Register::Rbp, offset),
+                    X86Operand::Reg(value_reg),
+                ));
+            }
+        }
     }
 }
 

@@ -8,11 +8,14 @@
 //!
 //! The result is an `X86Program` ready for text emission.
 
+use std::collections::HashSet;
+
 use crate::backend::liveness::{compute_live_intervals, linearize_cfg};
 use crate::backend::lowering::LoweringContext;
 use crate::backend::regalloc::linear_scan;
 use crate::backend::x86::X86Program;
 use crate::middle::desuger::ProgramIr;
+use crate::middle::ir::{Opcode, Operand};
 
 /// Compile an entire IR program to x86-64.
 pub fn compile_program(ir: &ProgramIr) -> X86Program {
@@ -28,6 +31,16 @@ pub fn compile_program(ir: &ProgramIr) -> X86Program {
         // Allocate registers
         let alloc = linear_scan(&intervals);
 
+        // Pre-scan for address-taken variables (those used in AddrOf).
+        let mut addr_taken_vars: HashSet<usize> = HashSet::new();
+        for (instr, _block) in &linear.instructions {
+            if instr.opcode == Opcode::AddrOf {
+                if let Some(Operand::Var(id)) = &instr.arg1 {
+                    addr_taken_vars.insert(*id);
+                }
+            }
+        }
+
         // Instruction selection
         let x86_fn = LoweringContext::lower_function(
             name,
@@ -35,6 +48,7 @@ pub fn compile_program(ir: &ProgramIr) -> X86Program {
             &linear.block_order,
             alloc,
             &ir.array_sizes,
+            &addr_taken_vars,
         );
 
         functions.push(x86_fn);

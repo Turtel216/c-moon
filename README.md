@@ -38,12 +38,12 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 **Phase 4: Support more C language features (In Progress)**
 - [x] Preprocessor macros (Partially)
 - [x] Static sized arrays
-- [ ] Pointers
+- [x] Pointers
 - [ ] `char` data type
 - [ ] `strings`
 - [ ] `extern` keyword and linking to GCC compiled C programs and standard library
 
-## Supported Language Subset (Target)
+## Supported Language Subset
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
 * **Data Types:** `int`, `int[size]`;
@@ -51,6 +51,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros** object like macros such as ``#define X 5`` and simple non-recursive function like macros.
+* **Pointers**: Support for referencing and dereferencing. Does not support pointer arithmetic yet.
 
 ## Getting Started
 

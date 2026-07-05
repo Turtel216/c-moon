@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::middle::ir::{BasicBlock, CFG, Opcode, Operand, TACInstruction};
 
-// ### Virtual Register — unified representation for the backend ###
+// ### Virtual Register - unified representation for the backend ###
 
 /// A unified representation of TAC variables (`Var(usize)`) and temporaries
 /// (`Temp(String)`).  The register allocator and liveness analysis work
@@ -228,6 +228,33 @@ pub fn instruction_uses(instr: &TACInstruction) -> Vec<VirtualReg> {
                 }
             }
         }
+
+        // Load: reads the pointer address (arg1).
+        Opcode::Load => {
+            if let Some(ref op) = instr.arg1 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+        }
+
+        // Store: reads address (arg1) and value (arg2). No def.
+        Opcode::Store => {
+            if let Some(ref op) = instr.arg1 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+            if let Some(ref op) = instr.arg2 {
+                if let Some(v) = operand_to_vreg(op) {
+                    uses.push(v);
+                }
+            }
+        }
+
+        // AddrOf: arg1 is a Var whose address is taken. Its value is not
+        // read, so it is not a use in the dataflow sense.
+        Opcode::AddrOf => {}
     }
 
     uses
@@ -249,16 +276,19 @@ pub fn instruction_def(instr: &TACInstruction) -> Option<VirtualReg> {
         | Opcode::Mov
         | Opcode::Call
         | Opcode::GetParam
-        | Opcode::ArrayLoad => instr.dest.as_ref().and_then(operand_to_vreg),
+        | Opcode::ArrayLoad
+        | Opcode::Load
+        | Opcode::AddrOf => instr.dest.as_ref().and_then(operand_to_vreg),
 
-        // ArrayStore does NOT define its dest — dest holds the base array
-        // variable which is read, not written.
+        // ArrayStore and Store do NOT define their dest -- they write to
+        // memory, not to a register.
         Opcode::Jump
         | Opcode::BranchIf
         | Opcode::BranchIfNot
         | Opcode::Param
         | Opcode::Ret
-        | Opcode::ArrayStore => None,
+        | Opcode::ArrayStore
+        | Opcode::Store => None,
     }
 }
 
