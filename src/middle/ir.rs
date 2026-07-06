@@ -304,13 +304,37 @@ impl BasicBlock {
         let mut changed = false;
         // Tracks variables with known constant integer values
         let mut known_constants: HashMap<Operand, i64> = HashMap::new();
+        // Tracks variables whose address has been taken (they can be
+        // modified indirectly through Store instructions).
+        let mut addr_taken: Vec<Operand> = Vec::new();
 
         for instr in &mut self.instructions {
-            // Replace arguments if they are known constants
-            if let Some(arg1) = &instr.arg1 {
-                if let Some(&val) = known_constants.get(arg1) {
-                    instr.arg1 = Some(Operand::ImmInt(val));
-                    changed = true;
+            // Record variables whose address is taken.
+            if instr.opcode == Opcode::AddrOf {
+                if let Some(ref arg1) = instr.arg1 {
+                    addr_taken.push(arg1.clone());
+                }
+            }
+
+            // When a Store or Call instruction is encountered, any
+            // address-taken variable may have been modified (directly via
+            // Store, or indirectly by a callee receiving a pointer).
+            // Invalidate all of them.
+            if instr.opcode == Opcode::Store || instr.opcode == Opcode::Call {
+                for var in &addr_taken {
+                    known_constants.remove(var);
+                }
+            }
+
+            // Replace arguments if they are known constants.
+            // Skip arg1 for AddrOf: arg1 is the variable whose address is
+            // taken, not a value to propagate.
+            if instr.opcode != Opcode::AddrOf {
+                if let Some(arg1) = &instr.arg1 {
+                    if let Some(&val) = known_constants.get(arg1) {
+                        instr.arg1 = Some(Operand::ImmInt(val));
+                        changed = true;
+                    }
                 }
             }
             if let Some(arg2) = &instr.arg2 {

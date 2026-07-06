@@ -649,3 +649,43 @@ fn test_pointer_write_via_function() {
     ";
     run_e2e_test("test_pointer_write_via_function", code, 33);
 }
+
+#[test]
+fn test_pointer_basic_with_opt() {
+    let code = "
+        int main() {
+            int x = 42;
+            int *p = &x;
+            return *p;
+        }
+    ";
+    run_e2e_test_with_opt("test_pointer_basic_with_opt", code, 42);
+}
+
+#[test]
+fn test_pointer_write_through_with_opt() {
+    let code = "
+        int main() {
+            int x = 10;
+            int *p = &x;
+            *p = 55;
+            return x;
+        }
+    ";
+    run_e2e_test_with_opt("test_pointer_write_through_with_opt", code, 55);
+}
+
+#[test]
+fn test_pointer_write_via_function_with_opt() {
+    let code = "
+        void set_val(int *p, int v) {
+            *p = v;
+        }
+        int main() {
+            int x = 0;
+            set_val(&x, 33);
+            return x;
+        }
+    ";
+    run_e2e_test_with_opt("test_pointer_write_via_function_with_opt", code, 33);
+}

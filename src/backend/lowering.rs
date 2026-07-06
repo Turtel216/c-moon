@@ -794,10 +794,7 @@ impl LoweringContext {
         let val_op = self.ensure_reg(val_op, SCRATCH1);
 
         // Write through the pointer: [SCRATCH2] = val_reg
-        self.emit(X86Instruction::Mov(
-            X86Operand::Mem(SCRATCH2, 0),
-            val_op,
-        ));
+        self.emit(X86Instruction::Mov(X86Operand::Mem(SCRATCH2, 0), val_op));
     }
 
     /// When a `Mov` targets an address-taken variable, sync the value to the
