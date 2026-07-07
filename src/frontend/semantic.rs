@@ -265,6 +265,7 @@ pub struct SemanticAnalyzer {
     symbols: SymbolTable,
     functions: HashMap<String, FunctionSig>,
     current_function_return: Option<Type>,
+    pub errors: Vec<SemanticError>,
 }
 
 impl Default for SemanticAnalyzer {
@@ -281,16 +282,26 @@ impl SemanticAnalyzer {
             symbols,
             functions: HashMap::new(),
             current_function_return: None,
+            errors: Vec::new(),
         }
     }
 
     /// Analyze a translation unit (top-level declarations).
-    pub fn analyze_program(&mut self, decls: &[Decl]) -> SemanticResult<()> {
-        self.register_function_signatures(decls)?;
-        for decl in decls {
-            self.analyze_decl(decl)?;
+    pub fn analyze_program(&mut self, decls: &[Decl]) -> Vec<SemanticError> {
+        match self.register_function_signatures(decls) {
+            Ok(_) => (),
+            Err(err) => self.errors.push(err),
         }
-        Ok(())
+
+        for decl in decls {
+            match self.analyze_decl(decl) {
+                Ok(_) => (),
+                Err(err) => self.errors.push(err),
+            };
+        }
+
+        // TODO: try avoiding move
+        self.errors.clone()
     }
 
     fn register_function_signatures(&mut self, decls: &[Decl]) -> SemanticResult<()> {
@@ -687,9 +698,7 @@ impl SemanticAnalyzer {
     fn is_assignable(expr: &Expr) -> bool {
         matches!(
             expr.kind,
-            ExprKind::Identifier(_)
-                | ExprKind::Index { .. }
-                | ExprKind::Unary(UnaryOp::Deref, _)
+            ExprKind::Identifier(_) | ExprKind::Index { .. } | ExprKind::Unary(UnaryOp::Deref, _)
         )
     }
 }

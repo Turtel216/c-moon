@@ -50,7 +50,7 @@ pub fn run() -> () {
     // Semantic analysis (with error collection)
     let mut sem = SemanticAnalyzer::new();
     let sem_errors = sem.analyze_program(&ast);
-    //diagnostics.report_all(sem_errors);
+    diagnostics.report_all(sem_errors);
 
     if diagnostics.panic() {
         diagnostics.print();
