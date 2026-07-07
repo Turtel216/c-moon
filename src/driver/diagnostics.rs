@@ -22,14 +22,26 @@ impl Diagnostics {
         }
     }
 
-    /// Report a compiler error
+    /// Report a single compiler error.
     pub fn report<T: CompilerError + 'static>(&mut self, comp_error: T) -> () {
         self.comp_errors.push(Box::new(comp_error));
+    }
+
+    /// Report a batch of compiler errors at once.
+    pub fn report_all<T: CompilerError + 'static>(&mut self, errors: Vec<T>) -> () {
+        for e in errors {
+            self.comp_errors.push(Box::new(e));
+        }
     }
 
     /// Check if a Compiler has accured and if the compilation proccess should be stoped.
     pub fn panic(&self) -> bool {
         !self.comp_errors.is_empty()
+    }
+
+    /// Return the number of errors reported so far.
+    pub fn error_count(&self) -> usize {
+        self.comp_errors.len()
     }
 
     /// Print Compilation errors to stdout
@@ -49,5 +61,13 @@ impl Diagnostics {
         }
 
         println!("{}", output.join("\n\n"));
+
+        // Summary line
+        let count = self.comp_errors.len();
+        if count == 1 {
+            println!("\n\x1b[31m1 error generated.\x1b[0m");
+        } else {
+            println!("\n\x1b[31m{} errors generated.\x1b[0m", count);
+        }
     }
 }

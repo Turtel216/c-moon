@@ -33,42 +33,24 @@ pub fn run() -> () {
         Ok(p) => p,
         Err(e) => {
             diagnostics.report(e);
-            Parser {
-                tokens: Vec::new(),
-                pos: 0,
-                next_node_id: 0,
-            }
+            diagnostics.print();
+            return;
         }
     };
+
+    // Parse Program (with error recovery)
+    let (ast, parse_errors) = parser.parse_translation_unit();
+    diagnostics.report_all(parse_errors);
 
     if diagnostics.panic() {
         diagnostics.print();
         return;
     }
 
-    // Parse Program
-    let ast = match parser.parse_translation_unit() {
-        Ok(a) => a,
-        Err(err) => {
-            diagnostics.report(err);
-            Vec::new()
-        }
-    };
-
-    if diagnostics.panic() {
-        diagnostics.print();
-        return;
-    }
-
-    // Semantic analysis
+    // Semantic analysis (with error collection)
     let mut sem = SemanticAnalyzer::new();
-    match sem.analyze_program(&ast) {
-        Ok(_) => (),
-        Err(e) => {
-            diagnostics.report(e);
-            ()
-        }
-    }
+    let sem_errors = sem.analyze_program(&ast);
+    //diagnostics.report_all(sem_errors);
 
     if diagnostics.panic() {
         diagnostics.print();

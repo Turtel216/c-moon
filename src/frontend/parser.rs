@@ -28,6 +28,8 @@ pub struct Parser<'a> {
     pub tokens: Vec<Token<'a>>,
     pub pos: usize,
     pub next_node_id: u32,
+    /// Accumulated parse errors (for multi-error reporting).
+    pub errors: Vec<ParseError>,
 }
 
 impl<'a> Parser<'a> {
@@ -51,15 +53,67 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             next_node_id: 0,
+            errors: Vec::new(),
         })
     }
 
-    pub fn parse_translation_unit(&mut self) -> PResult<Vec<Decl>> {
+    /// Parse a complete translation unit, recovering from errors.
+    ///
+    /// Returns the successfully-parsed declarations alongside any
+    /// errors encountered. This allows the compiler to report
+    /// multiple syntax errors in a single pass.
+    pub fn parse_translation_unit(&mut self) -> (Vec<Decl>, Vec<ParseError>) {
         let mut decls = Vec::new();
         while !self.check(TokenKind::Eof) {
-            decls.push(self.parse_external_decl()?);
+            match self.parse_external_decl() {
+                Ok(d) => decls.push(d),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
+                }
+            }
         }
-        Ok(decls)
+        let errors = std::mem::take(&mut self.errors);
+        (decls, errors)
+    }
+
+    /// Advance tokens until we reach a synchronization point.
+    ///
+    /// A synchronization point is a position where we are likely at
+    /// the start of a new statement or declaration, allowing the
+    /// parser to resume correctly after an error. We stop at:
+    ///   - After a semicolon (end of statement)
+    ///   - After a closing brace (end of block)
+    ///   - Before a keyword that starts a declaration or statement
+    fn synchronize(&mut self) {
+        while !self.check(TokenKind::Eof) {
+            // If we just passed a semicolon or closing brace, we are
+            // at a good resumption point.
+            if self.prev().kind == TokenKind::Semicolon || self.prev().kind == TokenKind::RBrace {
+                return;
+            }
+
+            // If the current token starts a new declaration or
+            // statement, stop before consuming it.
+            match self.current().kind {
+                TokenKind::Int
+                | TokenKind::Char
+                | TokenKind::Float
+                | TokenKind::Double
+                | TokenKind::Void
+                | TokenKind::Struct
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Return => return,
+                // Also stop before a closing brace (end of enclosing
+                // block) so the caller can consume it.
+                TokenKind::RBrace => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     fn parse_external_decl(&mut self) -> PResult<Decl> {
@@ -260,12 +314,18 @@ impl<'a> Parser<'a> {
     fn parse_block_stmt_from_open_brace(&mut self) -> PResult<Stmt> {
         let mut items = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
-            if self.is_type_start() || self.check(TokenKind::Struct) {
-                let d = self.parse_block_decl()?;
-                items.push(BlockItem::Decl(d));
+            let result = if self.is_type_start() || self.check(TokenKind::Struct) {
+                self.parse_block_decl().map(BlockItem::Decl)
             } else {
-                let s = self.parse_stmt()?;
-                items.push(BlockItem::Stmt(s));
+                self.parse_stmt().map(BlockItem::Stmt)
+            };
+
+            match result {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
+                }
             }
         }
         self.expect(TokenKind::RBrace, "expected '}' to close block")?;
@@ -859,9 +919,16 @@ mod tests {
     fn parse_ok(src: &str) -> Vec<Decl> {
         let lexer = Lexer::new(src);
         let mut parser = Parser::from_lexer(lexer).expect("lexer failed");
-        parser
-            .parse_translation_unit()
-            .unwrap_or_else(|e| panic!("parse failed: {} at {:?}", e.message, e.span))
+        let (decls, errors) = parser.parse_translation_unit();
+        if !errors.is_empty() {
+            panic!(
+                "parse failed with {} error(s): {} at {:?}",
+                errors.len(),
+                errors[0].message,
+                errors[0].span
+            );
+        }
+        decls
     }
 
     #[test]
@@ -1124,7 +1191,34 @@ mod tests {
     fn rejects_invalid_input() {
         let lexer = Lexer::new("int x = ;");
         let mut parser = Parser::from_lexer(lexer).expect("lexing should succeed");
-        let err = parser.parse_translation_unit().expect_err("should fail");
-        assert!(!err.message.is_empty());
+        let (_decls, errors) = parser.parse_translation_unit();
+        assert!(!errors.is_empty(), "should produce at least one error");
+        assert!(!errors[0].message.is_empty());
+    }
+
+    #[test]
+    fn reports_multiple_errors() {
+        // Two bad declarations: missing initializer expressions.
+        let lexer = Lexer::new("int x = ; int y = ;");
+        let mut parser = Parser::from_lexer(lexer).expect("lexing should succeed");
+        let (_decls, errors) = parser.parse_translation_unit();
+        assert!(
+            errors.len() >= 2,
+            "expected at least 2 errors, got {}",
+            errors.len()
+        );
+    }
+
+    #[test]
+    fn recovers_valid_decls_after_error() {
+        // First decl is broken, second is valid.
+        let lexer = Lexer::new("int x = ; int y = 5;");
+        let mut parser = Parser::from_lexer(lexer).expect("lexing should succeed");
+        let (decls, errors) = parser.parse_translation_unit();
+        assert!(!errors.is_empty(), "should have parse errors");
+        assert!(
+            !decls.is_empty(),
+            "should recover and parse valid declarations"
+        );
     }
 }
