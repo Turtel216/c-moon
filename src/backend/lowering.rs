@@ -124,13 +124,41 @@ impl LoweringContext {
         // label pseudo-instructions at block boundaries.
         let mut current_block: Option<&str> = None;
 
-        for (instr, block_label) in instructions {
+        let mut position = 0;
+        while position < instructions.len() {
+            let (instr, block_label) = &instructions[position];
+
             // Emit a label when we enter a new basic block.
             if current_block != Some(block_label.as_str()) {
                 current_block = Some(block_label.as_str());
                 ctx.emit(X86Instruction::Label(format!(".{}", block_label)));
             }
+
+            // Consecutive `GetParam`s must be lowered as one group: each one
+            // reads an incoming argument register that a later one's
+            // destination may overwrite, so they have to be scheduled
+            // together (see `lower_get_params`).
+            if instr.opcode == Opcode::GetParam {
+                // `position(..)` returns an offset into the sub-slice, hence
+                // the `position +` when converting it back to an index.
+                let group_end = instructions[position..]
+                    .iter()
+                    .position(|(next, label)| {
+                        next.opcode != Opcode::GetParam || label != block_label
+                    })
+                    .map_or(instructions.len(), |offset| position + offset);
+
+                let group: Vec<&TACInstruction> = instructions[position..group_end]
+                    .iter()
+                    .map(|(get_param, _)| get_param)
+                    .collect();
+                ctx.lower_get_params(&group);
+                position = group_end;
+                continue;
+            }
+
             ctx.lower_instruction(instr);
+            position += 1;
         }
 
         // Emit labels for blocks that had no instructions (e.g. exit block).
@@ -243,7 +271,9 @@ impl LoweringContext {
             Opcode::Param => self.lower_param(instr),
             Opcode::Call => self.lower_call(instr),
             Opcode::Ret => self.lower_ret(instr),
-            Opcode::GetParam => self.lower_get_param(instr),
+            // A lone `GetParam` is a group of one; runs of them are batched
+            // by `lower_function` before reaching this dispatcher.
+            Opcode::GetParam => self.lower_get_params(&[instr]),
 
             Opcode::ArrayStore => self.lower_array_store(instr),
             Opcode::ArrayLoad => self.lower_array_load(instr),
@@ -405,25 +435,15 @@ impl LoweringContext {
         // Move buffered arguments into ABI registers (first 6) or stack.
         let args: Vec<Operand> = self.param_buffer.drain(..).collect();
 
-        // Stack args go in reverse order (right-to-left).
-        let stack_args = if args.len() > 6 { &args[6..] } else { &[] };
-        for arg in stack_args.iter().rev() {
-            let val = self.resolve(arg, SCRATCH1);
-            let val = self.ensure_reg(val, SCRATCH1);
-            self.emit(X86Instruction::Push(val));
-        }
-
-        // Register args.
-        for (i, arg) in args.iter().enumerate().take(6) {
-            let target_reg = PARAM_REGS[i];
-            let val = self.resolve(arg, SCRATCH1);
-            if val != X86Operand::Reg(target_reg) {
-                self.emit(X86Instruction::Mov(X86Operand::Reg(target_reg), val));
-            }
-        }
-
-        // Align stack to 16 bytes if we pushed an odd number of stack args.
+        let stack_args = args.get(PARAM_REGS.len()..).unwrap_or(&[]);
         let stack_arg_count = stack_args.len();
+
+        // RSP is 16-byte aligned throughout the body (the prologue keeps it
+        // so), and `call` pushes 8 bytes, so an odd number of 8-byte stack
+        // arguments needs 8 bytes of padding.  The padding goes *below* the
+        // arguments -- it must be reserved before they are pushed, otherwise
+        // it would sit between them and the return address and the callee
+        // would read it as argument 7.
         let needs_alignment = stack_arg_count % 2 != 0;
         if needs_alignment {
             self.emit(X86Instruction::Sub(
@@ -431,6 +451,25 @@ impl LoweringContext {
                 X86Operand::Imm(8),
             ));
         }
+
+        // Stack args are pushed right-to-left, so the 7th argument ends up
+        // closest to the return address, at `[rbp + 16]` in the callee.
+        for arg in stack_args.iter().rev() {
+            let val = self.resolve(arg, SCRATCH1);
+            let val = self.ensure_reg(val, SCRATCH1);
+            self.emit(X86Instruction::Push(val));
+        }
+
+        // Register args.  These are a simultaneous assignment: an argument
+        // may currently live in a register that is another argument's ABI
+        // destination, so the moves must be ordered (or broken with a
+        // scratch register) rather than emitted blindly.
+        let register_moves: Vec<(X86Register, X86Operand)> = args
+            .iter()
+            .zip(PARAM_REGS)
+            .map(|(arg, &target_reg)| (target_reg, self.resolve_in_place(arg)))
+            .collect();
+        self.emit_parallel_moves(&register_moves);
 
         self.emit(X86Instruction::Call(func_label));
 
@@ -468,36 +507,82 @@ impl LoweringContext {
         self.emit(X86Instruction::Jmp(self.epilogue_label.clone()));
     }
 
-    fn lower_get_param(&mut self, instr: &TACInstruction) {
-        let dest = instr.dest.as_ref().unwrap();
-        let index = match instr.arg1.as_ref().unwrap() {
-            Operand::ImmInt(i) => *i as usize,
-            _ => panic!("GetParam arg1 must be an immediate index"),
-        };
+    /// Lower a run of consecutive `GetParam` instructions.
+    ///
+    /// Incoming arguments arrive in fixed ABI locations (RDI, RSI, RDX, RCX,
+    /// R8, R9, then `[rbp + 16]` upwards), while the register allocator is
+    /// free to place the corresponding locals anywhere.  Emitting one `mov`
+    /// per parameter in isolation is therefore wrong: a local assigned to,
+    /// say, RCX would clobber the incoming 4th argument before the parameter
+    /// that needs it has been read.  The whole run must be treated as a
+    /// single simultaneous assignment.
+    ///
+    /// The run is lowered in two phases:
+    ///
+    /// 1. Parameters that live in memory (spilled, or address-taken and thus
+    ///    pinned to a stack slot) are written first, while every incoming
+    ///    argument register still holds its original value.
+    /// 2. Parameters that live in registers are shuffled with
+    ///    [`Self::emit_parallel_moves`], which orders the moves so that no
+    ///    source is destroyed before it is read.
+    fn lower_get_params(&mut self, group: &[&TACInstruction]) {
+        let mut register_moves: Vec<(X86Register, X86Operand)> = Vec::with_capacity(group.len());
 
-        let dest_reg = self.dest_reg(dest);
+        for instr in group {
+            let dest = instr
+                .dest
+                .as_ref()
+                .expect("Compiler Bug: GetParam must have a destination");
+            let index = match instr.arg1.as_ref() {
+                Some(Operand::ImmInt(i)) => *i as usize,
+                _ => panic!("GetParam arg1 must be an immediate index"),
+            };
+            let source = Self::incoming_param_location(index);
 
-        if index < PARAM_REGS.len() {
-            let param_reg = PARAM_REGS[index];
-            if dest_reg != param_reg {
-                self.emit(X86Instruction::Mov(
-                    X86Operand::Reg(dest_reg),
-                    X86Operand::Reg(param_reg),
-                ));
+            // --- Phase 1: memory destinations. ---
+            // A variable can need both a spill slot and an address-taken
+            // slot, so collect every memory home before emitting.
+            let mut memory_offsets: Vec<i32> = Vec::new();
+            let vreg = operand_to_vreg(dest).expect("GetParam dest must be a vreg");
+            match self.alloc.mapping.get(&vreg) {
+                Some(StorageLocation::Register(reg)) => register_moves.push((*reg, source.clone())),
+                Some(StorageLocation::Stack(slot)) => memory_offsets.push(self.spill_offset(*slot)),
+                None => panic!("VirtualReg {} has no allocation", vreg),
             }
-        } else {
-            // Parameters beyond the 6th are on the stack.
-            // Layout: [rbp+16] = arg7, [rbp+24] = arg8, ...
-            let stack_offset = 16 + ((index - 6) * 8) as i32;
-            self.emit(X86Instruction::Mov(
-                X86Operand::Reg(dest_reg),
-                X86Operand::Mem(X86Register::Rbp, stack_offset),
-            ));
+            if let Operand::Var(id) = dest {
+                if let Some(&offset) = self.addr_taken_offsets.get(id) {
+                    memory_offsets.push(offset);
+                }
+            }
+
+            if !memory_offsets.is_empty() {
+                // x86 has no memory-to-memory `mov`, so a stack-passed
+                // argument has to go through a scratch register.
+                let value = self.ensure_reg(source, SCRATCH1);
+                for offset in memory_offsets {
+                    self.emit(X86Instruction::Mov(
+                        X86Operand::Mem(X86Register::Rbp, offset),
+                        value.clone(),
+                    ));
+                }
+            }
         }
 
-        self.store_if_spilled(dest, dest_reg);
-        // If this param is address-taken, sync to its dedicated slot.
-        self.sync_addr_taken_if_needed(dest, dest_reg);
+        // --- Phase 2: register destinations. ---
+        self.emit_parallel_moves(&register_moves);
+    }
+
+    /// Where the caller left incoming argument `index`, per the System V
+    /// AMD64 ABI: the first six in registers, the rest on the stack just
+    /// above the saved return address (`[rbp + 16]` = argument 7).
+    fn incoming_param_location(index: usize) -> X86Operand {
+        match PARAM_REGS.get(index) {
+            Some(&reg) => X86Operand::Reg(reg),
+            None => X86Operand::Mem(
+                X86Register::Rbp,
+                16 + ((index - PARAM_REGS.len()) * 8) as i32,
+            ),
+        }
     }
 
     // ### Helpers ###
@@ -512,20 +597,19 @@ impl LoweringContext {
         -((self.num_callee_pushes as i32) * 8 + slot * 8)
     }
 
-    /// Resolve a TAC `Operand` into an `X86Operand`.
-    /// If the operand is a spilled vreg, a `mov` into `scratch` is emitted
-    /// and the scratch register is returned.
-    fn resolve(&mut self, op: &Operand, scratch: X86Register) -> X86Operand {
-        // For address-taken variables, always load from their dedicated
-        // stack slot. This ensures pointer writes are visible when reading
-        // the variable by name.
+    /// Resolve a TAC `Operand` to the `X86Operand` that holds it, without
+    /// emitting anything.  Spilled and address-taken variables resolve to
+    /// their RBP-relative stack slot, which `mov` can read directly.
+    ///
+    /// Prefer [`Self::resolve`] unless the caller can genuinely accept a
+    /// memory operand — most x86 instructions allow at most one.
+    fn resolve_in_place(&self, op: &Operand) -> X86Operand {
+        // For address-taken variables, always read the dedicated stack slot.
+        // This ensures pointer writes are visible when reading the variable
+        // by name.
         if let Operand::Var(id) = op {
             if let Some(&offset) = self.addr_taken_offsets.get(id) {
-                self.emit(X86Instruction::Mov(
-                    X86Operand::Reg(scratch),
-                    X86Operand::Mem(X86Register::Rbp, offset),
-                ));
-                return X86Operand::Reg(scratch);
+                return X86Operand::Mem(X86Register::Rbp, offset);
             }
         }
 
@@ -537,16 +621,83 @@ impl LoweringContext {
                 match self.alloc.mapping.get(&vreg) {
                     Some(StorageLocation::Register(r)) => X86Operand::Reg(*r),
                     Some(StorageLocation::Stack(slot)) => {
-                        let offset = self.spill_offset(*slot);
-                        self.emit(X86Instruction::Mov(
-                            X86Operand::Reg(scratch),
-                            X86Operand::Mem(X86Register::Rbp, offset),
-                        ));
-                        X86Operand::Reg(scratch)
+                        X86Operand::Mem(X86Register::Rbp, self.spill_offset(*slot))
                     }
                     None => panic!("VirtualReg {} has no allocation", vreg),
                 }
             }
+        }
+    }
+
+    /// Resolve a TAC `Operand` into an `X86Operand`.
+    /// If the operand lives in memory (a spilled or address-taken vreg), a
+    /// `mov` into `scratch` is emitted and the scratch register is returned.
+    fn resolve(&mut self, op: &Operand, scratch: X86Register) -> X86Operand {
+        match self.resolve_in_place(op) {
+            memory @ X86Operand::Mem(..) => {
+                self.emit(X86Instruction::Mov(X86Operand::Reg(scratch), memory));
+                X86Operand::Reg(scratch)
+            }
+            other => other,
+        }
+    }
+
+    /// Emit a set of `mov`s into registers that must take effect *as if*
+    /// they all happened at once.
+    ///
+    /// Emitting them naively is wrong whenever one move's destination is
+    /// another move's source, because the second move would then read a
+    /// value that has already been overwritten.  This is the classic
+    /// "parallel move" problem; it shows up wherever values are shuffled
+    /// between fixed ABI registers and allocated ones.
+    ///
+    /// A move becomes safe to emit once no other pending move reads its
+    /// destination.  When no such move exists, the remaining moves form a
+    /// cycle (e.g. `rdi <- rsi` together with `rsi <- rdi`); it is broken by
+    /// stashing one register in `SCRATCH1` and rewriting the reads of it.
+    /// Only register sources can conflict -- immediates and RBP-relative
+    /// memory operands are never written here.
+    ///
+    /// Destinations must never be `SCRATCH1`; both call sites use ABI
+    /// argument registers or allocated ones, and neither pool contains it.
+    fn emit_parallel_moves(&mut self, moves: &[(X86Register, X86Operand)]) {
+        // Self-moves (`mov rax, rax`) are dropped: they are no-ops, and
+        // keeping them would make every such register look "read" and stall
+        // the scheduling loop below.
+        let mut pending: Vec<(X86Register, X86Operand)> = moves
+            .iter()
+            .filter(|(dest, src)| *src != X86Operand::Reg(*dest))
+            .cloned()
+            .collect();
+
+        while !pending.is_empty() {
+            let ready = pending
+                .iter()
+                .position(|(dest, _)| !reads_register(&pending, *dest));
+
+            let index = match ready {
+                Some(index) => index,
+                None => {
+                    // Every remaining destination is still needed as a
+                    // source, so break the cycle: save one register's value
+                    // in the scratch register and read it from there.
+                    let stashed = pending[0].0;
+                    self.emit(X86Instruction::Mov(
+                        X86Operand::Reg(SCRATCH1),
+                        X86Operand::Reg(stashed),
+                    ));
+                    for (_, src) in pending.iter_mut() {
+                        if *src == X86Operand::Reg(stashed) {
+                            *src = X86Operand::Reg(SCRATCH1);
+                        }
+                    }
+                    // `stashed` is no longer read, so its move is now ready.
+                    0
+                }
+            };
+
+            let (dest, src) = pending.remove(index);
+            self.emit(X86Instruction::Mov(X86Operand::Reg(dest), src));
         }
     }
 
@@ -811,9 +962,163 @@ impl LoweringContext {
     }
 }
 
+/// Returns `true` if any pending parallel move still reads `reg` as its source.
+fn reads_register(pending: &[(X86Register, X86Operand)], reg: X86Register) -> bool {
+    pending.iter().any(|(_, src)| *src == X86Operand::Reg(reg))
+}
+
 /// Internal helper enum to distinguish binary operations during lowering.
 enum BinKind {
     Add,
     Sub,
     Mul,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lowering context with an empty allocation — enough to exercise the
+    /// helpers that only emit instructions.
+    fn test_context() -> LoweringContext {
+        LoweringContext {
+            out: Vec::new(),
+            alloc: AllocationResult {
+                mapping: HashMap::new(),
+                stack_slots: 0,
+                callee_saved_used: Vec::new(),
+            },
+            num_callee_pushes: 0,
+            epilogue_label: ".test_epilogue".to_string(),
+            param_buffer: Vec::new(),
+            array_offsets: HashMap::new(),
+            addr_taken_offsets: HashMap::new(),
+        }
+    }
+
+    /// Interpret a sequence of register-to-register `mov`s.
+    ///
+    /// Every register starts out holding itself as a unique marker value, so
+    /// the final contents say exactly which original value each register
+    /// ended up with.
+    fn simulate(instructions: &[X86Instruction]) -> HashMap<X86Register, X86Register> {
+        let mut state: HashMap<X86Register, X86Register> = HashMap::new();
+        for instr in instructions {
+            match instr {
+                X86Instruction::Mov(X86Operand::Reg(dest), X86Operand::Reg(src)) => {
+                    // A register not yet written still holds its own marker.
+                    let value = *state.get(src).unwrap_or(src);
+                    state.insert(*dest, value);
+                }
+                other => panic!("Expected a register-to-register mov, got {:?}", other),
+            }
+        }
+        state
+    }
+
+    /// Assert that `moves` are emitted as a genuine simultaneous assignment:
+    /// every destination must end up with the value its source held *before*
+    /// any move was executed.
+    fn assert_moves_are_parallel(moves: &[(X86Register, X86Operand)]) {
+        let mut ctx = test_context();
+        ctx.emit_parallel_moves(moves);
+        let state = simulate(&ctx.out);
+
+        for (dest, src) in moves {
+            let expected = match src {
+                X86Operand::Reg(reg) => *reg,
+                other => panic!("This helper only checks register sources, got {:?}", other),
+            };
+            assert_eq!(
+                state.get(dest).copied().unwrap_or(*dest),
+                expected,
+                "{:?} should hold the original value of {:?}; emitted: {:?}",
+                dest,
+                expected,
+                ctx.out
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_moves_drop_self_moves() {
+        // Arrange
+        let moves = [
+            (X86Register::Rdi, X86Operand::Reg(X86Register::Rdi)),
+            (X86Register::Rsi, X86Operand::Reg(X86Register::Rsi)),
+        ];
+        let mut ctx = test_context();
+
+        // Act
+        ctx.emit_parallel_moves(&moves);
+
+        // Assert
+        assert!(ctx.out.is_empty(), "no-op moves must not be emitted");
+    }
+
+    #[test]
+    fn parallel_moves_order_chains_before_overwriting_sources() {
+        // `rcx <- rdi` must precede `rdi <- rdx`, or RDI's value is lost.
+        assert_moves_are_parallel(&[
+            (X86Register::Rcx, X86Operand::Reg(X86Register::Rdi)),
+            (X86Register::Rdi, X86Operand::Reg(X86Register::Rdx)),
+        ]);
+    }
+
+    #[test]
+    fn parallel_moves_handle_a_two_register_swap() {
+        // A pure cycle: no ordering works, so it must be broken with a
+        // scratch register.
+        assert_moves_are_parallel(&[
+            (X86Register::Rdi, X86Operand::Reg(X86Register::Rsi)),
+            (X86Register::Rsi, X86Operand::Reg(X86Register::Rdi)),
+        ]);
+    }
+
+    #[test]
+    fn parallel_moves_handle_a_cycle_with_a_dangling_chain() {
+        // A three-register rotation plus a move that feeds off it.
+        assert_moves_are_parallel(&[
+            (X86Register::Rdi, X86Operand::Reg(X86Register::Rsi)),
+            (X86Register::Rsi, X86Operand::Reg(X86Register::Rdx)),
+            (X86Register::Rdx, X86Operand::Reg(X86Register::Rdi)),
+            (X86Register::R8, X86Operand::Reg(X86Register::Rdx)),
+        ]);
+    }
+
+    #[test]
+    fn parallel_moves_handle_the_full_argument_shuffle() {
+        // The System V argument registers rotated by one — the worst case a
+        // six-parameter function can hand the allocator.
+        assert_moves_are_parallel(&[
+            (X86Register::Rdi, X86Operand::Reg(X86Register::R9)),
+            (X86Register::Rsi, X86Operand::Reg(X86Register::Rdi)),
+            (X86Register::Rdx, X86Operand::Reg(X86Register::Rsi)),
+            (X86Register::Rcx, X86Operand::Reg(X86Register::Rdx)),
+            (X86Register::R8, X86Operand::Reg(X86Register::Rcx)),
+            (X86Register::R9, X86Operand::Reg(X86Register::R8)),
+        ]);
+    }
+
+    #[test]
+    fn incoming_params_use_registers_then_the_caller_frame() {
+        // Arrange / Act / Assert — first six in ABI registers ...
+        assert_eq!(
+            LoweringContext::incoming_param_location(0),
+            X86Operand::Reg(X86Register::Rdi)
+        );
+        assert_eq!(
+            LoweringContext::incoming_param_location(5),
+            X86Operand::Reg(X86Register::R9)
+        );
+        // ... the rest just above the saved return address.
+        assert_eq!(
+            LoweringContext::incoming_param_location(6),
+            X86Operand::Mem(X86Register::Rbp, 16)
+        );
+        assert_eq!(
+            LoweringContext::incoming_param_location(7),
+            X86Operand::Mem(X86Register::Rbp, 24)
+        );
+    }
 }

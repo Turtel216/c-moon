@@ -689,3 +689,95 @@ fn test_pointer_write_via_function_with_opt() {
     ";
     run_e2e_test_with_opt("test_pointer_write_via_function_with_opt", code, 33);
 }
+
+#[test]
+fn test_function_call_with_more_than_six_int_arguments() {
+    let code = "
+        int sum(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a + b + c + d + e + f + g + h;
+        }
+
+        int main() {
+            return sum(1, 2, 3, 4, 5, 6, 7, 8);
+        }
+    ";
+    run_e2e_test(
+        "test_function_call_with_more_than_six_int_arguments",
+        code,
+        36,
+    );
+}
+
+#[test]
+fn test_function_call_with_more_than_six_int_arguments_with_opt() {
+    let code = "
+        int sum(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a + b + c + d + e + f + g + h;
+        }
+
+        int main() {
+            return sum(1, 2, 3, 4, 5, 6, 7, 8);
+        }
+    ";
+    run_e2e_test_with_opt(
+        "test_function_call_with_more_than_six_int_arguments_with_opt",
+        code,
+        36,
+    );
+}
+
+#[test]
+fn test_function_call_with_seven_int_arguments() {
+    // An odd number of stack arguments needs 8 bytes of alignment padding,
+    // which must sit *below* them so argument 7 stays at [rbp + 16].
+    let code = "
+        int weighted(int a, int b, int c, int d, int e, int f, int g) {
+            return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7;
+        }
+
+        int main() {
+            return weighted(1, 1, 1, 1, 1, 1, 1);
+        }
+    ";
+    run_e2e_test("test_function_call_with_seven_int_arguments", code, 28);
+}
+
+#[test]
+fn test_function_call_with_seven_int_arguments_with_opt() {
+    let code = "
+        int weighted(int a, int b, int c, int d, int e, int f, int g) {
+            return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7;
+        }
+
+        int main() {
+            return weighted(1, 1, 1, 1, 1, 1, 1);
+        }
+    ";
+    run_e2e_test_with_opt(
+        "test_function_call_with_seven_int_arguments_with_opt",
+        code,
+        28,
+    );
+}
+
+#[test]
+fn test_function_call_with_more_than_six_arguments_via_pointer() {
+    // Mixes an address-taken parameter (pinned to a stack slot) with
+    // register- and stack-passed arguments.
+    let code = "
+        int bump(int *p, int b, int c, int d, int e, int f, int g, int h) {
+            *p = *p + 1;
+            return *p + b + c + d + e + f + g + h;
+        }
+
+        int main() {
+            int v = 100;
+            return bump(&v, 1, 2, 3, 4, 5, 6, 7) - 100;
+        }
+    ";
+    run_e2e_test(
+        "test_function_call_with_more_than_six_arguments_via_pointer",
+        code,
+        29,
+    );
+}
