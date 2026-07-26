@@ -781,3 +781,199 @@ fn test_function_call_with_more_than_six_arguments_via_pointer() {
         29,
     );
 }
+
+#[test]
+fn test_value_live_across_a_call() {
+    // `a` must survive the second call; a caller-saved register would be
+    // destroyed by the callee.
+    let code = "
+        int f(int x) { int y = x + 1; int z = y + 1; return z * 2; }
+
+        int main() {
+            int a = f(1);
+            int b = f(2);
+            return a + b;
+        }
+    ";
+    run_e2e_test("test_value_live_across_a_call", code, 14);
+}
+
+#[test]
+fn test_value_live_across_a_call_with_opt() {
+    let code = "
+        int f(int x) { int y = x + 1; int z = y + 1; return z * 2; }
+
+        int main() {
+            int a = f(1);
+            int b = f(2);
+            return a + b;
+        }
+    ";
+    run_e2e_test_with_opt("test_value_live_across_a_call_with_opt", code, 14);
+}
+
+#[test]
+fn test_more_values_live_across_a_call_than_callee_saved_registers() {
+    // Eight values are live across the call but only five callee-saved
+    // registers exist, so the rest have to reach the stack.
+    let code = "
+        int f(int x) { return x * 2; }
+
+        int main() {
+            int a = 1; int b = 2; int c = 3; int d = 4;
+            int e = 5; int g = 6; int h = 7; int i = 8;
+            int r = f(3);
+            return a + b + c + d + e + g + h + i + r;
+        }
+    ";
+    run_e2e_test(
+        "test_more_values_live_across_a_call_than_callee_saved_registers",
+        code,
+        42,
+    );
+}
+
+#[test]
+fn test_recursive_call_keeps_intermediate_result() {
+    // The result of `fib(n - 1)` is live across the `fib(n - 2)` call.
+    let code = "
+        int fib(int n) {
+            if (n < 2) { return n; }
+            return fib(n - 1) + fib(n - 2);
+        }
+
+        int main() { return fib(10); }
+    ";
+    run_e2e_test("test_recursive_call_keeps_intermediate_result", code, 55);
+}
+
+#[test]
+fn test_recursive_call_keeps_intermediate_result_with_opt() {
+    let code = "
+        int fib(int n) {
+            if (n < 2) { return n; }
+            return fib(n - 1) + fib(n - 2);
+        }
+
+        int main() { return fib(10); }
+    ";
+    run_e2e_test_with_opt(
+        "test_recursive_call_keeps_intermediate_result_with_opt",
+        code,
+        55,
+    );
+}
+
+#[test]
+fn test_call_inside_loop_keeps_loop_state() {
+    // The accumulator and the counter are both live across the call.
+    let code = "
+        int add(int a, int b) { return a + b; }
+
+        int main() {
+            int s = 0;
+            int i = 0;
+            while (i < 10) {
+                s = add(s, i);
+                i = i + 1;
+            }
+            return s;
+        }
+    ";
+    run_e2e_test("test_call_inside_loop_keeps_loop_state", code, 45);
+}
+
+#[test]
+fn test_call_inside_loop_keeps_loop_state_with_opt() {
+    let code = "
+        int add(int a, int b) { return a + b; }
+
+        int main() {
+            int s = 0;
+            int i = 0;
+            while (i < 10) {
+                s = add(s, i);
+                i = i + 1;
+            }
+            return s;
+        }
+    ";
+    run_e2e_test_with_opt("test_call_inside_loop_keeps_loop_state_with_opt", code, 45);
+}
+
+#[test]
+fn test_nested_calls_with_more_than_six_arguments() {
+    // Two eight-argument calls whose results are combined: the first
+    // result is live across the second call.
+    let code = "
+        int inner(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a - b + c - d + e - f + g - h;
+        }
+
+        int outer(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return inner(h, g, f, e, d, c, b, a) + inner(a, b, c, d, e, f, g, h);
+        }
+
+        int main() { return outer(9, 8, 7, 6, 5, 4, 3, 2) + 50; }
+    ";
+    run_e2e_test("test_nested_calls_with_more_than_six_arguments", code, 50);
+}
+
+#[test]
+fn test_nested_calls_with_more_than_six_arguments_with_opt() {
+    let code = "
+        int inner(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return a - b + c - d + e - f + g - h;
+        }
+
+        int outer(int a, int b, int c, int d, int e, int f, int g, int h) {
+            return inner(h, g, f, e, d, c, b, a) + inner(a, b, c, d, e, f, g, h);
+        }
+
+        int main() { return outer(9, 8, 7, 6, 5, 4, 3, 2) + 50; }
+    ";
+    run_e2e_test_with_opt(
+        "test_nested_calls_with_more_than_six_arguments_with_opt",
+        code,
+        50,
+    );
+}
+
+#[test]
+fn test_unused_parameter_does_not_clobber_a_later_one() {
+    // `p3` is never read, so its live interval collapses and the allocator
+    // may hand its register to `p4`.  Only the live parameter's copy may
+    // survive, or `p4` is destroyed before it is ever used.
+    let code = "
+        int pick(int p0, int p1, int p2, int p3, int p4, int p5, int p6) {
+            int v0 = p6 - p0;
+            if (p2 < p5) { p0 = p5 - 1; } else { p1 = p0 + 4; }
+            return p4 * 1 + p1 + v0 * 0;
+        }
+
+        int main() { return pick(4, 3, 1, 5, 4, 2, 2); }
+    ";
+    run_e2e_test(
+        "test_unused_parameter_does_not_clobber_a_later_one",
+        code,
+        7,
+    );
+}
+
+#[test]
+fn test_unused_parameter_does_not_clobber_a_later_one_with_opt() {
+    let code = "
+        int pick(int p0, int p1, int p2, int p3, int p4, int p5, int p6) {
+            int v0 = p6 - p0;
+            if (p2 < p5) { p0 = p5 - 1; } else { p1 = p0 + 4; }
+            return p4 * 1 + p1 + v0 * 0;
+        }
+
+        int main() { return pick(4, 3, 1, 5, 4, 2, 2); }
+    ";
+    run_e2e_test_with_opt(
+        "test_unused_parameter_does_not_clobber_a_later_one_with_opt",
+        code,
+        7,
+    );
+}

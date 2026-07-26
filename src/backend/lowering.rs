@@ -569,6 +569,7 @@ impl LoweringContext {
         }
 
         // --- Phase 2: register destinations. ---
+        keep_last_write_per_register(&mut register_moves);
         self.emit_parallel_moves(&register_moves);
     }
 
@@ -962,6 +963,31 @@ impl LoweringContext {
     }
 }
 
+/// Drop every move whose destination is written again later in the group,
+/// keeping only the last write to each register.
+///
+/// Two parameters can be handed the same register: an unused parameter's
+/// live interval collapses to its definition, so the allocator is free to
+/// reuse its register for a later one.  The earlier copy is dead on arrival
+/// -- nothing between the two writes reads it -- and leaving it in would
+/// make the destination's final contents ambiguous, silently destroying the
+/// live parameter.
+fn keep_last_write_per_register(moves: &mut Vec<(X86Register, X86Operand)>) {
+    // Walk backwards so the *first* sighting of a register is its last write.
+    // `HashSet::insert` returns false for a register already seen.
+    let mut written: HashSet<X86Register> = HashSet::with_capacity(moves.len());
+    let mut survives: Vec<bool> = moves
+        .iter()
+        .rev()
+        .map(|(dest, _)| written.insert(*dest))
+        .collect();
+    survives.reverse();
+
+    // `retain` visits elements front to back, in step with `survives`.
+    let mut survivor = survives.into_iter();
+    moves.retain(|_| survivor.next().unwrap_or(false));
+}
+
 /// Returns `true` if any pending parallel move still reads `reg` as its source.
 fn reads_register(pending: &[(X86Register, X86Operand)], reg: X86Register) -> bool {
     pending.iter().any(|(_, src)| *src == X86Operand::Reg(reg))
@@ -1098,6 +1124,45 @@ mod tests {
             (X86Register::R8, X86Operand::Reg(X86Register::Rcx)),
             (X86Register::R9, X86Operand::Reg(X86Register::R8)),
         ]);
+    }
+
+    #[test]
+    fn a_register_written_twice_keeps_only_the_last_write() {
+        // Arrange: an unused parameter shares R8 with a live one, because
+        // its live interval collapsed to its definition.
+        let mut moves = vec![
+            (X86Register::R8, X86Operand::Reg(X86Register::Rcx)),
+            (X86Register::Rcx, X86Operand::Reg(X86Register::Rdi)),
+            (X86Register::R8, X86Operand::Reg(X86Register::R8)),
+        ];
+
+        // Act
+        keep_last_write_per_register(&mut moves);
+
+        // Assert: the dead copy is gone, the rest keeps its order.
+        assert_eq!(
+            moves,
+            vec![
+                (X86Register::Rcx, X86Operand::Reg(X86Register::Rdi)),
+                (X86Register::R8, X86Operand::Reg(X86Register::R8)),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_destinations_survive_deduplication() {
+        // Arrange
+        let original = vec![
+            (X86Register::Rdi, X86Operand::Reg(X86Register::Rsi)),
+            (X86Register::Rsi, X86Operand::Reg(X86Register::Rdx)),
+        ];
+        let mut moves = original.clone();
+
+        // Act
+        keep_last_write_per_register(&mut moves);
+
+        // Assert
+        assert_eq!(moves, original);
     }
 
     #[test]

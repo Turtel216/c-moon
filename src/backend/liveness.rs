@@ -69,6 +69,51 @@ pub struct LiveInterval {
     pub end: usize,
 }
 
+impl LiveInterval {
+    /// Returns `true` if this value has to survive `call`, i.e. it is live
+    /// on both sides of it.
+    ///
+    /// Such a value cannot be kept in a caller-saved register, because the
+    /// callee is free to overwrite every one of them.
+    pub fn crosses_call(&self, call: &CallSite) -> bool {
+        if self.start > call.position || self.end < call.position {
+            return false;
+        }
+        // A value produced *by* the call is only born once the callee has
+        // returned, so it has nothing to survive.
+        !(self.start == call.position && call.defines.as_ref() == Some(&self.vreg))
+    }
+}
+
+// ### Call sites ###
+
+/// A `Call` instruction in the linearized instruction sequence.
+///
+/// The register allocator needs these to know which values are held across
+/// a call and must therefore avoid caller-saved registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// Index of the `Call` in the linearized instruction sequence.
+    pub position: usize,
+    /// The virtual register the call writes its return value into, if any.
+    pub defines: Option<VirtualReg>,
+}
+
+/// Collect every call site in a linearized function, in ascending position
+/// order (which the allocator relies on for binary search).
+pub fn find_call_sites(linear: &LinearizedCfg) -> Vec<CallSite> {
+    linear
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, (instr, _))| instr.opcode == Opcode::Call)
+        .map(|(position, (instr, _))| CallSite {
+            position,
+            defines: instr.dest.as_ref().and_then(operand_to_vreg),
+        })
+        .collect()
+}
+
 // ### Linearize the CFG ###
 
 /// Flatten the CFG into a linear instruction sequence using DFS preorder

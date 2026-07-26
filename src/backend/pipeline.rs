@@ -2,7 +2,7 @@
 //!
 //! Orchestrates the backend stages for each function:
 //! 1. Linearize the CFG
-//! 2. Compute live intervals (liveness analysis)
+//! 2. Compute live intervals (liveness analysis) and locate call sites
 //! 3. Run linear-scan register allocation
 //! 4. Lower TAC -> x86-64 instructions
 //!
@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use crate::backend::liveness::{compute_live_intervals, linearize_cfg};
+use crate::backend::liveness::{compute_live_intervals, find_call_sites, linearize_cfg};
 use crate::backend::lowering::LoweringContext;
 use crate::backend::regalloc::linear_scan;
 use crate::backend::x86::X86Program;
@@ -28,8 +28,12 @@ pub fn compile_program(ir: &ProgramIr) -> X86Program {
         // Compute live intervals via liveness analysis.
         let intervals = compute_live_intervals(cfg, &linear);
 
+        // Locate the calls, so values live across one are kept out of
+        // caller-saved registers.
+        let call_sites = find_call_sites(&linear);
+
         // Allocate registers
-        let alloc = linear_scan(&intervals);
+        let alloc = linear_scan(&intervals, &call_sites);
 
         // Pre-scan for address-taken variables (those used in AddrOf).
         let mut addr_taken_vars: HashSet<usize> = HashSet::new();
