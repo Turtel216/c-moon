@@ -61,10 +61,26 @@ Build the project:
 cargo build --release
 ```
 
-Run unit tests:
+Run the test suite:
 ```bash
 cargo test
 ```
+
+The end-to-end suite follows the methodology of `rustc`'s own `compiletest`:
+each test is a C file under `tests/` that declares its expectations in `//@`
+header directives, split into three suites -- `run-pass` (compile, link, run,
+check the exit status), `codegen` (`CHECK` directives matched against the
+emitted assembly) and `ui` (diagnostics compared against checked-in `.stderr`
+snapshots). Every `run-pass` fixture runs twice, with and without `--opt`.
+
+```bash
+cargo test --test compiletest -- pointers   # filter by name
+cargo test --test compiletest -- --list     # list every fixture
+BLESS=1 cargo test --test compiletest       # re-record ui snapshots
+```
+
+See [`tests/README.md`](tests/README.md) for the directive reference and for
+how to add a test.
 
 The Compiler CLI:
 

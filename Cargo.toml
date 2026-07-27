@@ -2,6 +2,20 @@
 name = "c-moon"
 version = "0.1.0"
 edition = "2024"
+# The compiletest harness is declared explicitly below; disabling auto
+# discovery keeps stray files under `tests/` (C fixtures, snapshots) from
+# being picked up as test targets.
+autotests = false
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
+
+[dev-dependencies]
+# Custom test harness: gives one named, individually filterable test per
+# fixture file instead of one giant `#[test]` per case.
+libtest-mimic = "0.8.2"
+
+[[test]]
+name = "compiletest"
+path = "tests/compiletest/main.rs"
+harness = false
