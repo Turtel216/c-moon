@@ -1,6 +1,6 @@
 //! Compiler Driver.
 
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command, process::ExitCode};
 
 use cli::get_arguments;
 use diagnostics::Diagnostics;
@@ -17,14 +17,24 @@ pub mod diagnostics;
 
 /// Run the complete Compiler pipeline.
 /// Also Handles command line arguments.
-pub fn run() -> () {
+///
+/// # Returns
+///
+/// [`ExitCode::SUCCESS`] when an executable (or assembly listing) was
+/// produced, [`ExitCode::FAILURE`] when any diagnostic was emitted or an
+/// external step such as reading the source or linking failed. Callers --
+/// shells and test harnesses alike -- rely on this status to tell a rejected
+/// program from a compiled one.
+pub fn run() -> ExitCode {
     // Get command line arguments
     let cli = get_arguments();
     let mut diagnostics = Diagnostics::new();
 
     // Read source file
-    // TODO: Dont crash the program when file not. Print proper message
-    let source_program = fs::read_to_string(cli.source_file).expect("File not found");
+    let source_program = match fs::read_to_string(&cli.source_file) {
+        Ok(source) => source,
+        Err(e) => return fatal(&format!("cannot read '{}': {}", cli.source_file, e)),
+    };
 
     // Tokenize program
     let lexer = Lexer::new(&source_program);
@@ -34,7 +44,7 @@ pub fn run() -> () {
         Err(e) => {
             diagnostics.report(e);
             diagnostics.print();
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -44,7 +54,7 @@ pub fn run() -> () {
 
     if diagnostics.panic() {
         diagnostics.print();
-        return;
+        return ExitCode::FAILURE;
     }
 
     // Semantic analysis (with error collection)
@@ -54,11 +64,22 @@ pub fn run() -> () {
 
     if diagnostics.panic() {
         diagnostics.print();
-        return;
+        return ExitCode::FAILURE;
     }
 
-    // Identifier Renaming
-    let resolution_map = resolve_names(&ast).expect("Name resolution failed");
+    // Identifier Renaming.
+    // Semantic analysis already rejects the programs this pass can reject, so
+    // a failure here means the two passes disagree -- a compiler bug, not a
+    // user error.
+    let resolution_map = match resolve_names(&ast) {
+        Ok(map) => map,
+        Err(e) => {
+            return fatal(&format!(
+                "internal compiler error: name resolution: {:?}",
+                e
+            ));
+        }
+    };
 
     // Desuger AST into IR
     let ctx = LoweringContext::new(&resolution_map);
@@ -94,31 +115,61 @@ pub fn run() -> () {
 
     // Output assembly to file
     let asm_output = format!("{}.s", cli.output_file);
-    let out_path = std::path::Path::new(&asm_output);
+    let out_path = Path::new(&asm_output);
     let asm_program = backend::emit::emit_asm(&asm);
-    fs::write(out_path, asm_program).expect("Failed to write assembly to file");
+    if let Err(e) = fs::write(out_path, asm_program) {
+        return fatal(&format!("cannot write '{}': {}", asm_output, e));
+    }
 
-    assamble_program(&cli.output_file, &asm_output);
+    if let Err(message) = assamble_program(&cli.output_file, &asm_output) {
+        return fatal(&message);
+    }
 
     if !cli.asm {
         clean_up(&asm_output);
     }
+
+    ExitCode::SUCCESS
 }
 
 /// Invokes GCC on the ``asm_output`` file and produces the executable.
-fn assamble_program(output_path: &str, asm_output: &str) -> () {
-    let _ = Command::new("gcc")
+///
+/// # Errors
+///
+/// Returns a human readable message when GCC cannot be spawned or exits with
+/// a non-zero status; GCC's own stderr is forwarded so the assembler's
+/// complaint is not swallowed.
+fn assamble_program(output_path: &str, asm_output: &str) -> Result<(), String> {
+    let output = Command::new("gcc")
         .args(["-no-pie", "-o", output_path, asm_output])
         .output()
-        .expect("Failed to link program");
+        .map_err(|e| format!("failed to run gcc: {}", e))?;
+
+    if !output.status.success() {
+        // `from_utf8_lossy` avoids failing on a non-UTF-8 message from gcc.
+        return Err(format!(
+            "gcc failed to assemble '{}':\n{}",
+            asm_output,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(())
 }
 
 /// Clean up fils produces during compilation.
 /// Removes:
 ///   - ``asm_output``
 fn clean_up(asm_output: &str) -> () {
-    let _ = Command::new("rm")
-        .arg(asm_output)
-        .output()
-        .expect("Failed to delete intermediete files");
+    // A failed cleanup leaves a stray listing behind but does not invalidate
+    // the executable, so it is reported without failing the compilation.
+    if let Err(e) = fs::remove_file(asm_output) {
+        eprintln!("warning: could not remove '{}': {}", asm_output, e);
+    }
+}
+
+/// Report a failure that is not tied to a source span and end the run.
+fn fatal(message: &str) -> ExitCode {
+    eprintln!("error: {}", message);
+    ExitCode::FAILURE
 }

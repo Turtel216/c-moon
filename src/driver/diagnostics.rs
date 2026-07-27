@@ -1,8 +1,16 @@
 //! Compiler Diagnostics/Error messages
 
+use std::io::{IsTerminal, Write, stderr};
+
 use crate::frontend::lexer::Span;
 
 // TODO: Add Support for line snippet and fancy arrows etc.
+
+/// ANSI escape sequence that switches the terminal to red text.
+const ANSI_RED: &str = "\x1b[31m";
+
+/// ANSI escape sequence that restores the terminal's default styling.
+const ANSI_RESET: &str = "\x1b[0m";
 
 /// Common behaviour of Compiler Errors for later reporting
 pub trait CompilerError {
@@ -44,14 +52,30 @@ impl Diagnostics {
         self.comp_errors.len()
     }
 
-    /// Print Compilation errors to stdout
+    /// Print Compilation errors to stderr.
+    ///
+    /// Diagnostics go to stderr rather than stdout so that a compiled
+    /// program's output and the compiler's own output never interleave, and
+    /// so test harnesses can snapshot them independently.
     pub fn print(&self) -> () {
-        let mut output: Vec<String> = Vec::new();
+        let (red, reset) = if color_enabled() {
+            (ANSI_RED, ANSI_RESET)
+        } else {
+            ("", "")
+        };
+
+        // Locking stderr once keeps the whole report contiguous even when
+        // another thread is writing concurrently.
+        let mut out = stderr().lock();
+
+        let mut output: Vec<String> = Vec::with_capacity(self.comp_errors.len());
         for err in &self.comp_errors {
             let span = err.get_span();
             let message = format!(
-                "\x1b[31m{}\x1b[0m {}:{} {}",
+                "{}{}{} {}:{} {}",
+                red,
                 err.error_prefix(),
+                reset,
                 span.line,
                 span.column,
                 err.get_message()
@@ -60,14 +84,23 @@ impl Diagnostics {
             output.push(message);
         }
 
-        println!("{}", output.join("\n\n"));
+        let _ = writeln!(out, "{}", output.join("\n\n"));
 
         // Summary line
         let count = self.comp_errors.len();
         if count == 1 {
-            println!("\n\x1b[31m1 error generated.\x1b[0m");
+            let _ = writeln!(out, "\n{}1 error generated.{}", red, reset);
         } else {
-            println!("\n\x1b[31m{} errors generated.\x1b[0m", count);
+            let _ = writeln!(out, "\n{}{} errors generated.{}", red, count, reset);
         }
     }
+}
+
+/// Decide whether ANSI colour codes should be emitted.
+///
+/// Colour is suppressed when stderr is redirected (a pipe or a file, as in a
+/// test harness) or when the conventional `NO_COLOR` variable is set, so that
+/// captured diagnostics stay free of escape sequences.
+fn color_enabled() -> bool {
+    stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
