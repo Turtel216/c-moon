@@ -2,7 +2,7 @@
 
 use std::io::{IsTerminal, Write, stderr};
 
-use crate::frontend::lexer::Span;
+use crate::frontend::span::Span;
 
 // TODO: Add Support for line snippet and fancy arrows etc.
 
@@ -70,14 +70,12 @@ impl Diagnostics {
 
         let mut output: Vec<String> = Vec::with_capacity(self.comp_errors.len());
         for err in &self.comp_errors {
-            let span = err.get_span();
             let message = format!(
-                "{}{}{} {}:{} {}",
+                "{}{}{} {} {}",
                 red,
                 err.error_prefix(),
                 reset,
-                span.line,
-                span.column,
+                err.get_span(),
                 err.get_message()
             );
 

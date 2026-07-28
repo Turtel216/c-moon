@@ -1,7 +1,19 @@
+//! Abstract syntax tree produced by the parser.
+//!
+//! Every node carries a [`NodeId`] and a [`Span`]. The id gives later passes a
+//! stable key for side tables -- the renamer's resolution map, for instance --
+//! so the tree itself never has to be rewritten; the span is what diagnostics
+//! point at.
+
 use std::fmt;
 
-use crate::frontend::lexer::Span;
+use crate::frontend::span::Span;
 
+/// Identifies one AST node within a translation unit.
+///
+/// Ids are handed out by the parser in construction order and are unique
+/// across the whole tree, which lets passes record their results in a side
+/// table keyed by id instead of mutating the AST.
 pub type NodeId = u32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,17 +133,24 @@ pub enum CType {
     Float,
     Double,
     Pointer(Box<CType>),
+    /// A fixed-size array; the size is `None` for `int a[]`.
     Array(Box<CType>, Option<usize>),
     Struct(String),
 }
 
 impl fmt::Display for CType {
+    /// Writes the type in C declaration syntax, e.g. `int*` or `int[10]`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CType::Int => write!(f, "int"),
             CType::Void => write!(f, "void"),
-            CType::Pointer(inner) => write!(f, "{}*", inner),
-            _ => todo!("Other types not supported yet"),
+            CType::Int => write!(f, "int"),
+            CType::Char => write!(f, "char"),
+            CType::Float => write!(f, "float"),
+            CType::Double => write!(f, "double"),
+            CType::Pointer(inner) => write!(f, "{inner}*"),
+            CType::Array(elem, Some(size)) => write!(f, "{elem}[{size}]"),
+            CType::Array(elem, None) => write!(f, "{elem}[]"),
+            CType::Struct(name) => write!(f, "struct {name}"),
         }
     }
 }
@@ -178,4 +197,27 @@ pub enum UnaryOp {
     PreDec,    // --x
     PostInc,   // x++
     PostDec,   // x--
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displays_derived_types_in_c_syntax() {
+        let pointer_to_int = CType::Pointer(Box::new(CType::Int));
+        assert_eq!(pointer_to_int.to_string(), "int*");
+
+        let array_of_pointers = CType::Array(Box::new(pointer_to_int), Some(10));
+        assert_eq!(array_of_pointers.to_string(), "int*[10]");
+
+        assert_eq!(
+            CType::Array(Box::new(CType::Char), None).to_string(),
+            "char[]"
+        );
+        assert_eq!(
+            CType::Struct("Point".to_string()).to_string(),
+            "struct Point"
+        );
+    }
 }

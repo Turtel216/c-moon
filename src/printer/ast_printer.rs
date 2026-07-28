@@ -23,8 +23,7 @@ impl AstPrinter {
                 initializer,
             } => {
                 self.indent(w)?;
-                self.print_ctype(ty, w)?;
-                write!(w, " {}", name)?;
+                write!(w, "{ty} {name}")?;
                 if let Some(init) = initializer {
                     write!(w, " = ")?;
                     self.print_expr(init, w)?;
@@ -38,13 +37,12 @@ impl AstPrinter {
                 body,
             } => {
                 self.indent(w)?;
-                self.print_ctype(return_ty, w)?;
-                write!(w, " {}(", name)?;
+                write!(w, "{return_ty} {name}(")?;
                 for (i, param) in params.iter().enumerate() {
                     if i > 0 {
                         write!(w, ", ")?;
                     }
-                    self.print_ctype(&param.ty, w)?;
+                    write!(w, "{}", param.ty)?;
                     if let Some(pname) = &param.name {
                         write!(w, " {}", pname)?;
                     }
@@ -229,9 +227,7 @@ impl AstPrinter {
                 write!(w, "{}{}", if *is_arrow { "->" } else { "." }, member)
             }
             ExprKind::Cast(ty, inner) => {
-                write!(w, "(")?;
-                self.print_ctype(ty, w)?;
-                write!(w, ")")?;
+                write!(w, "({ty})")?;
                 self.print_expr(inner, w)
             }
             ExprKind::SizeOf(inner) => {
@@ -239,29 +235,6 @@ impl AstPrinter {
                 self.print_expr(inner, w)?;
                 write!(w, ")")
             }
-        }
-    }
-
-    fn print_ctype(&self, ty: &CType, w: &mut impl Write) -> fmt::Result {
-        match ty {
-            CType::Void => write!(w, "void"),
-            CType::Int => write!(w, "int"),
-            CType::Char => write!(w, "char"),
-            CType::Float => write!(w, "float"),
-            CType::Double => write!(w, "double"),
-            CType::Pointer(inner) => {
-                self.print_ctype(inner, w)?;
-                write!(w, "*")
-            }
-            CType::Array(inner, size) => {
-                self.print_ctype(inner, w)?;
-                if let Some(s) = size {
-                    write!(w, "[{}]", s)
-                } else {
-                    write!(w, "[]")
-                }
-            }
-            CType::Struct(name) => write!(w, "struct {}", name),
         }
     }
 

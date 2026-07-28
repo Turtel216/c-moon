@@ -74,10 +74,7 @@ pub fn run() -> ExitCode {
     let resolution_map = match resolve_names(&ast) {
         Ok(map) => map,
         Err(e) => {
-            return fatal(&format!(
-                "internal compiler error: name resolution: {:?}",
-                e
-            ));
+            return fatal(&format!("internal compiler error: name resolution: {e}"));
         }
     };
 
