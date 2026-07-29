@@ -8,7 +8,7 @@ This project is an educational compiler designed to compile a strict subset of t
 
 The compiler is structured as a classic three-phase pipeline to separate language semantics from machine architecture:
 
-1. **Frontend:** A hand-rolled Lexer and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a .
+1. **Frontend:** A hand-rolled Lexer (scanner plus a small preprocessor) and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass.
 2. **Middle-End:** Lowers the AST into a linear, architecture-independent Three-Address Code (TAC) IR. This phase is responsible for target-independent optimizations.
 3. **Backend:** Translates the optimized IR into x86 assembly, utilizing a linear scan register allocator and managing x86 calling conventions.
 
@@ -47,7 +47,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
 * **Data Types:** `int`, `int[size]`;
-* **Control Flow:** `if` / `else`, `while` loops, `return`
+* **Control Flow:** `if` / `else`, `while` and `for` loops, `return`
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros** object like macros such as ``#define X 5`` and simple non-recursive function like macros.

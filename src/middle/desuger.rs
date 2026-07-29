@@ -190,6 +190,9 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_statement(&mut self, stmt: &Stmt) {
         match &stmt.kind {
+            // The empty statement produces no code.
+            StmtKind::Empty => {}
+
             StmtKind::Expr(expr) => {
                 // Includes assignments represented as BinaryOp::Assign.
                 let _ = self.lower_expression(expr);
@@ -367,9 +370,81 @@ impl<'a> LoweringContext<'a> {
                 self.set_current_block(dead_block);
             }
 
-            // Not in current scope;
-            StmtKind::For { .. } => {
-                todo!("For loops are not implemented yet")
+            // A `for` is lowered like a `while` with the init clause hoisted
+            // into the preheader and the step appended to the body:
+            //
+            //   <init>; goto cond
+            //   cond: if !condition goto end; goto body
+            //   body: <body>; <step>; goto cond
+            //   end:
+            StmtKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                let cond_label = self.create_block("for_cond");
+                let body_label = self.create_block("for_body");
+                let end_label = self.create_block("for_end");
+
+                // preheader: the init clause runs once, before the loop
+                if let Some(init) = init {
+                    self.lower_statement(init);
+                }
+                let preheader = self.current_block.clone();
+                self.emit(TACInstruction::new(
+                    Opcode::Jump,
+                    None,
+                    Some(Operand::Label(cond_label.clone())),
+                    None,
+                ));
+                self.add_edge(&preheader, &cond_label);
+
+                // cond block
+                self.set_current_block(cond_label.clone());
+                if let Some(condition) = condition {
+                    let cond = self.lower_expression(condition);
+
+                    // if !cond -> end
+                    self.emit(TACInstruction::new(
+                        Opcode::BranchIfNot,
+                        None,
+                        Some(cond),
+                        Some(Operand::Label(end_label.clone())),
+                    ));
+                    self.add_edge(&cond_label, &end_label);
+                }
+                // An omitted condition is always true, so `for (;;)` falls
+                // straight through to the body.
+
+                // else -> body
+                self.emit(TACInstruction::new(
+                    Opcode::Jump,
+                    None,
+                    Some(Operand::Label(body_label.clone())),
+                    None,
+                ));
+                self.add_edge(&cond_label, &body_label);
+
+                // body block, with the step at its end
+                self.set_current_block(body_label);
+                self.lower_statement(body);
+                if let Some(step) = step {
+                    let _ = self.lower_expression(step);
+                }
+
+                // back-edge body -> cond
+                let body_end = self.current_block.clone();
+                self.emit(TACInstruction::new(
+                    Opcode::Jump,
+                    None,
+                    Some(Operand::Label(cond_label.clone())),
+                    None,
+                ));
+                self.add_edge(&body_end, &cond_label);
+
+                // continue after loop
+                self.set_current_block(end_label);
             }
         }
     }

@@ -58,6 +58,8 @@ pub struct Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
+    /// A lone semicolon, e.g. the body of `while (drain()) ;`
+    Empty,
     /// A standalone expression followed by a semicolon, e.g., `x = 5;`
     Expr(Expr),
     /// e.g., `return x;`

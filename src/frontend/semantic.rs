@@ -381,6 +381,8 @@ impl SemanticAnalyzer {
 
     fn analyze_stmt(&mut self, stmt: &Stmt) -> SemanticResult<()> {
         match &stmt.kind {
+            StmtKind::Empty => Ok(()),
+
             StmtKind::Expr(expr) => self.analyze_expr(expr).map(|_| ()),
 
             StmtKind::Return(value) => {
@@ -420,7 +422,7 @@ impl SemanticAnalyzer {
                 // the loop.
                 self.in_new_scope(|analyzer| {
                     if let Some(init) = init {
-                        analyzer.analyze_stmt(init)?;
+                        analyzer.analyze_for_init(init)?;
                     }
                     if let Some(condition) = condition {
                         analyzer.analyze_condition(condition, "for condition")?;
@@ -432,15 +434,34 @@ impl SemanticAnalyzer {
                 })
             }
 
-            StmtKind::Block(items) => self.in_new_scope(|analyzer| {
-                for item in items {
-                    match item {
-                        BlockItem::Stmt(stmt) => analyzer.analyze_stmt(stmt)?,
-                        BlockItem::Decl(decl) => analyzer.analyze_decl(decl)?,
-                    }
-                }
-                Ok(())
-            }),
+            StmtKind::Block(items) => {
+                self.in_new_scope(|analyzer| analyzer.analyze_block_items(items))
+            }
+        }
+    }
+
+    /// Checks the items of a block in the scope that is already open.
+    fn analyze_block_items(&mut self, items: &[BlockItem]) -> SemanticResult<()> {
+        for item in items {
+            match item {
+                BlockItem::Stmt(stmt) => self.analyze_stmt(stmt)?,
+                BlockItem::Decl(decl) => self.analyze_decl(decl)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the init clause of a `for`, which belongs to the loop's scope.
+    ///
+    /// The parser wraps a declaration in the init clause in a block so that it
+    /// fits where a statement is expected. That wrapper must not get a scope of
+    /// its own, or the loop variable would go out of scope before the condition
+    /// is reached: in `for (int i = 0; i < n; i = i + 1)`, `i` has to stay
+    /// visible to the condition, the step and the body.
+    fn analyze_for_init(&mut self, init: &Stmt) -> SemanticResult<()> {
+        match &init.kind {
+            StmtKind::Block(items) => self.analyze_block_items(items),
+            _ => self.analyze_stmt(init),
         }
     }
 
@@ -730,6 +751,26 @@ mod tests {
     #[test]
     fn allows_shadowing_in_a_nested_block() {
         analyze_ok("int main() { int x = 1; { int x = 2; x = x + 1; } return x; }");
+    }
+
+    #[test]
+    fn accepts_a_variable_declared_in_a_for_init_clause() {
+        analyze_ok(
+            "int main() { int s = 0; for (int i = 0; i < 3; i = i + 1) { s = s + i; } return s; }",
+        );
+    }
+
+    #[test]
+    fn for_loop_variable_does_not_outlive_the_loop() {
+        match analyze_err("int main() { for (int i = 0; i < 3; i = i + 1) { } return i; }") {
+            SemanticError::UndeclaredVariable { name, .. } => assert_eq!(name, "i"),
+            other => panic!("expected UndeclaredVariable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_empty_statements() {
+        analyze_ok("int main() { ; if (1) ; else ; while (0) ; return 0; }");
     }
 
     #[test]

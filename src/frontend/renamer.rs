@@ -158,6 +158,8 @@ impl Renamer {
 
     fn resolve_stmt(&mut self, stmt: &Stmt) -> RenameResult<()> {
         match &stmt.kind {
+            StmtKind::Empty => Ok(()),
+
             StmtKind::Expr(expr) => self.resolve_expr(expr),
 
             StmtKind::Return(value) => match value {
@@ -191,7 +193,7 @@ impl Renamer {
             } => self.in_new_scope(|renamer| {
                 // A variable declared in the init clause is scoped to the loop.
                 if let Some(init) = init {
-                    renamer.resolve_stmt(init)?;
+                    renamer.resolve_for_init(init)?;
                 }
                 if let Some(condition) = condition {
                     renamer.resolve_expr(condition)?;
@@ -202,15 +204,34 @@ impl Renamer {
                 renamer.resolve_stmt(body)
             }),
 
-            StmtKind::Block(items) => self.in_new_scope(|renamer| {
-                for item in items {
-                    match item {
-                        BlockItem::Stmt(stmt) => renamer.resolve_stmt(stmt)?,
-                        BlockItem::Decl(decl) => renamer.resolve_decl(decl)?,
-                    }
-                }
-                Ok(())
-            }),
+            StmtKind::Block(items) => {
+                self.in_new_scope(|renamer| renamer.resolve_block_items(items))
+            }
+        }
+    }
+
+    /// Resolves the items of a block in the scope that is already open.
+    fn resolve_block_items(&mut self, items: &[BlockItem]) -> RenameResult<()> {
+        for item in items {
+            match item {
+                BlockItem::Stmt(stmt) => self.resolve_stmt(stmt)?,
+                BlockItem::Decl(decl) => self.resolve_decl(decl)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the init clause of a `for`, which belongs to the loop's scope.
+    ///
+    /// The parser wraps a declaration in the init clause in a block so that it
+    /// fits where a statement is expected. That wrapper must not get a scope of
+    /// its own, or the loop variable would go out of scope before the condition
+    /// is reached: in `for (int i = 0; i < n; i = i + 1)`, `i` has to stay
+    /// visible to the condition, the step and the body.
+    fn resolve_for_init(&mut self, init: &Stmt) -> RenameResult<()> {
+        match &init.kind {
+            StmtKind::Block(items) => self.resolve_block_items(items),
+            _ => self.resolve_stmt(init),
         }
     }
 
@@ -372,6 +393,7 @@ mod tests {
 
         fn index_stmt(&mut self, stmt: &Stmt) {
             match &stmt.kind {
+                StmtKind::Empty => {}
                 StmtKind::Expr(expr) => self.index_expr(expr),
                 StmtKind::Return(value) => {
                     if let Some(expr) = value {
@@ -547,6 +569,24 @@ mod tests {
             RenameError::RedeclarationInSameScope { name, .. } => assert_eq!(name, "x"),
             other => panic!("expected RedeclarationInSameScope, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scopes_a_for_loop_variable_to_the_loop() {
+        let (decls, index) =
+            parse("int main() { for (int i = 0; i < 3; i = i + 1) { } int i = 9; return i; }");
+        let map = resolve_names(&decls).expect("name resolution should succeed");
+
+        let loop_i = map.decl_to_var[&index.decl_of("i", 0)];
+        let outer_i = map.decl_to_var[&index.decl_of("i", 1)];
+
+        // The condition and the step see the loop variable...
+        assert_eq!(map.expr_to_var[&index.use_of("i", 0)], loop_i);
+        assert_eq!(map.expr_to_var[&index.use_of("i", 1)], loop_i);
+
+        // ... and it does not outlive the loop.
+        assert_ne!(loop_i, outer_i);
+        assert_eq!(map.expr_to_var[&index.use_of("i", 3)], outer_i);
     }
 
     #[test]

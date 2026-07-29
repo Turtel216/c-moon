@@ -87,6 +87,7 @@ impl AstPrinter {
     /// Prints statements without the leading indent (useful for blocks/loops)
     fn print_stmt_inner(&mut self, stmt: &Stmt, w: &mut impl Write) -> fmt::Result {
         match &stmt.kind {
+            StmtKind::Empty => write!(w, ";"),
             StmtKind::Expr(expr) => {
                 self.print_expr(expr, w)?;
                 write!(w, ";")

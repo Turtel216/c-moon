@@ -368,6 +368,11 @@ impl<'a> Parser<'a> {
     // ### Statements ###
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // A lone `;` is the empty statement: legal wherever a statement is, and
+        // the idiomatic body of a loop that does all its work in the header.
+        if self.match_kind(TokenKind::Semicolon) {
+            return Ok(self.mk_stmt(StmtKind::Empty));
+        }
         if self.match_kind(TokenKind::LBrace) {
             return self.parse_block();
         }
@@ -1098,6 +1103,33 @@ mod tests {
 
         // The declaration is wrapped in its own block, which is what scopes it.
         assert!(matches!(init.kind, StmtKind::Block(_)));
+    }
+
+    #[test]
+    fn parses_empty_statement() {
+        let items = parse_function_body("int f(){ ; return 0; }");
+
+        assert!(matches!(
+            items[0],
+            BlockItem::Stmt(Stmt {
+                kind: StmtKind::Empty,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_loop_with_an_empty_body() {
+        let items = parse_function_body("int f(){ for (int i = 0; i < 3; i = i + 1) ; return 0; }");
+
+        let body = match &items[0] {
+            BlockItem::Stmt(Stmt {
+                kind: StmtKind::For { body, .. },
+                ..
+            }) => body,
+            other => panic!("expected for statement, got {other:?}"),
+        };
+        assert!(matches!(body.kind, StmtKind::Empty));
     }
 
     #[test]
