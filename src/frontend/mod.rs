@@ -9,7 +9,7 @@
 //!
 //! [`span`] and [`scope`] hold the vocabulary the phases share: source
 //! locations, and the lexically scoped name table used by both resolution
-//! passes.
+//! passes; [`suggest`] turns an unresolved name into a "did you mean".
 
 pub mod ast;
 pub mod lexer;
@@ -18,3 +18,4 @@ pub mod renamer;
 pub mod scope;
 pub mod semantic;
 pub mod span;
+pub mod suggest;

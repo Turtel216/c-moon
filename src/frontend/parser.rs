@@ -8,7 +8,7 @@
 //! failed declaration or block item is recorded and the token stream is
 //! resynchronised, so one run reports every syntax error in the file.
 
-use crate::driver::diagnostics::CompilerError;
+use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
     BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Stmt,
     StmtKind, UnaryOp,
@@ -16,34 +16,59 @@ use crate::frontend::ast::{
 use crate::frontend::lexer::{LexError, Lexer, Token, TokenKind};
 use crate::frontend::span::Span;
 
-/// A syntax error, tied to the token that could not be accepted.
+/// A syntax error, tied to the source text that could not be accepted.
+///
+/// The fields are private: outside the parser an error is only ever turned
+/// into a [`Diagnostic`], so the wording stays this module's business.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
-    pub message: String,
-    pub span: Span,
+    /// The headline, e.g. ``expected `;`, found `return` ``.
+    message: String,
+    /// What the diagnostic points at.
+    span: Span,
+    /// Caption written under the span, e.g. ``expected `;` after declaration``.
+    label: String,
+    /// Which class of error this is, for the `error[E01xx]` header.
+    code: &'static str,
 }
 
 impl ParseError {
+    /// The parser wanted `expectation` and `found` turned up instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `expectation` - what the grammar allows here, already quoted where it
+    ///   names a literal token (see [`TokenKind`]'s `Display`)
+    /// * `context` - where in the construct the error is, e.g. `after
+    ///   declaration`; empty when the expectation speaks for itself
+    /// * `found` - the token that was actually there
+    /// * `span` - the text to underline, which is not always `found`'s
+    fn expected(expectation: &str, context: &str, found: &Token<'_>, span: Span) -> Self {
+        Self {
+            message: format!("expected {expectation}, found {}", found.describe()),
+            span,
+            label: match context.is_empty() {
+                true => format!("expected {expectation}"),
+                false => format!("expected {expectation} {context}"),
+            },
+            code: codes::SYNTAX,
+        }
+    }
+
     /// Wraps a lexical error, which reaches the caller as a parse failure.
     fn lexical(error: LexError, span: Span) -> Self {
         Self {
-            message: format!("lex error: {error}"),
+            message: error.to_string(),
             span,
+            label: String::from("not valid C"),
+            code: codes::LEXICAL,
         }
     }
 }
 
 impl CompilerError for ParseError {
-    fn get_span(&self) -> Span {
-        self.span
-    }
-
-    fn get_message(&self) -> String {
-        self.message.clone()
-    }
-
-    fn error_prefix(&self) -> String {
-        String::from("Syntax Error")
+    fn into_diagnostic(self) -> Diagnostic {
+        Diagnostic::error(self.code, self.message, self.span).with_label(self.label)
     }
 }
 
@@ -74,6 +99,16 @@ enum DeclContext {
     /// Inside a block. C has no nested functions, so only variables are
     /// accepted here.
     Block,
+}
+
+/// A parsed declarator: what a declaration declares, before its initializer,
+/// parameter list or body is read.
+struct Declarator {
+    name: String,
+    /// Where the name is written, for diagnostics about the name itself.
+    name_span: Span,
+    /// The type built up by the pointer and array modifiers around the name.
+    ty: CType,
 }
 
 pub struct Parser<'a> {
@@ -174,59 +209,72 @@ impl<'a> Parser<'a> {
     /// Parses one declaration: a struct definition, a variable, or -- at file
     /// scope -- a function prototype or definition.
     fn parse_decl(&mut self, context: DeclContext) -> PResult<Decl> {
+        // Every declaration node spans from its first token to its last, so the
+        // start is remembered before anything is consumed.
+        let start = self.current().span;
+
         if self.at_struct_decl() {
-            return self.parse_struct_decl();
+            return self.parse_struct_decl(start);
         }
 
         let base_ty = self.parse_type_specifier()?;
-        let (name, ty) = self.parse_declarator(base_ty)?;
+        let declarator = self.parse_declarator(base_ty)?;
 
         // Only a declarator followed by `(` at file scope is a function; inside
         // a block the variable path runs instead and rejects the `(`.
         if context == DeclContext::TopLevel && self.match_kind(TokenKind::LParen) {
-            return self.parse_function_tail(ty, name);
+            return self.parse_function_tail(start, declarator);
         }
-        self.parse_variable_tail(ty, name)
+        self.parse_variable_tail(start, declarator)
     }
 
     /// Parses a function's parameters and body, with `(` consumed.
-    fn parse_function_tail(&mut self, return_ty: CType, name: String) -> PResult<Decl> {
+    fn parse_function_tail(&mut self, start: Span, declarator: Declarator) -> PResult<Decl> {
         let params = self.parse_param_list()?;
-        self.expect(TokenKind::RParen, "expected ')' after parameter list")?;
+        self.expect(TokenKind::RParen, "after parameter list")?;
+
+        // The signature is what a diagnostic quotes; the body would drag the
+        // whole function into the snippet.
+        let signature = start.to(self.prev_span());
 
         let body = if self.match_kind(TokenKind::LBrace) {
-            Some(self.parse_block()?)
+            Some(self.parse_block(self.prev_span())?)
         } else {
-            self.expect(
-                TokenKind::Semicolon,
-                "expected ';' after function prototype",
-            )?;
+            self.expect(TokenKind::Semicolon, "after function prototype")?;
             None
         };
 
-        Ok(self.mk_decl(DeclKind::Function {
-            return_ty,
-            name,
-            params,
-            body,
-        }))
+        Ok(self.mk_decl(
+            DeclKind::Function {
+                return_ty: declarator.ty,
+                name: declarator.name,
+                params,
+                body,
+            },
+            signature,
+            declarator.name_span,
+        ))
     }
 
     /// Parses a variable declaration's initializer and terminator, with the
     /// declarator consumed.
-    fn parse_variable_tail(&mut self, ty: CType, name: String) -> PResult<Decl> {
+    fn parse_variable_tail(&mut self, start: Span, declarator: Declarator) -> PResult<Decl> {
         let initializer = if self.match_kind(TokenKind::Eq) {
             Some(self.parse_expr()?)
         } else {
             None
         };
-        self.expect(TokenKind::Semicolon, "expected ';' after declaration")?;
+        self.expect(TokenKind::Semicolon, "after declaration")?;
 
-        Ok(self.mk_decl(DeclKind::Variable {
-            ty,
-            name,
-            initializer,
-        }))
+        Ok(self.mk_decl(
+            DeclKind::Variable {
+                ty: declarator.ty,
+                name: declarator.name,
+                initializer,
+            },
+            start.to(self.prev_span()),
+            declarator.name_span,
+        ))
     }
 
     /// Whether the cursor sits on a struct declaration -- `struct [Tag] { ... };`
@@ -248,13 +296,16 @@ impl<'a> Parser<'a> {
 
     /// Parses `struct [Tag] { members };` or `struct Tag;`, with the cursor on
     /// `struct`.
-    fn parse_struct_decl(&mut self) -> PResult<Decl> {
-        self.expect(TokenKind::Struct, "expected 'struct'")?;
+    fn parse_struct_decl(&mut self, start: Span) -> PResult<Decl> {
+        self.expect(TokenKind::Struct, "")?;
 
-        let name = if self.check(TokenKind::Identifier) {
-            Some(self.advance().lexeme.to_string())
+        // An anonymous struct has no name to point at, so the tag's span falls
+        // back to the `struct` keyword.
+        let (name, name_span) = if self.check(TokenKind::Identifier) {
+            let tag = self.advance();
+            (Some(tag.lexeme.to_string()), tag.span)
         } else {
-            None
+            (None, start)
         };
 
         // A forward declaration names the tag but declares no members.
@@ -263,28 +314,34 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        self.expect(
-            TokenKind::Semicolon,
-            "expected ';' after struct declaration",
-        )?;
+        self.expect(TokenKind::Semicolon, "after struct declaration")?;
 
-        Ok(self.mk_decl(DeclKind::Struct { name, members }))
+        Ok(self.mk_decl(
+            DeclKind::Struct { name, members },
+            start.to(self.prev_span()),
+            name_span,
+        ))
     }
 
     /// Parses a struct body, with `{` consumed and up to and including `}`.
     fn parse_struct_members(&mut self) -> PResult<Vec<Decl>> {
         let mut members = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
+            let start = self.current().span;
             let base_ty = self.parse_type_specifier()?;
-            let (name, ty) = self.parse_declarator(base_ty)?;
-            self.expect(TokenKind::Semicolon, "expected ';' after struct member")?;
-            members.push(self.mk_decl(DeclKind::Variable {
-                ty,
-                name,
-                initializer: None,
-            }));
+            let declarator = self.parse_declarator(base_ty)?;
+            self.expect(TokenKind::Semicolon, "after struct member")?;
+            members.push(self.mk_decl(
+                DeclKind::Variable {
+                    ty: declarator.ty,
+                    name: declarator.name,
+                    initializer: None,
+                },
+                start.to(self.prev_span()),
+                declarator.name_span,
+            ));
         }
-        self.expect(TokenKind::RBrace, "expected '}' after struct body")?;
+        self.expect(TokenKind::RBrace, "after struct body")?;
         Ok(members)
     }
 
@@ -298,11 +355,9 @@ impl<'a> Parser<'a> {
             TokenKind::Void => CType::Void,
             TokenKind::Struct => {
                 self.advance();
-                return Ok(CType::Struct(
-                    self.expect_identifier("expected struct name")?,
-                ));
+                return Ok(CType::Struct(self.expect_identifier("after `struct`")?.0));
             }
-            _ => return self.err_here("expected type specifier"),
+            _ => return self.err_here("a type specifier"),
         };
         self.advance();
         Ok(ty)
@@ -313,14 +368,14 @@ impl<'a> Parser<'a> {
     ///
     /// # Returns
     ///
-    /// The declared name and the type it stands for, here `("p",
-    /// Array(Pointer(Int), 10))`.
-    fn parse_declarator(&mut self, mut ty: CType) -> PResult<(String, CType)> {
+    /// The declared name, where it is written, and the type it stands for --
+    /// here `p` and `Array(Pointer(Int), 10)`.
+    fn parse_declarator(&mut self, mut ty: CType) -> PResult<Declarator> {
         while self.match_kind(TokenKind::Star) {
             ty = CType::Pointer(Box::new(ty));
         }
 
-        let name = self.expect_identifier("expected identifier in declarator")?;
+        let (name, name_span) = self.expect_identifier("in declarator")?;
 
         // Array suffixes, e.g. `int a[10][20];`
         while self.match_kind(TokenKind::LBracket) {
@@ -329,11 +384,15 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            self.expect(TokenKind::RBracket, "expected ']'")?;
+            self.expect(TokenKind::RBracket, "after array size")?;
             ty = CType::Array(Box::new(ty), size);
         }
 
-        Ok((name, ty))
+        Ok(Declarator {
+            name,
+            name_span,
+            ty,
+        })
     }
 
     /// Parses a parameter list, with `(` consumed and stopping before `)`.
@@ -344,11 +403,12 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            let start = self.current().span;
             let base_ty = self.parse_type_specifier()?;
             // A prototype may omit the parameter name: `int f(int);`
             let (name, ty) = if self.check(TokenKind::Identifier) || self.check(TokenKind::Star) {
-                let (name, ty) = self.parse_declarator(base_ty)?;
-                (Some(name), ty)
+                let declarator = self.parse_declarator(base_ty)?;
+                (Some(declarator.name), declarator.ty)
             } else {
                 (None, base_ty)
             };
@@ -357,6 +417,7 @@ impl<'a> Parser<'a> {
                 ty,
                 name,
                 id: self.allocate_id(),
+                span: start.to(self.prev_span()),
             });
 
             if !self.match_kind(TokenKind::Comma) {
@@ -368,37 +429,41 @@ impl<'a> Parser<'a> {
     // ### Statements ###
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // Where the statement begins; every node's span runs from here to the
+        // last token the statement consumes.
+        let start = self.current().span;
+
         // A lone `;` is the empty statement: legal wherever a statement is, and
         // the idiomatic body of a loop that does all its work in the header.
         if self.match_kind(TokenKind::Semicolon) {
-            return Ok(self.mk_stmt(StmtKind::Empty));
+            return Ok(self.mk_stmt(StmtKind::Empty, start));
         }
         if self.match_kind(TokenKind::LBrace) {
-            return self.parse_block();
+            return self.parse_block(start);
         }
         if self.match_kind(TokenKind::If) {
-            return self.parse_if_stmt();
+            return self.parse_if_stmt(start);
         }
         if self.match_kind(TokenKind::While) {
-            return self.parse_while_stmt();
+            return self.parse_while_stmt(start);
         }
         if self.match_kind(TokenKind::For) {
-            return self.parse_for_stmt();
+            return self.parse_for_stmt(start);
         }
         if self.match_kind(TokenKind::Return) {
-            return self.parse_return_stmt();
+            return self.parse_return_stmt(start);
         }
 
         let expr = self.parse_expr()?;
-        self.expect(TokenKind::Semicolon, "expected ';' after expression")?;
-        Ok(self.mk_stmt(StmtKind::Expr(expr)))
+        self.expect(TokenKind::Semicolon, "after expression")?;
+        Ok(self.mk_stmt(StmtKind::Expr(expr), start))
     }
 
     /// Parses a block's items, with `{` consumed and up to and including `}`.
     ///
     /// Item-level errors are recovered from here rather than propagated, so a
     /// mistake in one statement does not hide the rest of the function.
-    fn parse_block(&mut self) -> PResult<Stmt> {
+    fn parse_block(&mut self, start: Span) -> PResult<Stmt> {
         let mut items = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.check(TokenKind::Eof) {
             let item = if self.at_declaration() {
@@ -412,14 +477,14 @@ impl<'a> Parser<'a> {
                 Err(error) => self.recover_from(error),
             }
         }
-        self.expect(TokenKind::RBrace, "expected '}' to close block")?;
-        Ok(self.mk_stmt(StmtKind::Block(items)))
+        self.expect(TokenKind::RBrace, "to close this block")?;
+        Ok(self.mk_stmt(StmtKind::Block(items), start))
     }
 
-    fn parse_if_stmt(&mut self) -> PResult<Stmt> {
-        self.expect(TokenKind::LParen, "expected '(' after if")?;
+    fn parse_if_stmt(&mut self, start: Span) -> PResult<Stmt> {
+        self.expect(TokenKind::LParen, "after `if`")?;
         let condition = self.parse_expr()?;
-        self.expect(TokenKind::RParen, "expected ')' after if condition")?;
+        self.expect(TokenKind::RParen, "after the `if` condition")?;
 
         let then_branch = Box::new(self.parse_stmt()?);
         let else_branch = if self.match_kind(TokenKind::Else) {
@@ -428,24 +493,27 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(self.mk_stmt(StmtKind::If {
-            condition,
-            then_branch,
-            else_branch,
-        }))
+        Ok(self.mk_stmt(
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            },
+            start,
+        ))
     }
 
-    fn parse_while_stmt(&mut self) -> PResult<Stmt> {
-        self.expect(TokenKind::LParen, "expected '(' after while")?;
+    fn parse_while_stmt(&mut self, start: Span) -> PResult<Stmt> {
+        self.expect(TokenKind::LParen, "after `while`")?;
         let condition = self.parse_expr()?;
-        self.expect(TokenKind::RParen, "expected ')' after while condition")?;
+        self.expect(TokenKind::RParen, "after the `while` condition")?;
 
         let body = Box::new(self.parse_stmt()?);
-        Ok(self.mk_stmt(StmtKind::While { condition, body }))
+        Ok(self.mk_stmt(StmtKind::While { condition, body }, start))
     }
 
-    fn parse_for_stmt(&mut self) -> PResult<Stmt> {
-        self.expect(TokenKind::LParen, "expected '(' after for")?;
+    fn parse_for_stmt(&mut self, start: Span) -> PResult<Stmt> {
+        self.expect(TokenKind::LParen, "after `for`")?;
 
         let init = self.parse_for_init()?;
 
@@ -453,7 +521,7 @@ impl<'a> Parser<'a> {
             None
         } else {
             let condition = self.parse_expr()?;
-            self.expect(TokenKind::Semicolon, "expected ';' after for condition")?;
+            self.expect(TokenKind::Semicolon, "after the `for` condition")?;
             Some(condition)
         };
 
@@ -462,20 +530,24 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.parse_expr()?)
         };
-        self.expect(TokenKind::RParen, "expected ')' after for clauses")?;
+        self.expect(TokenKind::RParen, "after the `for` clauses")?;
 
         let body = Box::new(self.parse_stmt()?);
-        Ok(self.mk_stmt(StmtKind::For {
-            init,
-            condition,
-            step,
-            body,
-        }))
+        Ok(self.mk_stmt(
+            StmtKind::For {
+                init,
+                condition,
+                step,
+                body,
+            },
+            start,
+        ))
     }
 
     /// Parses the first clause of a `for`, which may be empty, a declaration or
     /// an expression.
     fn parse_for_init(&mut self) -> PResult<Option<Box<Stmt>>> {
+        let start = self.current().span;
         if self.match_kind(TokenKind::Semicolon) {
             return Ok(None);
         }
@@ -484,24 +556,24 @@ impl<'a> Parser<'a> {
             // A declaration is wrapped in a block so that the loop variable is
             // scoped to the loop, matching `for (int i = 0; ...)`.
             let decl = self.parse_decl(DeclContext::Block)?;
-            self.mk_stmt(StmtKind::Block(vec![BlockItem::Decl(decl)]))
+            self.mk_stmt(StmtKind::Block(vec![BlockItem::Decl(decl)]), start)
         } else {
             let expr = self.parse_expr()?;
-            self.expect(TokenKind::Semicolon, "expected ';' after for init")?;
-            self.mk_stmt(StmtKind::Expr(expr))
+            self.expect(TokenKind::Semicolon, "after the `for` init clause")?;
+            self.mk_stmt(StmtKind::Expr(expr), start)
         };
 
         Ok(Some(Box::new(init)))
     }
 
-    fn parse_return_stmt(&mut self) -> PResult<Stmt> {
+    fn parse_return_stmt(&mut self, start: Span) -> PResult<Stmt> {
         let expr = if self.check(TokenKind::Semicolon) {
             None
         } else {
             Some(self.parse_expr()?)
         };
-        self.expect(TokenKind::Semicolon, "expected ';' after return")?;
-        Ok(self.mk_stmt(StmtKind::Return(expr)))
+        self.expect(TokenKind::Semicolon, "after the returned value")?;
+        Ok(self.mk_stmt(StmtKind::Return(expr), start))
     }
 
     // ### Expressions ###
@@ -557,16 +629,16 @@ impl<'a> Parser<'a> {
         }
 
         if self.match_kind(TokenKind::Sizeof) {
-            self.expect(TokenKind::LParen, "expected '(' after sizeof")?;
+            self.expect(TokenKind::LParen, "after `sizeof`")?;
             let operand = self.parse_expr()?;
-            self.expect(TokenKind::RParen, "expected ')' after sizeof argument")?;
+            self.expect(TokenKind::RParen, "after the `sizeof` operand")?;
             return Ok(self.mk_expr(ExprKind::SizeOf(Box::new(operand)), span));
         }
 
         if self.at_cast() {
-            self.expect(TokenKind::LParen, "expected '('")?;
+            self.expect(TokenKind::LParen, "to open the cast")?;
             let ty = self.parse_type_specifier()?;
-            self.expect(TokenKind::RParen, "expected ')' in cast")?;
+            self.expect(TokenKind::RParen, "to close the cast")?;
             let operand = self.parse_unary()?;
             return Ok(self.mk_expr(ExprKind::Cast(ty, Box::new(operand)), span));
         }
@@ -596,7 +668,7 @@ impl<'a> Parser<'a> {
 
             if self.match_kind(TokenKind::LBracket) {
                 let index = self.parse_expr()?;
-                self.expect(TokenKind::RBracket, "expected ']'")?;
+                self.expect(TokenKind::RBracket, "after the subscript")?;
                 expr = self.mk_expr(
                     ExprKind::Index {
                         array: Box::new(expr),
@@ -609,7 +681,7 @@ impl<'a> Parser<'a> {
 
             if self.check(TokenKind::Dot) || self.check(TokenKind::Arrow) {
                 let is_arrow = self.advance().kind == TokenKind::Arrow;
-                let member = self.expect_identifier("expected member name")?;
+                let member = self.expect_identifier("as the member name")?.0;
                 expr = self.mk_expr(
                     ExprKind::MemberAccess {
                         base: Box::new(expr),
@@ -639,7 +711,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.expect(TokenKind::RParen, "expected ')' after arguments")?;
+        self.expect(TokenKind::RParen, "after the arguments")?;
         Ok(args)
     }
 
@@ -671,12 +743,12 @@ impl<'a> Parser<'a> {
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_expr()?;
-                self.expect(TokenKind::RParen, "expected ')'")?;
+                self.expect(TokenKind::RParen, "to close the group")?;
                 // A parenthesised expression is its own node; the parentheses
                 // only guided precedence.
                 return Ok(inner);
             }
-            _ => return self.err_here("expected primary expression"),
+            _ => return self.err_here("an expression"),
         };
 
         Ok(self.mk_expr(kind, span))
@@ -774,23 +846,43 @@ impl<'a> Parser<'a> {
 
     /// Consumes the current token, requiring it to be of the given kind.
     ///
+    /// # Arguments
+    ///
+    /// * `kind` - the token the grammar requires here
+    /// * `context` - where in the construct it belongs, e.g. `after
+    ///   declaration`, used as the caption under the underline
+    ///
     /// # Errors
     ///
-    /// Returns a [`ParseError`] carrying `message`, located at the token that
-    /// was found instead.
-    fn expect(&mut self, kind: TokenKind, message: &str) -> PResult<()> {
-        if !self.match_kind(kind) {
-            return self.err_here(message);
+    /// Returns a [`ParseError`] blaming the token that was found instead --
+    /// except when the missing token is a `;` or the input has run out, where
+    /// the gap after the last token is blamed instead. Pointing at the next
+    /// token there reads as if the following line were at fault, and at the end
+    /// of input there is no token to point at at all.
+    fn expect(&mut self, kind: TokenKind, context: &str) -> PResult<()> {
+        if self.match_kind(kind) {
+            return Ok(());
         }
-        Ok(())
+
+        let span = match (kind, self.current().kind) {
+            (TokenKind::Semicolon, _) | (_, TokenKind::Eof) => self.prev_span().after(),
+            _ => self.current().span,
+        };
+        Err(ParseError::expected(
+            &kind.to_string(),
+            context,
+            self.current(),
+            span,
+        ))
     }
 
-    /// Consumes an identifier and returns its name.
-    fn expect_identifier(&mut self, message: &str) -> PResult<String> {
+    /// Consumes an identifier and returns its name and location.
+    fn expect_identifier(&mut self, context: &str) -> PResult<(String, Span)> {
         if !self.check(TokenKind::Identifier) {
-            return self.err_here(message);
+            return self.err_here_with("identifier", context);
         }
-        Ok(self.advance().lexeme.to_string())
+        let token = self.advance();
+        Ok((token.lexeme.to_string(), token.span))
     }
 
     /// Consumes the current token and returns it.
@@ -824,11 +916,20 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos + n).map(|token| token.kind)
     }
 
-    fn err_here<T>(&self, message: &str) -> PResult<T> {
-        Err(ParseError {
-            message: message.to_string(),
-            span: self.current().span,
-        })
+    /// Rejects the current token, which was not what the grammar allows here.
+    fn err_here<T>(&self, expectation: &str) -> PResult<T> {
+        self.err_here_with(expectation, "")
+    }
+
+    /// [`Parser::err_here`], with a phrase saying where in the construct the
+    /// expectation comes from.
+    fn err_here_with<T>(&self, expectation: &str, context: &str) -> PResult<T> {
+        Err(ParseError::expected(
+            expectation,
+            context,
+            self.current(),
+            self.current().span,
+        ))
     }
 
     // ### Node construction ###
@@ -839,30 +940,37 @@ impl<'a> Parser<'a> {
         id
     }
 
-    /// Builds an expression node; `span` is where the expression starts.
-    fn mk_expr(&mut self, kind: ExprKind, span: Span) -> Expr {
+    /// Builds an expression node covering `start` up to the last token consumed.
+    fn mk_expr(&mut self, kind: ExprKind, start: Span) -> Expr {
         Expr {
             id: self.allocate_id(),
             kind,
-            span,
+            span: start.to(self.prev_span()),
         }
     }
 
-    /// Builds a statement node, spanning the last token it consumed.
-    fn mk_stmt(&mut self, kind: StmtKind) -> Stmt {
+    /// Builds a statement node covering `start` up to the last token consumed.
+    fn mk_stmt(&mut self, kind: StmtKind, start: Span) -> Stmt {
         Stmt {
             id: self.allocate_id(),
             kind,
-            span: self.prev_span(),
+            span: start.to(self.prev_span()),
         }
     }
 
-    /// Builds a declaration node, spanning the last token it consumed.
-    fn mk_decl(&mut self, kind: DeclKind) -> Decl {
+    /// Builds a declaration node.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - what is being declared
+    /// * `span` - the declaration as written; see [`Decl::span`]
+    /// * `name_span` - the declared identifier alone
+    fn mk_decl(&mut self, kind: DeclKind, span: Span, name_span: Span) -> Decl {
         Decl {
             id: self.allocate_id(),
             kind,
-            span: self.prev_span(),
+            span,
+            name_span,
         }
     }
 }

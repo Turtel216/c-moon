@@ -426,7 +426,15 @@ struct Mark {
 
 impl Mark {
     /// Builds the span running from this mark to `end_pos`.
+    ///
+    /// Positions are narrowed to the `u32` a [`Span`] stores; a file large
+    /// enough to overflow one cannot be compiled anyway.
     fn span_to(self, end_pos: usize) -> Span {
-        Span::new(self.line, self.column, end_pos.saturating_sub(self.pos))
+        Span::new(
+            self.line as u32,
+            self.column as u32,
+            self.pos as u32,
+            end_pos.saturating_sub(self.pos) as u32,
+        )
     }
 }

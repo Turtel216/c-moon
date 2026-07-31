@@ -147,6 +147,106 @@ impl TokenKind {
     }
 }
 
+impl fmt::Display for TokenKind {
+    /// Names the token the way a diagnostic should refer to it.
+    ///
+    /// Tokens with a fixed spelling are quoted -- `` `;` ``, `` `while` `` --
+    /// while categories whose text varies are described in words, so that
+    /// `format!("expected {kind}")` reads correctly either way.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            TokenKind::Break => "`break`",
+            TokenKind::Case => "`case`",
+            TokenKind::Char => "`char`",
+            TokenKind::Const => "`const`",
+            TokenKind::Continue => "`continue`",
+            TokenKind::Default => "`default`",
+            TokenKind::Do => "`do`",
+            TokenKind::Double => "`double`",
+            TokenKind::Else => "`else`",
+            TokenKind::Enum => "`enum`",
+            TokenKind::Extern => "`extern`",
+            TokenKind::Float => "`float`",
+            TokenKind::For => "`for`",
+            TokenKind::Goto => "`goto`",
+            TokenKind::If => "`if`",
+            TokenKind::Int => "`int`",
+            TokenKind::Long => "`long`",
+            TokenKind::Return => "`return`",
+            TokenKind::Short => "`short`",
+            TokenKind::Signed => "`signed`",
+            TokenKind::Sizeof => "`sizeof`",
+            TokenKind::Static => "`static`",
+            TokenKind::Struct => "`struct`",
+            TokenKind::Switch => "`switch`",
+            TokenKind::Typedef => "`typedef`",
+            TokenKind::Union => "`union`",
+            TokenKind::Unsigned => "`unsigned`",
+            TokenKind::Void => "`void`",
+            TokenKind::Volatile => "`volatile`",
+            TokenKind::While => "`while`",
+
+            TokenKind::Identifier => "identifier",
+            TokenKind::IntegerLiteral => "integer literal",
+            TokenKind::FloatLiteral => "floating-point literal",
+            TokenKind::StringLiteral => "string literal",
+            TokenKind::CharLiteral => "character literal",
+
+            TokenKind::Plus => "`+`",
+            TokenKind::Minus => "`-`",
+            TokenKind::Star => "`*`",
+            TokenKind::Slash => "`/`",
+            TokenKind::Percent => "`%`",
+            TokenKind::Eq => "`=`",
+            TokenKind::EqEq => "`==`",
+            TokenKind::Bang => "`!`",
+            TokenKind::BangEq => "`!=`",
+            TokenKind::Less => "`<`",
+            TokenKind::LessEq => "`<=`",
+            TokenKind::Greater => "`>`",
+            TokenKind::GreaterEq => "`>=`",
+            TokenKind::Ampersand => "`&`",
+            TokenKind::AmpAmp => "`&&`",
+            TokenKind::Pipe => "`|`",
+            TokenKind::PipePipe => "`||`",
+            TokenKind::Caret => "`^`",
+            TokenKind::Tilde => "`~`",
+            TokenKind::Shl => "`<<`",
+            TokenKind::Shr => "`>>`",
+            TokenKind::PlusPlus => "`++`",
+            TokenKind::MinusMinus => "`--`",
+            TokenKind::PlusEq => "`+=`",
+            TokenKind::MinusEq => "`-=`",
+            TokenKind::StarEq => "`*=`",
+            TokenKind::SlashEq => "`/=`",
+            TokenKind::PercentEq => "`%=`",
+            TokenKind::AmpEq => "`&=`",
+            TokenKind::PipeEq => "`|=`",
+            TokenKind::CaretEq => "`^=`",
+            TokenKind::ShlEq => "`<<=`",
+            TokenKind::ShrEq => "`>>=`",
+
+            TokenKind::LParen => "`(`",
+            TokenKind::RParen => "`)`",
+            TokenKind::LBrace => "`{`",
+            TokenKind::RBrace => "`}`",
+            TokenKind::LBracket => "`[`",
+            TokenKind::RBracket => "`]`",
+            TokenKind::Comma => "`,`",
+            TokenKind::Semicolon => "`;`",
+            TokenKind::Colon => "`:`",
+            TokenKind::Dot => "`.`",
+            TokenKind::Arrow => "`->`",
+            TokenKind::Question => "`?`",
+
+            TokenKind::Eof => "end of file",
+            TokenKind::Error(error) => return write!(f, "{error}"),
+        };
+
+        f.write_str(name)
+    }
+}
+
 /// Why the scanner could not turn a piece of input into a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LexError {
@@ -194,6 +294,19 @@ impl<'a> Token<'a> {
             kind,
             lexeme: Cow::Owned(lexeme.into()),
             span,
+        }
+    }
+
+    /// Names this token as a diagnostic should refer to it.
+    ///
+    /// A token that carries text is quoted as written -- `` `return` `` -- so
+    /// the message shows what the reader typed; the end of input has no text to
+    /// quote and is described instead. The result borrows the lexeme whenever
+    /// no quoting is needed.
+    pub fn describe(&self) -> Cow<'_, str> {
+        match self.kind {
+            TokenKind::Eof => Cow::Borrowed("end of file"),
+            _ => Cow::Owned(format!("`{}`", self.lexeme)),
         }
     }
 

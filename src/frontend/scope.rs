@@ -69,6 +69,27 @@ impl<T> ScopeStack<T> {
     pub fn lookup(&self, name: &str) -> Option<&T> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
+
+    /// Looks `name` up in the innermost scope alone.
+    ///
+    /// This is what a failed [`ScopeStack::declare`] is followed by: the name
+    /// that blocked the declaration is the one in *this* scope, not a shadowed
+    /// one from an enclosing scope.
+    pub fn lookup_local(&self, name: &str) -> Option<&T> {
+        self.scopes.last().and_then(|scope| scope.get(name))
+    }
+
+    /// Every name in scope, innermost first.
+    ///
+    /// A name shadowed by an inner declaration is yielded twice; callers that
+    /// only search the names -- suggesting a correction for a typo, say -- do
+    /// not care, and de-duplicating would cost an allocation.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.keys().map(String::as_str))
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +115,29 @@ mod tests {
         assert!(scopes.declare("x", 1));
         assert!(!scopes.declare("x", 2));
         assert_eq!(scopes.lookup("x"), Some(&1));
+    }
+
+    #[test]
+    fn finds_the_name_that_blocked_a_declaration() {
+        let mut scopes = ScopeStack::new();
+        assert!(scopes.declare("x", 1));
+
+        scopes.push_scope();
+        assert_eq!(scopes.lookup_local("x"), None);
+        assert!(scopes.declare("x", 2));
+        assert_eq!(scopes.lookup_local("x"), Some(&2));
+    }
+
+    #[test]
+    fn lists_the_names_in_scope() {
+        let mut scopes = ScopeStack::new();
+        assert!(scopes.declare("outer", 1));
+        scopes.push_scope();
+        assert!(scopes.declare("inner", 2));
+
+        let mut names: Vec<&str> = scopes.names().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["inner", "outer"]);
     }
 
     #[test]

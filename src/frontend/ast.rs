@@ -94,7 +94,13 @@ pub enum BlockItem {
 pub struct Decl {
     pub id: NodeId,
     pub kind: DeclKind,
+    /// The declaration as written. A function's span stops at its parameter
+    /// list: underlining a whole definition would quote the entire body.
     pub span: Span,
+    /// The declared identifier on its own, which is what a diagnostic about
+    /// the *name* -- a redeclaration, say -- points at. An unnamed declaration
+    /// repeats `span` here.
+    pub name_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +130,9 @@ pub struct ParamDecl {
     pub ty: CType,
     pub name: Option<String>,
     pub id: NodeId,
+    /// The parameter as written, so a bad argument can be blamed on the
+    /// parameter it was passed for.
+    pub span: Span,
 }
 
 /// Representation of C Types
