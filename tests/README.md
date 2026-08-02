@@ -96,7 +96,25 @@ error rather than a vacuous pass.
 
 Compile a program the compiler must reject and compare the diagnostics against
 a checked-in `.stderr` snapshot sitting next to the fixture. Machine-specific
-paths are folded into `$DIR` and `$TMP`, so the snapshots are portable.
+paths are folded into `$DIR` and `$TMP`, so the snapshots are portable, and the
+compiler is run with `NO_COLOR=1` so no escape sequence reaches the snapshot.
+
+```text
+error[E0201]: cannot find value `countr` in this scope
+ --> $DIR/similar-name.c:5:12
+  |
+5 |     return countr;
+  |            ^^^^^^ not found in this scope
+  |
+  = help: a variable with a similar name exists: `counter`
+
+error: aborting due to 1 previous error
+```
+
+A fixture covers one diagnostic: the snapshot is the whole point of the test,
+so a file that trips several errors at once makes a change to any of them look
+like a change to all of them. `reports-every-error.c` is the deliberate
+exception -- reporting more than one error *is* what it tests.
 
 Snapshots are data, not hand-written text. After changing a diagnostic:
 

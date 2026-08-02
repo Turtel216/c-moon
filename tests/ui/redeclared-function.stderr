@@ -1,3 +1,11 @@
-Type Error 4:21 Redeclared function 'f'
+error[E0203]: the name `f` is defined multiple times
+ --> $DIR/redeclared-function.c:4:5
+  |
+3 | int f() { return 1; }
+  | ------- previous definition of `f` here
+4 | int f() { return 2; }
+  |     ^ `f` redefined here
+  |
+  = note: `f` must be defined only once
 
-1 error generated.
+error: aborting due to 1 previous error

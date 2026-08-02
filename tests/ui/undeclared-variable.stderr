@@ -1,3 +1,7 @@
-Type Error 4:12 Undeclared variable 'value'
+error[E0201]: cannot find value `value` in this scope
+ --> $DIR/undeclared-variable.c:4:12
+  |
+4 |     return value;
+  |            ^^^^^ not found in this scope
 
-1 error generated.
+error: aborting due to 1 previous error

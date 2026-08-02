@@ -1,0 +1,9 @@
+error[E0201]: cannot find value `countr` in this scope
+ --> $DIR/similar-name.c:5:12
+  |
+5 |     return countr;
+  |            ^^^^^^ not found in this scope
+  |
+  = help: a variable with a similar name exists: `counter`
+
+error: aborting due to 1 previous error

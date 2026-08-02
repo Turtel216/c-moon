@@ -8,7 +8,7 @@ This project is an educational compiler designed to compile a strict subset of t
 
 The compiler is structured as a classic three-phase pipeline to separate language semantics from machine architecture:
 
-1. **Frontend:** A hand-rolled Lexer (scanner plus a small preprocessor) and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass.
+1. **Frontend:** A hand-rolled Lexer (scanner plus a small preprocessor) and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass. Every node carries a source span, which the diagnostics renderer turns into an annotated snippet.
 2. **Middle-End:** Lowers the AST into a linear, architecture-independent Three-Address Code (TAC) IR. This phase is responsible for target-independent optimizations.
 3. **Backend:** Translates the optimized IR into x86 assembly, utilizing a linear scan register allocator and managing x86 calling conventions.
 
@@ -35,12 +35,18 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 - [x] **Register Allocation:** Implementing a Linear Scan Register Allocator.
 - [x] **Code Emission:** Generating valid `.s` files assembled via GCC.
 
-**Phase 4: Support more C language features (In Progress)**
+**Phase 4: Diagnostics (Done)**
+- [x] **Source snippets:** `rustc`-style errors that quote the offending line and underline it.
+- [x] **Error codes:** every diagnostic carries a stable `E0xxx` code.
+- [x] **Secondary spans:** the earlier declaration, the parameter or the return type that explains the error is quoted alongside it.
+- [x] **Suggestions:** an unknown name proposes the closest one in scope.
+- [x] **Error recovery:** the parser and the analyzer both keep going, so one run reports every problem it can.
+
+**Phase 5: Support more C language features (In Progress)**
 - [x] Preprocessor macros (Partially)
 - [x] Static sized arrays
 - [x] Pointers
-- [ ] `char` data type
-- [ ] `strings`
+- [ ] add additional data types 
 - [ ] `extern` keyword and linking to GCC compiled C programs and standard library
 
 ## Supported Language Subset
@@ -52,6 +58,30 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros** object like macros such as ``#define X 5`` and simple non-recursive function like macros.
 * **Pointers**: Support for referencing and dereferencing. Does not support pointer arithmetic yet.
+
+## Diagnostics
+
+Errors are reported the way `rustc` reports them: a headline with a code, the
+location, the offending line, and an underline saying what is wrong. Related
+spans are quoted too, so the error and its cause are visible at once.
+
+```text
+error[E0203]: the name `a` is defined multiple times
+ --> tests/ui/redeclared-variable.c:5:9
+  |
+4 |     int a = 1;
+  |         - previous declaration of `a` here
+5 |     int a = 2;
+  |         ^ `a` redeclared here
+  |
+  = note: `a` must be declared only once in the same scope
+
+error: aborting due to 1 previous error
+```
+
+Colour is used on a terminal and dropped when the output is redirected or when
+`NO_COLOR` is set. The `tests/ui` suite pins every message down as a snapshot,
+so a change in wording shows up as a reviewable diff.
 
 ## Getting Started
 

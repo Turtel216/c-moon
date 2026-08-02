@@ -1,0 +1,9 @@
+error[E0204]: mismatched types
+ --> $DIR/mismatched-types.c:6:16
+  |
+6 |     int copy = pointer;
+  |         ----   ^^^^^^^ expected `int`, found `int*`
+  |         |
+  |         expected because of this declaration
+
+error: aborting due to 1 previous error

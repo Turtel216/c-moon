@@ -1,3 +1,9 @@
-Type Error 5:5 Invalid assignment
+error[E0206]: cannot assign to this expression
+ --> $DIR/invalid-assignment-target.c:5:5
+  |
+5 |     1 = a;
+  |     ^ not an lvalue
+  |
+  = note: only variables, array elements and dereferences are lvalues
 
-1 error generated.
+error: aborting due to 1 previous error

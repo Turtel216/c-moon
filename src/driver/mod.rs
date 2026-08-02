@@ -28,13 +28,14 @@ pub mod diagnostics;
 pub fn run() -> ExitCode {
     // Get command line arguments
     let cli = get_arguments();
-    let mut diagnostics = Diagnostics::new();
 
-    // Read source file
+    // Read source file. Diagnostics quote from it, so it is read before there
+    // is anywhere to report an error to.
     let source_program = match fs::read_to_string(&cli.source_file) {
         Ok(source) => source,
         Err(e) => return fatal(&format!("cannot read '{}': {}", cli.source_file, e)),
     };
+    let mut diagnostics = Diagnostics::new(&cli.source_file, &source_program);
 
     // Tokenize program
     let lexer = Lexer::new(&source_program);

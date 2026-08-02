@@ -1,3 +1,10 @@
-Type Error 8:12 Argument count mismatch for function 'add'. Expected 2 got 1
+error[E0205]: this function takes 2 arguments but 1 argument was supplied
+ --> $DIR/argument-count-mismatch.c:8:12
+  |
+3 | int add(int a, int b) {
+  | --------------------- function `add` defined here
+...
+8 |     return add(1);
+  |            ^^^^^^ expected 2 arguments, found 1
 
-1 error generated.
+error: aborting due to 1 previous error

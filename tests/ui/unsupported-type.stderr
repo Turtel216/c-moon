@@ -1,0 +1,9 @@
+error[E0207]: the type `float` is not supported yet
+ --> $DIR/unsupported-type.c:4:5
+  |
+4 |     float ratio;
+  |     ^^^^^^^^^^^^ in this declaration
+  |
+  = note: this compiler implements the subset of C listed in its README
+
+error: aborting due to 1 previous error

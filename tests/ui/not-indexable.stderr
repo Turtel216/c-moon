@@ -1,0 +1,9 @@
+error[E0204]: cannot index into a value of type `int`
+ --> $DIR/not-indexable.c:5:12
+  |
+5 |     return value[0];
+  |            ^^^^^ not an array
+  |
+  = note: only a value of array type can be indexed
+
+error: aborting due to 1 previous error
