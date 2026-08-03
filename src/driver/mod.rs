@@ -108,14 +108,13 @@ pub fn run() -> ExitCode {
         println!("{}", output);
     }
 
-    // Emit x86 assembly
-    let asm = backend::pipeline::compile_program(&ir);
+    // Select instructions, allocate registers and emit assembly
+    let assembly = backend::compile_to_assembly(&ir);
 
     // Output assembly to file
     let asm_output = format!("{}.s", cli.output_file);
     let out_path = Path::new(&asm_output);
-    let asm_program = backend::emit::emit_asm(&asm);
-    if let Err(e) = fs::write(out_path, asm_program) {
+    if let Err(e) = fs::write(out_path, assembly) {
         return fatal(&format!("cannot write '{}': {}", asm_output, e));
     }
 

@@ -10,7 +10,7 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 
 1. **Frontend:** A hand-rolled Lexer (scanner plus a small preprocessor) and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass. Every node carries a source span, which the diagnostics renderer turns into an annotated snippet.
 2. **Middle-End:** Lowers the AST into a linear, architecture-independent Three-Address Code (TAC) IR. This phase is responsible for target-independent optimizations.
-3. **Backend:** Translates the optimized IR into x86 assembly, utilizing a linear scan register allocator and managing x86 calling conventions.
+3. **Backend:** Translates the optimized IR into machine code. It is split into stages that are the same for every machine -- CFG linearization, liveness analysis, a linear scan register allocator and stack frame layout -- and one module per target that supplies the rest. A target is described by the `Target` trait: its register file, frame parameters, instruction selection and assembly syntax. x86-64 with the System V AMD64 ABI is the only one implemented, and everything before instruction selection is reused as it stands by any target added next.
 
 ## Development Roadmap
 
@@ -34,6 +34,8 @@ The compiler is structured as a classic three-phase pipeline to separate languag
 - [x] **Instruction Selection:** Mapping TAC operations to x86 instructions.
 - [x] **Register Allocation:** Implementing a Linear Scan Register Allocator.
 - [x] **Code Emission:** Generating valid `.s` files assembled via GCC.
+- [x] **Target abstraction:** Machine-independent stages behind a `Target` trait,
+      so a second architecture reuses them.
 
 **Phase 4: Diagnostics (Done)**
 - [x] **Source snippets:** `rustc`-style errors that quote the offending line and underline it.
