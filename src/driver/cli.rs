@@ -16,6 +16,13 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub opt: bool, // TODO: find better name, cant use O because of conflict with output_file
 
+    /// Round-trip the middle-end through SSA form.
+    ///
+    /// Temporary: the round trip becomes unconditional once it is proven to
+    /// preserve behaviour, and this flag goes away with it.
+    #[arg(long, default_value_t = false)]
+    pub ssa: bool,
+
     /// Pretty print AST
     #[arg(long, default_value_t = false)]
     pub printast: bool,

@@ -8,7 +8,8 @@ use diagnostics::Diagnostics;
 use crate::{
     backend,
     frontend::{lexer::Lexer, parser::Parser, renamer::resolve_names, semantic::SemanticAnalyzer},
-    middle::desuger::LoweringContext,
+    middle::desuger::{LoweringContext, ProgramIr},
+    middle::ssa,
     printer::{ast_printer::AstPrinter, ir_printer::IrPrinter},
 };
 
@@ -88,6 +89,12 @@ pub fn run() -> ExitCode {
         ir.optimize();
     }
 
+    // Round-trip the middle-end through SSA form. Nothing optimises on the
+    // way through yet, so this is expected to preserve behaviour exactly.
+    if cli.ssa {
+        round_trip_through_ssa(&mut ir);
+    }
+
     let mut output = String::new();
     // Print AST to console
     if cli.printast {
@@ -127,6 +134,19 @@ pub fn run() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Rebuild every function by way of SSA form.
+///
+/// The result is the same program: construction and destruction are inverses,
+/// and no pass runs in between.  What it buys is that every test exercises the
+/// two, which is what has to be true before anything optimises on SSA.
+fn round_trip_through_ssa(ir: &mut ProgramIr) {
+    for (name, cfg) in ir.functions.iter_mut() {
+        let function = ssa::build::build(name, cfg);
+        ssa::verify::debug_assert_valid(&function, "SSA construction");
+        *cfg = ssa::destruct::to_cfg(&function);
+    }
 }
 
 /// Invokes GCC on the ``asm_output`` file and produces the executable.
