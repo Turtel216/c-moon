@@ -13,8 +13,7 @@
 //! refer to.  Those stay [`Slot`]s and are reached exclusively through
 //! [`Op::SlotLoad`] and [`Op::SlotStore`]; the two never mix, and the type of
 //! each field decides which one it is.  Which variables qualify is decided by
-//! the promotion analysis, and nothing else in this module makes that
-//! judgement.
+//! [`promote`], and nothing else in this module makes that judgement.
 //!
 //! # Edges and phi arguments
 //!
@@ -28,6 +27,7 @@
 pub mod build;
 pub mod destruct;
 pub mod dom;
+pub mod promote;
 pub mod verify;
 
 use std::collections::HashMap;
