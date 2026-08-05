@@ -27,6 +27,7 @@
 pub mod build;
 pub mod destruct;
 pub mod dom;
+pub mod mem2reg;
 pub mod promote;
 pub mod verify;
 
@@ -92,6 +93,15 @@ impl InstId {
 pub struct SlotId(u32);
 
 impl SlotId {
+    /// The slot at position `index` of its function's slot arena.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` does not fit in a `u32`.
+    pub fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("Compiler Bug: more slots than a u32 can index"))
+    }
+
     /// This slot's position in its function's slot arena.
     pub fn index(self) -> usize {
         self.0 as usize
@@ -517,7 +527,7 @@ impl Function {
 
     /// Every slot of the function, in arena order.
     pub fn slot_ids(&self) -> impl Iterator<Item = SlotId> {
-        (0..self.slots.len()).map(|index| SlotId(index as u32))
+        (0..self.slots.len()).map(SlotId::from_index)
     }
 
     /// One memory location.
@@ -545,7 +555,7 @@ impl Function {
         if let Some(&slot) = self.slot_of_origin.get(&origin) {
             return slot;
         }
-        let slot = SlotId(self.slots.len() as u32);
+        let slot = SlotId::from_index(self.slots.len());
         self.slots.push(Slot {
             origin: origin.clone(),
         });
