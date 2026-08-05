@@ -42,7 +42,40 @@ pub fn build(name: &str, cfg: &CFG) -> Function {
     // in the source leaves one behind, so they go before anything looks at
     // the graph shape.
     function.retain_reachable();
+    split_critical_edges(&mut function);
     function
+}
+
+/// Break up every critical edge, so that each one has a block of its own.
+///
+/// An edge is *critical* when it leaves a block that branches and arrives at a
+/// block that is branched into from elsewhere as well.  Such an edge has
+/// nowhere to put code that must run on it and on no other path -- which is
+/// exactly what a phi node is -- so leaving out a block for it makes phi
+/// nodes impossible to lower correctly.
+///
+/// The blocks this adds contain nothing but a jump.  From here on the
+/// control-flow graph is kept free of critical edges, and the verifier checks
+/// it.
+pub fn split_critical_edges(function: &mut Function) {
+    // Collected before anything is split: splitting adds blocks, and a block
+    // added for one edge can never be on a critical edge itself.
+    let mut critical = Vec::new();
+    for block in function.block_ids() {
+        let successors: Vec<BlockId> = function.block(block).successors().collect();
+        if successors.len() < 2 {
+            continue;
+        }
+        for successor in successors {
+            if function.block(successor).preds().len() > 1 {
+                critical.push((block, successor));
+            }
+        }
+    }
+
+    for (from, to) in critical {
+        function.split_edge(from, to);
+    }
 }
 
 /// The state of one function's translation.
@@ -673,6 +706,85 @@ function f {
             .map(|instr| instr.opcode.clone())
             .collect();
         assert_eq!(opcodes[..2], [Opcode::GetParam, Opcode::GetParam]);
+    }
+
+    #[test]
+    fn a_critical_edge_gets_a_block_of_its_own() {
+        // Arrange: the branch in `entry` goes straight to `join`, which the
+        // other arm also reaches -- a critical edge in the shape an `if` with
+        // an empty arm produces.
+        let function = build_verified(&[
+            (
+                "entry",
+                vec![
+                    instr(
+                        Opcode::BranchIf,
+                        None,
+                        Some(temp("t1")),
+                        Some(label("consequent")),
+                    ),
+                    jump("join"),
+                ],
+            ),
+            ("consequent", vec![jump("join")]),
+            ("join", vec![instr(Opcode::Ret, None, None, None)]),
+        ]);
+
+        // Assert: a block was interposed, and it holds nothing but the jump.
+        let entry = function.entry();
+        let arms: Vec<String> = function
+            .block(entry)
+            .successors()
+            .map(|block| function.block(block).label.clone())
+            .collect();
+        assert_eq!(
+            arms,
+            vec!["consequent".to_string(), "entry_to_join".to_string()]
+        );
+
+        let split = function
+            .block_ids()
+            .find(|&block| function.block(block).label == "entry_to_join")
+            .expect("the critical edge was split");
+        assert!(function.block(split).insts.is_empty());
+        assert_eq!(
+            function.block(split).successors().collect::<Vec<_>>().len(),
+            1
+        );
+
+        // The join keeps both predecessors, one of them by way of the new
+        // block, so any phi argument would still line up.
+        let join = function
+            .block_ids()
+            .find(|&block| function.block(block).label == "join")
+            .expect("the join survives");
+        assert_eq!(function.block(join).preds().len(), 2);
+    }
+
+    #[test]
+    fn an_edge_that_is_not_critical_is_left_alone() {
+        // Arrange: both arms lead to blocks of their own, so neither edge has
+        // anywhere it needs to put code.
+        let function = build_verified(&[
+            (
+                "entry",
+                vec![
+                    instr(
+                        Opcode::BranchIf,
+                        None,
+                        Some(temp("t1")),
+                        Some(label("consequent")),
+                    ),
+                    jump("otherwise"),
+                ],
+            ),
+            ("consequent", vec![jump("join")]),
+            ("otherwise", vec![jump("join")]),
+            ("join", vec![instr(Opcode::Ret, None, None, None)]),
+        ]);
+
+        // Assert: four blocks, exactly the ones written above.
+        assert_eq!(function.block_count(), 4);
     }
 
     #[test]

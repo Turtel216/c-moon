@@ -83,6 +83,10 @@ pub enum SsaError {
     /// An incoming argument read outside the entry block's opening run of
     /// them, which the backend lowers as a single simultaneous assignment.
     ParameterOutOfPrologue { block: String, inst: String },
+
+    /// An edge from a block that branches into a block with several
+    /// predecessors.  Phi nodes on such an edge have nowhere to be lowered to.
+    CriticalEdge { from: String, to: String },
 }
 
 impl fmt::Display for SsaError {
@@ -159,6 +163,11 @@ impl fmt::Display for SsaError {
                 "`{inst}` in .{block} reads an incoming argument outside the entry block's \
                  opening run of them"
             ),
+            SsaError::CriticalEdge { from, to } => write!(
+                f,
+                "the edge .{from} -> .{to} is critical: .{from} branches and .{to} is entered \
+                 from elsewhere too"
+            ),
         }
     }
 }
@@ -192,6 +201,7 @@ pub fn verify_ssa(function: &Function) -> Result<(), Vec<SsaError>> {
     check_edges(function, &mut errors);
     check_definitions(function, &mut errors);
     check_parameter_prologue(function, &mut errors);
+    check_critical_edges(function, &mut errors);
 
     if errors.is_empty() {
         check_dominance(function, &mut errors);
@@ -398,6 +408,25 @@ fn check_parameter_prologue(function: &Function, errors: &mut Vec<SsaError>) {
                 });
             }
             in_prologue &= is_parameter;
+        }
+    }
+}
+
+/// No edge may leave a block that branches and arrive at a block that is
+/// entered from somewhere else as well.
+fn check_critical_edges(function: &Function, errors: &mut Vec<SsaError>) {
+    for block in function.block_ids() {
+        let successors: Vec<BlockId> = function.block(block).successors().collect();
+        if successors.len() < 2 {
+            continue;
+        }
+        for successor in successors {
+            if function.block(successor).preds().len() > 1 {
+                errors.push(SsaError::CriticalEdge {
+                    from: function.block(block).label.clone(),
+                    to: function.block(successor).label.clone(),
+                });
+            }
         }
     }
 }
