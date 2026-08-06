@@ -24,6 +24,8 @@ pub struct ProgramIr {
     /// Maps variable id → array element count for each local array.
     /// Used by the backend to allocate stack space.
     pub array_sizes: HashMap<usize, usize>,
+    /// Maps variable id → the name it was declared with, for IR dumps.
+    pub var_names: HashMap<usize, String>,
 }
 
 impl ProgramIr {
@@ -31,6 +33,7 @@ impl ProgramIr {
         Self {
             functions: BTreeMap::new(),
             array_sizes: HashMap::new(),
+            var_names: HashMap::new(),
         }
     }
 
@@ -78,6 +81,8 @@ impl<'a> LoweringContext<'a> {
 
     /// Desuger a list of AST ``Decl`` into the ``ProgramIr``
     pub fn lower_program(mut self, decls: &[Decl]) -> ProgramIr {
+        self.program.var_names = self.res_map.var_names.clone();
+
         for decl in decls {
             match &decl.kind {
                 DeclKind::Function {

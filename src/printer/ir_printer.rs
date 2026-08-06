@@ -239,7 +239,10 @@ pub struct ValueText<'a> {
 impl fmt::Display for ValueText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.function.value_def(self.value).source {
-            Some(source) => write!(f, "%r{}.{}", source.variable, source.version),
+            Some(source) => match self.function.variable_name(source.variable) {
+                Some(name) => write!(f, "%{}.{}", name, source.version),
+                None => write!(f, "%r{}.{}", source.variable, source.version),
+            },
             None => write!(f, "%v{}", self.value.index()),
         }
     }

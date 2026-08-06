@@ -438,6 +438,8 @@ pub struct Function {
     slots: Vec<Slot>,
     /// Reverse lookup for slot creation, so one variable gets one slot.
     slot_of_origin: HashMap<SlotOrigin, SlotId>,
+    /// What each source variable was called, for dumps and diagnostics.
+    names: HashMap<VarId, String>,
     entry: BlockId,
 }
 
@@ -465,6 +467,7 @@ impl Function {
             values: Vec::new(),
             slots: Vec::new(),
             slot_of_origin: HashMap::new(),
+            names: HashMap::new(),
             entry: BlockId::from_index(0),
         }
     }
@@ -535,6 +538,20 @@ impl Function {
         &self.slots[slot.index()]
     }
 
+    /// What a source variable was called, when the name is known.
+    pub fn variable_name(&self, variable: VarId) -> Option<&str> {
+        self.names.get(&variable).map(String::as_str)
+    }
+
+    /// Record what the source variables of this function were called.
+    ///
+    /// Names are for dumps and diagnostics only.  Nothing may decide anything
+    /// from them: two variables can share a name, which is the whole reason
+    /// the renamer numbers them in the first place.
+    pub fn set_variable_names(&mut self, names: HashMap<VarId, String>) {
+        self.names = names;
+    }
+
     // ### Building ###
 
     /// Add a block with no instructions, which returns until told otherwise.
@@ -571,6 +588,20 @@ impl Function {
     /// The value is created here rather than by the caller, so a value cannot
     /// exist without the instruction that defines it.
     pub fn emit(&mut self, block: BlockId, op: Op) -> Option<ValueId> {
+        let position = self.blocks[block.index()].insts.len();
+        self.insert(block, position, op)
+    }
+
+    /// Insert an instruction at a position within a block.
+    ///
+    /// # Returns
+    ///
+    /// The value it defines, or `None` for the operations that define none.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `position` is past the end of the block.
+    pub fn insert(&mut self, block: BlockId, position: usize, op: Op) -> Option<ValueId> {
         let inst = InstId(self.insts.len() as u32);
         let dest = op.defines_value().then(|| {
             self.values.push(ValueDef {
@@ -581,8 +612,19 @@ impl Function {
         });
 
         self.insts.push(Inst { dest, op });
-        self.blocks[block.index()].insts.push(inst);
+        self.blocks[block.index()].insts.insert(position, inst);
         dest
+    }
+
+    /// Remove an instruction from a block.
+    ///
+    /// The instruction stays in the arena, so every other id keeps its
+    /// meaning; it is simply no longer part of the function.  A value it
+    /// defined must have no uses left, which the verifier checks.
+    pub fn remove(&mut self, block: BlockId, inst: InstId) {
+        self.blocks[block.index()]
+            .insts
+            .retain(|&kept| kept != inst);
     }
 
     /// Record which source variable a value is a version of.

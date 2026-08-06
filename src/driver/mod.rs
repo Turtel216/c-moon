@@ -142,9 +142,23 @@ pub fn run() -> ExitCode {
 /// and no pass runs in between.  What it buys is that every test exercises the
 /// two, which is what has to be true before anything optimises on SSA.
 fn round_trip_through_ssa(ir: &mut ProgramIr) {
-    for (name, cfg) in ir.functions.iter_mut() {
-        let function = ssa::build::build(name, cfg);
+    // Destructured so that the two side tables can be read while the functions
+    // are being replaced; borrowing `ir` whole would not allow both.
+    let ProgramIr {
+        functions,
+        array_sizes,
+        var_names,
+    } = ir;
+
+    for (name, cfg) in functions.iter_mut() {
+        let mut function = ssa::build::build(name, cfg);
+        function.set_variable_names(var_names.clone());
         ssa::verify::debug_assert_valid(&function, "SSA construction");
+
+        let promotable = ssa::promote::promotable(&function, array_sizes);
+        ssa::mem2reg::promote_slots(&mut function, &promotable);
+        ssa::verify::debug_assert_valid(&function, "promotion to SSA values");
+
         *cfg = ssa::destruct::to_cfg(&function);
     }
 }

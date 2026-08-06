@@ -25,9 +25,12 @@
 //! Fully pruned SSA needs real liveness and removes a few more; it can come
 //! later if the phi count turns out to matter.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::{BlockId, Function, Op, SlotId};
+use crate::frontend::renamer::VarId;
+
+use super::dom::{DomTree, Graph};
+use super::{BlockId, DefSite, Function, Op, Operand, SlotId, SlotOrigin, SourceName, ValueId};
 
 /// How a function uses the slots that may be promoted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,12 +122,319 @@ pub fn phi_placement(
     placement
 }
 
+/// Replace every promotable slot with SSA values.
+///
+/// # Arguments
+///
+/// * `function` - a function in the all-in-memory form construction produces
+/// * `promotable` - the slots the promotion gate cleared
+///
+/// After this, a promoted slot has no loads or stores left and no longer
+/// appears anywhere; the values that used to flow through it are read
+/// directly.  Slots that were not promoted are untouched.
+pub fn promote_slots(function: &mut Function, promotable: &BTreeSet<SlotId>) {
+    if promotable.is_empty() {
+        return;
+    }
+
+    let usage = SlotUsage::compute(function, promotable);
+
+    let tree = {
+        // The adjacency lists borrow nothing from `function` once built, so
+        // the tree outlives them and the function can be mutated below.
+        let (predecessors, successors) = function.adjacency();
+        let graph = Graph::new(function.entry(), &predecessors, &successors);
+        let tree = DomTree::build(graph);
+        let frontiers = tree.frontiers(graph);
+        let placement = phi_placement(&frontiers, &usage);
+
+        // Phi nodes go in before renaming, so that renaming finds them and
+        // fills in their arguments as it passes each predecessor.
+        for (&slot, blocks) in &placement {
+            for &block in blocks {
+                function.add_phi(block, slot);
+            }
+        }
+        tree
+    };
+
+    Renaming::new(function, promotable).run(&tree);
+}
+
+/// The renaming walk: what each name means at each point of the function.
+struct Renaming<'a> {
+    function: &'a mut Function,
+    promotable: &'a BTreeSet<SlotId>,
+    /// The definition currently in scope for each slot, innermost last.
+    stacks: HashMap<SlotId, Vec<Operand>>,
+    /// What to read instead of the value a deleted load produced.
+    substitutions: HashMap<ValueId, Operand>,
+    /// The value standing for "never written on this path".
+    undefined: Operand,
+    undefined_used: bool,
+    /// Next version number for each source variable, for readable dumps.
+    versions: HashMap<VarId, u32>,
+}
+
+impl<'a> Renaming<'a> {
+    fn new(function: &'a mut Function, promotable: &'a BTreeSet<SlotId>) -> Self {
+        // Created up front rather than on demand: inserting into a block while
+        // its instruction list is being rebuilt would lose the instruction.
+        // It is removed again below if nothing turned out to need it.
+        let entry = function.entry();
+        let prologue = function
+            .block(entry)
+            .insts
+            .iter()
+            .take_while(|&&inst| matches!(function.inst(inst).op, Op::GetParam(_)))
+            .count();
+        let undefined = function
+            .insert(entry, prologue, Op::Undef)
+            .expect("undef defines a value");
+
+        Self {
+            function,
+            promotable,
+            stacks: HashMap::new(),
+            substitutions: HashMap::new(),
+            undefined: Operand::Value(undefined),
+            undefined_used: false,
+            versions: HashMap::new(),
+        }
+    }
+
+    /// Walk the dominator tree, renaming as it goes.
+    ///
+    /// Preorder is what makes a stack the right structure: a block is visited
+    /// after everything that dominates it, so whatever is on top of a slot's
+    /// stack when the block is reached is exactly the definition that reaches
+    /// it.  The pushes a block made are undone on the way back out.
+    fn run(mut self, tree: &DomTree) {
+        let children = dominator_children(self.function, tree);
+
+        // An explicit stack rather than recursion, for the same reason the
+        // rest of the module avoids it: a deep enough function would otherwise
+        // overflow the compiler's own stack.
+        let mut steps = vec![Step::Enter(self.function.entry())];
+        let mut pushed: Vec<Vec<SlotId>> = vec![Vec::new(); self.function.block_count()];
+
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Enter(block) => {
+                    pushed[block.index()] = self.rename_block(block);
+                    steps.push(Step::Leave(block));
+                    // Reversed so the first child is dealt with first, which
+                    // keeps version numbers in a readable order.
+                    for &child in children[block.index()].iter().rev() {
+                        steps.push(Step::Enter(child));
+                    }
+                }
+                Step::Leave(block) => {
+                    for slot in pushed[block.index()].drain(..) {
+                        self.stacks
+                            .get_mut(&slot)
+                            .expect("Compiler Bug: popping a slot that was never pushed")
+                            .pop();
+                    }
+                }
+            }
+        }
+
+        if !self.undefined_used {
+            let entry = self.function.entry();
+            if let Operand::Value(value) = self.undefined
+                && let DefSite::Inst(inst) = self.function.value_def(value).site
+            {
+                self.function.remove(entry, inst);
+            }
+        }
+    }
+
+    /// Rename one block, and fill in the phi arguments its outgoing edges owe.
+    ///
+    /// # Returns
+    ///
+    /// The slots this block pushed a definition for, to be popped on the way
+    /// back out of the dominator tree.
+    fn rename_block(&mut self, block: BlockId) -> Vec<SlotId> {
+        let mut pushed = Vec::new();
+
+        // A phi is a definition of its slot, in scope for the whole block.
+        let phis: Vec<(SlotId, ValueId)> = self
+            .function
+            .block(block)
+            .phis
+            .iter()
+            .map(|phi| (phi.slot, phi.dest))
+            .collect();
+        for (slot, dest) in phis {
+            self.name(slot, dest);
+            self.stacks
+                .entry(slot)
+                .or_default()
+                .push(Operand::Value(dest));
+            pushed.push(slot);
+        }
+
+        // Rust note: `mem::take` moves the instruction list out, so the loop
+        // can mutate the instructions it names without holding a borrow of the
+        // block itself.
+        let insts = std::mem::take(&mut self.function.block_mut(block).insts);
+        let mut kept = Vec::with_capacity(insts.len());
+
+        for inst in insts {
+            for operand in self.function.inst_mut(inst).op.operands_mut() {
+                if let Operand::Value(value) = *operand
+                    && let Some(&replacement) = self.substitutions.get(&value)
+                {
+                    *operand = replacement;
+                }
+            }
+
+            let action = match &self.function.inst(inst).op {
+                Op::SlotLoad { slot } if self.promotable.contains(slot) => Action::Load(*slot),
+                Op::SlotStore { slot, value } if self.promotable.contains(slot) => {
+                    Action::Store(*slot, *value)
+                }
+                _ => Action::Keep,
+            };
+
+            match action {
+                // The load disappears: everything that read its result reads
+                // the definition that reaches it instead.
+                Action::Load(slot) => {
+                    let current = self.current(slot);
+                    let dest = self
+                        .function
+                        .inst(inst)
+                        .dest
+                        .expect("Compiler Bug: a load defines a value");
+                    self.substitutions.insert(dest, current);
+                }
+                // The store disappears too: it defines the name from here on,
+                // which is what the stack records.
+                Action::Store(slot, value) => {
+                    if let Operand::Value(value) = value {
+                        self.name(slot, value);
+                    }
+                    self.stacks.entry(slot).or_default().push(value);
+                    pushed.push(slot);
+                }
+                Action::Keep => kept.push(inst),
+            }
+        }
+
+        self.function.block_mut(block).insts = kept;
+
+        for operand in self.function.block_mut(block).terminator_operands_mut() {
+            if let Operand::Value(value) = *operand
+                && let Some(&replacement) = self.substitutions.get(&value)
+            {
+                *operand = replacement;
+            }
+        }
+
+        self.fill_successor_phis(block);
+        pushed
+    }
+
+    /// Give each phi of each successor the value arriving from this block.
+    fn fill_successor_phis(&mut self, block: BlockId) {
+        let successors: Vec<BlockId> = self.function.block(block).successors().collect();
+
+        for successor in successors {
+            // Every position, not just the first: a block can reach the same
+            // successor along more than one edge, and each edge has its own
+            // argument.
+            let positions: Vec<usize> = self
+                .function
+                .block(successor)
+                .preds()
+                .iter()
+                .enumerate()
+                .filter(|&(_, &pred)| pred == block)
+                .map(|(position, _)| position)
+                .collect();
+
+            for index in 0..self.function.block(successor).phis.len() {
+                let slot = self.function.block(successor).phis[index].slot;
+                let current = self.current(slot);
+                for &position in &positions {
+                    self.function.block_mut(successor).phis[index].args[position] = current;
+                }
+            }
+        }
+    }
+
+    /// The definition of `slot` in scope here, or the undefined value when the
+    /// program reads a variable it never wrote.
+    fn current(&mut self, slot: SlotId) -> Operand {
+        match self.stacks.get(&slot).and_then(|stack| stack.last()) {
+            Some(&operand) => operand,
+            None => {
+                self.undefined_used = true;
+                self.undefined
+            }
+        }
+    }
+
+    /// Record that `value` is the next version of the variable `slot` stands
+    /// for, so dumps and diagnostics can name it.
+    fn name(&mut self, slot: SlotId, value: ValueId) {
+        let SlotOrigin::Variable(variable) = self.function.slot(slot).origin else {
+            return;
+        };
+        if self.function.value_def(value).source.is_some() {
+            return;
+        }
+
+        let version = self.versions.entry(variable).or_default();
+        self.function.name_value(
+            value,
+            SourceName {
+                variable,
+                version: *version,
+            },
+        );
+        *version += 1;
+    }
+}
+
+/// What renaming does with one instruction.
+enum Action {
+    /// A load of a promoted slot, which disappears.
+    Load(SlotId),
+    /// A store to a promoted slot, which disappears.
+    Store(SlotId, Operand),
+    /// Anything else.
+    Keep,
+}
+
+/// One step of the walk over the dominator tree.
+enum Step {
+    Enter(BlockId),
+    Leave(BlockId),
+}
+
+/// The children of every block in the dominator tree, by block index.
+fn dominator_children(function: &Function, tree: &DomTree) -> Vec<Vec<BlockId>> {
+    let mut children = vec![Vec::new(); function.block_count()];
+    // Reverse postorder gives the children a stable order, so renaming --
+    // and the version numbers it hands out -- is reproducible.
+    for &block in tree.reverse_postorder() {
+        if let Some(idom) = tree.immediate_dominator(block) {
+            children[idom.index()].push(block);
+        }
+    }
+    children
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::middle::ssa::Terminator;
     use crate::middle::ssa::dom::{DomTree, Graph};
-    use crate::middle::ssa::{Operand, SlotOrigin, Terminator};
 
     fn block(index: usize) -> BlockId {
         BlockId::from_index(index)

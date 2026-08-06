@@ -25,6 +25,11 @@ pub struct ResolutionMap {
     pub expr_to_var: HashMap<NodeId, VarId>,
     /// Maps *declaration node id* -> globally unique variable id
     pub decl_to_var: HashMap<NodeId, VarId>,
+    /// Maps *variable id* -> the name it was declared with.
+    ///
+    /// For diagnostics and IR dumps only: several variables can share a name,
+    /// which is the reason this pass numbers them at all.
+    pub var_names: HashMap<VarId, String>,
 }
 
 impl ResolutionMap {
@@ -103,6 +108,7 @@ impl Renamer {
 
         self.next_var_id += 1;
         self.resolution.decl_to_var.insert(node, var_id);
+        self.resolution.var_names.insert(var_id, name.to_owned());
         Ok(())
     }
 

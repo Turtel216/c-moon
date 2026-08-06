@@ -457,8 +457,12 @@ fn binary_operator(opcode: &Opcode) -> BinOp {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
     use crate::middle::ir::{BasicBlock, Operand as TacOperand};
     use crate::middle::ssa::destruct::to_cfg;
+    use crate::middle::ssa::mem2reg::promote_slots;
+    use crate::middle::ssa::promote::promotable;
     use crate::middle::ssa::verify::verify_ssa;
 
     /// A TAC control-flow graph made of the given blocks, in order.
@@ -507,10 +511,56 @@ mod tests {
     /// The function built from `blocks`, verified.
     fn build_verified(blocks: &[(&str, Vec<TACInstruction>)]) -> Function {
         let function = build("f", &cfg(blocks));
+        verified(function)
+    }
+
+    /// The function built from `blocks` with every eligible variable promoted
+    /// to SSA values, verified.
+    fn promote_verified(
+        blocks: &[(&str, Vec<TACInstruction>)],
+        array_sizes: &[(usize, usize)],
+    ) -> Function {
+        let mut function = build_verified(blocks);
+        let sizes: HashMap<usize, usize> = array_sizes.iter().copied().collect();
+        let eligible = promotable(&function, &sizes);
+        promote_slots(&mut function, &eligible);
+        verified(function)
+    }
+
+    fn verified(function: Function) -> Function {
         if let Err(errors) = verify_ssa(&function) {
             panic!("verification failed: {:?}\n{}", errors, function);
         }
         function
+    }
+
+    /// The blocks of an `if`/`else` whose arms both assign to variable 0.
+    fn if_else(
+        consequent: Vec<TACInstruction>,
+        alternative: Vec<TACInstruction>,
+    ) -> Vec<(&'static str, Vec<TACInstruction>)> {
+        let mut consequent = consequent;
+        let mut alternative = alternative;
+        consequent.push(jump("join"));
+        alternative.push(jump("join"));
+        vec![
+            (
+                "entry",
+                vec![
+                    mov(temp("t1"), TacOperand::ImmInt(1)),
+                    instr(
+                        Opcode::BranchIfNot,
+                        None,
+                        Some(temp("t1")),
+                        Some(label("otherwise")),
+                    ),
+                    jump("consequent"),
+                ],
+            ),
+            ("consequent", consequent),
+            ("otherwise", alternative),
+            ("join", vec![instr(Opcode::Ret, None, Some(var(0)), None)]),
+        ]
     }
 
     #[test]
@@ -788,9 +838,254 @@ function f {
     }
 
     #[test]
-    fn the_round_trip_preserves_the_control_flow_graph() {
-        // Arrange: a loop, so the graph has a back edge and a join.
-        let blocks = [
+    fn a_promoted_variable_leaves_memory_entirely() {
+        // Arrange: `r0 = 1; t1 = r0 + 2; return t1`, the same function the
+        // memory form above was built from.
+        let function = promote_verified(
+            &[
+                (
+                    "entry",
+                    vec![
+                        mov(var(0), TacOperand::ImmInt(1)),
+                        instr(
+                            Opcode::Add,
+                            Some(temp("t1")),
+                            Some(var(0)),
+                            Some(TacOperand::ImmInt(2)),
+                        ),
+                        instr(Opcode::Ret, None, Some(temp("t1")), None),
+                    ],
+                ),
+                ("exit", vec![]),
+            ],
+            &[],
+        );
+
+        // Assert: no load, no store, and the values read each other directly.
+        // The first value is printed as a version of the variable it came
+        // from, which is what debug output and diagnostics need.
+        assert_eq!(
+            function.to_string(),
+            "\
+function f {
+.entry:
+    %r0.0 = 1
+    %v2 = %r0.0 + 2
+    ret %v2
+}
+"
+        );
+    }
+
+    #[test]
+    fn a_variable_assigned_in_both_arms_gets_a_phi_at_the_join() {
+        // Arrange: `if (t1) r0 = 1; else r0 = 2; return r0`.
+        let function = promote_verified(
+            &if_else(
+                vec![mov(var(0), TacOperand::ImmInt(1))],
+                vec![mov(var(0), TacOperand::ImmInt(2))],
+            ),
+            &[],
+        );
+
+        // Assert: the join reads a phi with one argument per predecessor,
+        // each of them the value that predecessor computed.
+        let join = function
+            .block_ids()
+            .find(|&block| function.block(block).label == "join")
+            .expect("the join survives");
+        let phi = &function.block(join).phis[0];
+        assert_eq!(function.block(join).phis.len(), 1);
+        assert_eq!(phi.args.len(), function.block(join).preds().len());
+        assert_eq!(phi.args.len(), 2);
+
+        // Argument `i` belongs to predecessor `i`, whatever order the block
+        // happens to record them in.
+        for (position, &pred) in function.block(join).preds().iter().enumerate() {
+            let assigned = *function
+                .block(pred)
+                .insts
+                .iter()
+                .find_map(|&inst| function.inst(inst).dest.as_ref())
+                .expect("each arm computes the value it assigns");
+            assert_eq!(phi.args[position], Operand::Value(assigned));
+        }
+    }
+
+    #[test]
+    fn reading_a_variable_that_was_never_written_yields_an_undefined_value() {
+        // Arrange: `if (t1) r0 = 1; return r0` -- nothing writes `r0` on the
+        // other path, which SSA cannot represent as a use with no definition.
+        let function = promote_verified(
+            &if_else(vec![mov(var(0), TacOperand::ImmInt(1))], vec![]),
+            &[],
+        );
+
+        // Assert: the missing definition is an explicit `undef` in the entry
+        // block, which dominates every use of it.
+        let entry = function.entry();
+        let undefined = function
+            .block(entry)
+            .insts
+            .iter()
+            .find(|&&inst| matches!(function.inst(inst).op, Op::Undef))
+            .map(|&inst| function.inst(inst).dest.expect("undef defines a value"))
+            .expect("the unwritten path needs an undefined value");
+
+        let join = function
+            .block_ids()
+            .find(|&block| function.block(block).label == "join")
+            .expect("the join survives");
+        assert!(
+            function.block(join).phis[0]
+                .args
+                .contains(&Operand::Value(undefined))
+        );
+    }
+
+    #[test]
+    fn a_function_that_writes_every_path_needs_no_undefined_value() {
+        // Arrange: the same shape with both arms assigning.
+        let function = promote_verified(
+            &if_else(
+                vec![mov(var(0), TacOperand::ImmInt(1))],
+                vec![mov(var(0), TacOperand::ImmInt(2))],
+            ),
+            &[],
+        );
+
+        // Assert: the placeholder construction creates up front is taken out
+        // again when nothing needs it.
+        assert!(
+            !function
+                .block_ids()
+                .flat_map(|block| function.block(block).insts.clone())
+                .any(|inst| matches!(function.inst(inst).op, Op::Undef))
+        );
+    }
+
+    #[test]
+    fn a_loop_variable_gets_a_phi_at_the_header() {
+        // Arrange: `i = 0; while (i < 5) i = i + 1; return i`.
+        let function = promote_verified(&loop_blocks(), &[]);
+
+        // Assert: the header's phi takes the initial value along the edge
+        // from the entry and the updated one along the back edge.
+        let header = function
+            .block_ids()
+            .find(|&block| function.block(block).label == "cond")
+            .expect("the header survives");
+        let phi = &function.block(header).phis[0];
+        assert_eq!(function.block(header).phis.len(), 1);
+
+        let argument = |from: &str| {
+            let position = function
+                .block(header)
+                .preds()
+                .iter()
+                .position(|&pred| function.block(pred).label == from)
+                .expect("the header is entered from here");
+            phi.args[position]
+        };
+        let initial = *function
+            .block(function.entry())
+            .insts
+            .iter()
+            .find_map(|&inst| function.inst(inst).dest.as_ref())
+            .expect("the entry computes the initial value");
+        assert_eq!(argument("entry"), Operand::Value(initial));
+        assert_ne!(argument("body"), Operand::Value(initial));
+        assert!(matches!(argument("body"), Operand::Value(_)));
+    }
+
+    #[test]
+    fn a_variable_whose_address_is_taken_keeps_its_loads_and_stores() {
+        // Arrange: `r0 = 1; t1 = &r0; store t1, 5; return r0`.
+        let function = promote_verified(
+            &[
+                (
+                    "entry",
+                    vec![
+                        mov(var(0), TacOperand::ImmInt(1)),
+                        instr(Opcode::AddrOf, Some(temp("t1")), Some(var(0)), None),
+                        instr(
+                            Opcode::Store,
+                            None,
+                            Some(temp("t1")),
+                            Some(TacOperand::ImmInt(5)),
+                        ),
+                        instr(Opcode::Ret, None, Some(var(0)), None),
+                    ],
+                ),
+                ("exit", vec![]),
+            ],
+            &[],
+        );
+
+        // Assert: the write through the pointer has to be visible to the read
+        // by name, so `r0` stays in memory and `t1` -- an ordinary value --
+        // does not.
+        assert_eq!(
+            function.to_string(),
+            "\
+function f {
+.entry:
+    %v0 = 1
+    store_slot %r0, %v0
+    %v1 = addr_of %r0
+    store %v1, 5
+    %v3 = load_slot %r0
+    ret %v3
+}
+"
+        );
+    }
+
+    #[test]
+    fn an_array_keeps_its_storage_but_its_index_does_not() {
+        // Arrange: `a[0] = 1; t1 = a[0]; return t1` with `a` a real array.
+        let function = promote_verified(
+            &[
+                (
+                    "entry",
+                    vec![
+                        instr(
+                            Opcode::ArrayStore,
+                            Some(var(0)),
+                            Some(TacOperand::ImmInt(0)),
+                            Some(TacOperand::ImmInt(1)),
+                        ),
+                        instr(
+                            Opcode::ArrayLoad,
+                            Some(temp("t1")),
+                            Some(var(0)),
+                            Some(TacOperand::ImmInt(0)),
+                        ),
+                        instr(Opcode::Ret, None, Some(temp("t1")), None),
+                    ],
+                ),
+                ("exit", vec![]),
+            ],
+            &[(0, 4)],
+        );
+
+        // Assert
+        assert_eq!(
+            function.to_string(),
+            "\
+function f {
+.entry:
+    array_store %r0[0] = 1
+    %v0 = array_load %r0[0]
+    ret %v0
+}
+"
+        );
+    }
+
+    /// `i = 0; while (i < 5) i = i + 1; return i`.
+    fn loop_blocks() -> Vec<(&'static str, Vec<TACInstruction>)> {
+        vec![
             (
                 "entry",
                 vec![mov(var(0), TacOperand::ImmInt(0)), jump("cond")],
@@ -828,7 +1123,13 @@ function f {
             ),
             ("done", vec![instr(Opcode::Ret, None, Some(var(0)), None)]),
             ("exit", vec![]),
-        ];
+        ]
+    }
+
+    #[test]
+    fn the_round_trip_preserves_the_control_flow_graph() {
+        // Arrange: a loop, so the graph has a back edge and a join.
+        let blocks = loop_blocks();
 
         // Act: build, lower back to TAC, and build again.
         let once = build_verified(&blocks);
@@ -836,11 +1137,11 @@ function f {
 
         // Assert: the same blocks, joined the same way, and still valid SSA.
         //
-        // The instructions are *not* yet identical: with every variable still
-        // a slot, the second trip turns the temporaries the first one emitted
-        // into slots of their own and each round trip adds a layer of loads
-        // and stores. Promotion is what makes the two translations exact
-        // inverses, and this assertion tightens to text equality with it.
+        // Only the shape: the instructions are not identical, because
+        // lowering a phi introduces copies that the next trip sees as ordinary
+        // instructions. One trip is all the compiler makes, and the copy
+        // propagation that would collapse them belongs to the passes rather
+        // than to construction.
         assert!(verify_ssa(&twice).is_ok());
         let shape = |function: &Function| -> Vec<(String, Vec<String>)> {
             function
