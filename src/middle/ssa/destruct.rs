@@ -56,7 +56,41 @@ pub fn to_cfg(function: &Function) -> CFG {
         lowering.lower_block(&mut cfg, block);
     }
 
+    debug_assert_transfers(&cfg);
     cfg
+}
+
+/// Every block that carries instructions must end in an explicit transfer.
+///
+/// The backend emits blocks in an order of its own and has no notion of
+/// falling through to the next one, so a block that simply runs off its end
+/// continues into whichever block was laid out after it.  An empty block is
+/// fine -- it contributes only its label, and control reaching that label
+/// falls into the epilogue, which is what the exit block is for.
+///
+/// # Panics
+///
+/// Panics in a debug build if any block breaks this.
+fn debug_assert_transfers(cfg: &CFG) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+
+    for (label, block) in &cfg.blocks {
+        let Some(last) = block.instructions.last() else {
+            continue;
+        };
+        assert!(
+            matches!(
+                last.opcode,
+                Opcode::Jump | Opcode::BranchIf | Opcode::BranchIfNot | Opcode::Ret
+            ),
+            "Compiler Bug: block .{} ends in `{}` rather than a transfer, so control would \
+             fall into whatever the backend lays out after it",
+            label,
+            last
+        );
+    }
 }
 
 /// The state of one function's translation back to TAC.

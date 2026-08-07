@@ -360,7 +360,7 @@ fn check_definitions(function: &Function, errors: &mut Vec<SsaError>) {
             if function.value_def(phi.dest).site != DefSite::Phi(block, position) {
                 errors.push(SsaError::MisplacedDefinition {
                     value: value_text(function, phi.dest),
-                    site: format!("{:?}", function.value_def(phi.dest).site),
+                    site: site_text(function, function.value_def(phi.dest).site),
                 });
             }
         }
@@ -374,7 +374,7 @@ fn check_definitions(function: &Function, errors: &mut Vec<SsaError>) {
             if function.value_def(dest).site != DefSite::Inst(inst) {
                 errors.push(SsaError::MisplacedDefinition {
                     value: value_text(function, dest),
-                    site: format!("{:?}", function.value_def(dest).site),
+                    site: site_text(function, function.value_def(dest).site),
                 });
             }
         }
@@ -591,4 +591,346 @@ fn value_text(function: &Function, value: ValueId) -> String {
 /// One instruction, as a message should quote it.
 fn inst_text(function: &Function, inst: InstId) -> String {
     InstText { function, inst }.to_string()
+}
+
+/// The place a value claims to be defined, as a message should describe it.
+fn site_text(function: &Function, site: DefSite) -> String {
+    match site {
+        DefSite::Inst(inst) => format!("`{}`", inst_text(function, inst)),
+        DefSite::Phi(block, position) => format!(
+            "the phi at position {} of .{}",
+            position,
+            function.block(block).label
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::middle::ssa::{Op, SlotOrigin, Terminator};
+
+    /// A function with an entry block and nothing in it.
+    fn function() -> Function {
+        Function::new("f".to_string(), "entry".to_string(), "exit".to_string())
+    }
+
+    /// The errors `function` is reported with, failing the test if it is valid.
+    ///
+    /// The functions below are broken on purpose, by reaching past the API
+    /// that normally makes these invariants unbreakable -- which is only
+    /// possible from inside this module, and is the point: a pass cannot do
+    /// this by accident, but a pass can still corrupt what the API does not
+    /// police.
+    fn errors(function: &Function) -> Vec<SsaError> {
+        verify_ssa(function).expect_err("this function is meant to be broken")
+    }
+
+    /// Fail unless one of the reported errors is the expected one.
+    macro_rules! assert_reports {
+        ($function:expr, $pattern:pat) => {{
+            let found = errors($function);
+            assert!(
+                found.iter().any(|error| matches!(error, $pattern)),
+                "expected {} among the reported errors, got {:#?}",
+                stringify!($pattern),
+                found
+            );
+        }};
+    }
+
+    /// `entry` branches to two blocks that join again: the smallest valid
+    /// function with more than one path through it.
+    fn diamond() -> (Function, BlockId, BlockId, BlockId, BlockId) {
+        let mut function = function();
+        let entry = function.entry();
+        let left = function.add_block("left".to_string());
+        let right = function.add_block("right".to_string());
+        let join = function.add_block("join".to_string());
+
+        function.set_terminator(left, Terminator::Jump(join));
+        function.set_terminator(right, Terminator::Jump(join));
+        function.set_terminator(
+            entry,
+            Terminator::Branch {
+                cond: Operand::Imm(1),
+                then_block: left,
+                else_block: right,
+            },
+        );
+        function.set_terminator(join, Terminator::Return(None));
+
+        (function, entry, left, right, join)
+    }
+
+    #[test]
+    fn a_well_formed_function_is_accepted() {
+        // Arrange: a diamond whose join reads a phi of the two arms.
+        let (mut function, entry, left, right, join) = diamond();
+        let slot = function.slot_for(SlotOrigin::Variable(0));
+        let from_left = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        let from_right = function
+            .emit(right, Op::Copy(Operand::Imm(2)))
+            .expect("a copy defines a value");
+
+        let merged = function.add_phi(join, slot);
+        function.block_mut(join).phis[0].args =
+            vec![Operand::Value(from_left), Operand::Value(from_right)];
+        function.set_terminator(join, Terminator::Return(Some(Operand::Value(merged))));
+        function.emit(entry, Op::Copy(Operand::Imm(0)));
+
+        // Act / Assert
+        assert_eq!(verify_ssa(&function), Ok(()));
+    }
+
+    #[test]
+    fn an_unreachable_block_is_reported() {
+        // Arrange: a block nothing branches to, which dominance has no answer
+        // for and which construction is supposed to have deleted.
+        let mut function = function();
+        function.add_block("orphan".to_string());
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::UnreachableBlock { .. });
+    }
+
+    #[test]
+    fn a_branch_back_into_the_entry_block_is_reported() {
+        // Arrange: the entry block cannot have predecessors -- a definition
+        // there would no longer dominate everything, and it could need phis.
+        let mut function = function();
+        let entry = function.entry();
+        let second = function.add_block("second".to_string());
+        function.set_terminator(entry, Terminator::Jump(second));
+        function.set_terminator(second, Terminator::Jump(entry));
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::EntryHasPredecessors { .. });
+    }
+
+    #[test]
+    fn a_value_defined_twice_is_reported() {
+        // Arrange: two instructions claiming the same result.
+        let mut function = function();
+        let entry = function.entry();
+        let first = function
+            .emit(entry, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        let second = function
+            .emit(entry, Op::Copy(Operand::Imm(2)))
+            .expect("a copy defines a value");
+        let DefSite::Inst(inst) = function.value_def(second).site else {
+            panic!("a copy is defined by an instruction");
+        };
+        function.inst_mut(inst).dest = Some(first);
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::MultipleDefinitions { .. });
+    }
+
+    #[test]
+    fn a_value_that_is_not_defined_where_it_says_is_reported() {
+        // Arrange: the arena and the block disagree about where a value comes
+        // from, which is what a pass that moves instructions gets wrong.
+        let mut function = function();
+        let entry = function.entry();
+        let value = function
+            .emit(entry, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.values[value.index()].site = DefSite::Phi(entry, 0);
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::MisplacedDefinition { .. });
+    }
+
+    #[test]
+    fn reading_a_value_whose_definition_was_deleted_is_reported() {
+        // Arrange: an instruction removed from its block while something still
+        // reads its result -- what an over-eager dead-code pass does.
+        let mut function = function();
+        let entry = function.entry();
+        let value = function
+            .emit(entry, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.emit(entry, Op::Copy(Operand::Value(value)));
+
+        let DefSite::Inst(inst) = function.value_def(value).site else {
+            panic!("a copy is defined by an instruction");
+        };
+        function.remove(entry, inst);
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::DanglingUse { .. });
+    }
+
+    #[test]
+    fn a_use_that_its_definition_does_not_dominate_is_reported() {
+        // Arrange: one arm of a diamond reading a value the other arm defines.
+        let (mut function, _, left, right, _) = diamond();
+        let value = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.emit(right, Op::Copy(Operand::Value(value)));
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::UseNotDominated { .. });
+    }
+
+    #[test]
+    fn a_use_before_its_definition_in_the_same_block_is_reported() {
+        // Arrange: dominance within a block is a question of order.
+        let mut function = function();
+        let entry = function.entry();
+        let later = function
+            .emit(entry, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        let user = function
+            .emit(entry, Op::Copy(Operand::Value(later)))
+            .expect("a copy defines a value");
+
+        let (DefSite::Inst(first), DefSite::Inst(second)) = (
+            function.value_def(later).site,
+            function.value_def(user).site,
+        ) else {
+            panic!("a copy is defined by an instruction");
+        };
+        function.block_mut(entry).insts = vec![second, first];
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::UseNotDominated { .. });
+    }
+
+    #[test]
+    fn a_phi_with_the_wrong_number_of_arguments_is_reported() {
+        // Arrange: an argument with no predecessor to arrive from.
+        let (mut function, _, left, _, join) = diamond();
+        let slot = function.slot_for(SlotOrigin::Variable(0));
+        let value = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.add_phi(join, slot);
+        function.block_mut(join).phis[0].args = vec![
+            Operand::Value(value),
+            Operand::Value(value),
+            Operand::Imm(0),
+        ];
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::PhiArity { .. });
+    }
+
+    #[test]
+    fn a_phi_argument_that_does_not_reach_its_edge_is_reported() {
+        // Arrange: the join takes a value from `right` that only `left`
+        // defines. The definition dominates neither the phi's own block nor
+        // the predecessor the argument arrives from, and it is the second of
+        // those that makes it wrong.
+        let (mut function, _, left, _, join) = diamond();
+        let slot = function.slot_for(SlotOrigin::Variable(0));
+        let value = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.add_phi(join, slot);
+        function.block_mut(join).phis[0].args = vec![Operand::Value(value), Operand::Value(value)];
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::PhiArgumentNotDominated { .. });
+    }
+
+    #[test]
+    fn a_phi_argument_is_checked_against_its_predecessor_not_its_own_block() {
+        // Arrange: the same shape, but each argument arrives from the arm that
+        // defines it. Neither definition dominates the join, so a verifier
+        // checking the phi's own block would reject a perfectly good function.
+        let (mut function, _, left, right, join) = diamond();
+        let slot = function.slot_for(SlotOrigin::Variable(0));
+        let from_left = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        let from_right = function
+            .emit(right, Op::Copy(Operand::Imm(2)))
+            .expect("a copy defines a value");
+        function.add_phi(join, slot);
+        function.block_mut(join).phis[0].args =
+            vec![Operand::Value(from_left), Operand::Value(from_right)];
+
+        // Act / Assert
+        assert_eq!(verify_ssa(&function), Ok(()));
+    }
+
+    #[test]
+    fn a_predecessor_list_that_disagrees_with_the_branches_is_reported() {
+        // Arrange: a predecessor that does not branch here.
+        let (mut function, _, _, _, join) = diamond();
+        let stray = function.add_block("stray".to_string());
+        function.blocks[join.index()].preds.push(stray);
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::EdgesDisagree { .. });
+    }
+
+    #[test]
+    fn an_incoming_argument_read_out_of_the_prologue_is_reported() {
+        // Arrange: the backend lowers the entry block's opening run of
+        // `get_param`s as one simultaneous assignment, so one that comes after
+        // other work cannot be lowered at all.
+        let mut function = function();
+        let entry = function.entry();
+        function.emit(entry, Op::Copy(Operand::Imm(1)));
+        function.emit(entry, Op::GetParam(0));
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::ParameterOutOfPrologue { .. });
+    }
+
+    #[test]
+    fn a_critical_edge_is_reported() {
+        // Arrange: `entry` branches, and one arm goes straight to a block that
+        // is entered from elsewhere as well.
+        let mut function = function();
+        let entry = function.entry();
+        let other = function.add_block("other".to_string());
+        let join = function.add_block("join".to_string());
+        function.set_terminator(other, Terminator::Jump(join));
+        function.set_terminator(
+            entry,
+            Terminator::Branch {
+                cond: Operand::Imm(1),
+                then_block: other,
+                else_block: join,
+            },
+        );
+        function.set_terminator(join, Terminator::Return(None));
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::CriticalEdge { .. });
+    }
+
+    #[test]
+    fn a_message_names_the_block_the_instruction_and_the_value() {
+        // Arrange: a use its definition does not dominate, which is the error
+        // that is hardest to find without being told where to look.
+        let (mut function, _, left, right, _) = diamond();
+        let value = function
+            .emit(left, Op::Copy(Operand::Imm(1)))
+            .expect("a copy defines a value");
+        function.emit(right, Op::Copy(Operand::Value(value)));
+
+        // Act
+        let reported = errors(&function)
+            .iter()
+            .map(SsaError::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Assert: the value, both blocks and the offending instruction are all
+        // in the message.
+        assert!(reported.contains("%v0"), "{reported}");
+        assert!(reported.contains(".left"), "{reported}");
+        assert!(reported.contains(".right"), "{reported}");
+        assert!(reported.contains("used by: %v1 = %v0"), "{reported}");
+    }
 }
