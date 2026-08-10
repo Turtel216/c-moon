@@ -185,11 +185,17 @@ fn misused_directive(suite: Suite, directives: &directives::Directives) -> Optio
 /// once with whatever flags they declare.
 fn variants(suite: Suite, policy: VariantPolicy) -> Vec<Variant> {
     match suite {
-        Suite::RunPass => match policy {
-            VariantPolicy::Both => vec![Variant::NoOpt, Variant::Opt],
-            VariantPolicy::NoOptOnly => vec![Variant::NoOpt],
-            VariantPolicy::OptOnly => vec![Variant::Opt],
-        },
+        Suite::RunPass => {
+            let mut variants = match policy {
+                VariantPolicy::Both => vec![Variant::NoOpt, Variant::Opt],
+                VariantPolicy::NoOptOnly => vec![Variant::NoOpt],
+                VariantPolicy::OptOnly => vec![Variant::Opt],
+            };
+            // The reference build is independent of which of this compiler's
+            // levels a fixture asks for: it checks the expectation itself.
+            variants.push(Variant::Gcc);
+            variants
+        }
         Suite::Codegen | Suite::Ui => vec![Variant::AsDeclared],
     }
 }

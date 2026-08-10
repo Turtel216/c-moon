@@ -53,12 +53,18 @@ int main() {
 }
 ```
 
-**Every `run-pass` fixture runs twice: once without `--opt` and once with it.**
-A single file therefore covers both the naive and the optimised pipeline, and
-the two appear separately in the report as `[no-opt]` and `[opt]`. This is the
-main reason the suite exists in this shape -- the previous one duplicated each
-case by hand, which meant new tests silently skipped the optimiser whenever
-someone forgot the second copy.
+**Every `run-pass` fixture runs three times: without `--opt`, with it, and
+once through `gcc -O0`.** A single file therefore covers both the naive and the
+optimised pipeline, and the three appear separately in the report as
+`[no-opt]`, `[opt]` and `[gcc]`. This is the main reason the suite exists in
+this shape -- the previous one duplicated each case by hand, which meant new
+tests silently skipped the optimiser whenever someone forgot the second copy.
+
+The `[gcc]` variant does not involve this compiler at all. It builds the same
+fixture with a production compiler and checks the declared exit code against
+it, which is what makes `//@ exit-code` an assertion about what the C program
+*means* rather than about what this compiler currently does with it. Without
+it, a fixture recorded from a miscompilation would pass for ever.
 
 ### `codegen`
 

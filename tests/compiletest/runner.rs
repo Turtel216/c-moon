@@ -68,13 +68,17 @@ pub enum Variant {
     NoOpt,
     /// Compiler invoked with `--opt`.
     Opt,
+    /// Not this compiler at all: the fixture is built with `gcc -O0`, and its
+    /// declared exit code checked against what a production compiler makes of
+    /// the same program.
+    Gcc,
 }
 
 impl Variant {
     /// The flag this variant adds to the compiler invocation, if any.
     fn flag(self) -> Option<&'static str> {
         match self {
-            Variant::AsDeclared | Variant::NoOpt => None,
+            Variant::AsDeclared | Variant::NoOpt | Variant::Gcc => None,
             Variant::Opt => Some("--opt"),
         }
     }
@@ -85,6 +89,7 @@ impl Variant {
             Variant::AsDeclared => "",
             Variant::NoOpt => " [no-opt]",
             Variant::Opt => " [opt]",
+            Variant::Gcc => " [gcc]",
         }
     }
 
@@ -94,6 +99,7 @@ impl Variant {
             Variant::AsDeclared => "as-declared",
             Variant::NoOpt => "no-opt",
             Variant::Opt => "opt",
+            Variant::Gcc => "gcc",
         }
     }
 }
@@ -133,6 +139,13 @@ impl TestCase {
         // GCC writes the executable here and the compiler writes `<stem>.s`
         // alongside it.
         let stem = work_dir.join("a");
+
+        // The reference variant never invokes this compiler: it asks what the
+        // program is supposed to do, not what this compiler does with it.
+        if self.variant == Variant::Gcc {
+            return self.check_against_gcc(&stem);
+        }
+
         let compiled = self.compile(&stem)?;
 
         match self.suite {
@@ -176,7 +189,39 @@ impl TestCase {
     /// `run-pass`: the program must build and exit with the declared status.
     fn check_run_pass(&self, compiled: &Output, stem: &Path) -> Result<(), Failed> {
         self.expect_compiled(compiled)?;
+        self.expect_exit_code(stem)
+    }
 
+    /// Build the fixture with a production compiler and check that it agrees.
+    ///
+    /// This is the differential half of the suite. The other variants prove
+    /// that every optimisation level of this compiler agrees with the declared
+    /// exit code; this one proves the declared exit code is what the C program
+    /// actually means, so an expectation cannot be wrong in the same direction
+    /// as the compiler.
+    fn check_against_gcc(&self, stem: &Path) -> Result<(), Failed> {
+        // Warnings are silenced: this asks what the program does, and the
+        // fixtures are written for a compiler that accepts a subset of C.
+        let compiled = Command::new("gcc")
+            .args(["-O0", "-w", "-o"])
+            .arg(stem)
+            .arg(&self.path)
+            .output()
+            .map_err(|e| Failed::from(format!("could not run gcc: {}", e)))?;
+
+        if !compiled.status.success() {
+            return Err(format!(
+                "gcc rejected the fixture:\n{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            )
+            .into());
+        }
+
+        self.expect_exit_code(stem)
+    }
+
+    /// Run the built program and compare its status with the declared one.
+    fn expect_exit_code(&self, stem: &Path) -> Result<(), Failed> {
         let run = Command::new(stem)
             .output()
             .map_err(|e| Failed::from(format!("could not run the compiled program: {}", e)))?;

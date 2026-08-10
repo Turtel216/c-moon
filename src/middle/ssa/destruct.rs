@@ -8,23 +8,45 @@
 //!
 //! # Phi lowering
 //!
-//! Each phi group is lowered on the edge it belongs to in two passes: every
-//! argument is copied into a fresh temporary first, and only then is each
-//! temporary copied into the phi's destination.  Reading everything before
-//! writing anything is what makes the classic hazards impossible --
-//! `(a, b) := (b, a)` cannot lose a value to the copy that precedes it, and a
-//! phi argument that is still live after the copy is never overwritten.
+//! A group of phi nodes describes one *parallel* assignment on each incoming
+//! edge: every argument is read, and only then is every destination written.
+//! Emitting the copies one after another in the order the phis happen to be
+//! written is what produces the classic wrong code.  `(a, b) := (b, a)` turns
+//! into `a := b; b := a`, which leaves both holding `b` -- the **swap
+//! problem**.  A phi argument that is still live after the copy, overwritten
+//! by an earlier copy of the same group, is the **lost-copy problem**.
 //!
-//! It costs two moves per phi per edge where one is usually enough.  Phase 4
-//! of the SSA migration replaces this with the parallel-copy sequentialisation
-//! from Boissinot et al., *Revisiting Out-of-SSA Translation*, which uses one
-//! move per phi plus one temporary per cycle; the fixtures that pin down the
-//! difference belong to that phase.  Until then this stands, because it is
-//! obviously correct and that is what the round trip has to be first.
+//! The sequentialisation here is Algorithm 1 of Boissinot et al., *Revisiting
+//! Out-of-SSA Translation for Correctness, Code Quality, and Efficiency*: work
+//! through the copies whose destination nothing else still needs, and when
+//! only cycles are left, break one by saving a single value into a fresh
+//! temporary.  That costs one move per phi plus one per cycle, against the two
+//! per phi that reading everything into temporaries first would.
+//!
+//! What is *not* implemented is the rest of that paper: the interference
+//! analysis and the coalescing that would let the copies be removed again.
+//! Without coalescing every phi destination is a value of its own, and
+//! correctness reduces exactly to sequentialising each parallel copy, which is
+//! what this does.  Copies are placed at the end of the predecessor, and
+//! critical edges are already split, so there is always a block where a copy
+//! belongs to one edge alone.
+//!
+//! Coalescing is deferred deliberately.  It should not be added before the
+//! copy count is shown to be a problem, and before checking what the backend's
+//! register allocator already does with them.
+
+use std::collections::{HashMap, HashSet};
 
 use crate::middle::ir::{BasicBlock, CFG, Opcode, Operand as TacOperand, TACInstruction};
 
-use super::{BinOp, BlockId, Function, Op, Operand, SlotOrigin, Terminator};
+use super::{BinOp, BlockId, Function, Op, Operand, SlotOrigin, Terminator, ValueId};
+
+/// One assignment of a parallel copy: `dest := source`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Copy {
+    dest: ValueId,
+    source: Operand,
+}
 
 /// Translate a function in SSA form back into a TAC control-flow graph.
 ///
@@ -235,9 +257,8 @@ impl Lowering<'_> {
 
     /// Emit the copies this block owes to the phi nodes of its successors.
     ///
-    /// Every argument is read into a temporary before any destination is
-    /// written, which is what makes a group of phis behave as the simultaneous
-    /// assignment it is meant to be.
+    /// The phis of one successor form a single parallel assignment on this
+    /// edge, which [`Lowering::sequentialize`] turns into moves.
     fn lower_outgoing_phis(&mut self, out: &mut Vec<TACInstruction>, block: BlockId) {
         let function = self.function;
 
@@ -256,31 +277,102 @@ impl Lowering<'_> {
             );
 
             let position = self.argument_position(successor, block);
+            let copies: Vec<Copy> = phis
+                .iter()
+                .map(|phi| Copy {
+                    dest: phi.dest,
+                    source: phi.args[position],
+                })
+                // A phi taking its own result along this edge -- what a loop
+                // produces for a variable it does not assign -- asks for a
+                // move from a value to itself, which is no assignment at all.
+                .filter(|copy| copy.source != Operand::Value(copy.dest))
+                .collect();
 
-            // Every argument is read first ...
-            let mut temporaries = Vec::with_capacity(phis.len());
-            for phi in phis {
-                let temporary = self.fresh_copy();
-                let source = self.operand(phi.args[position]);
+            self.sequentialize(&copies, out);
+        }
+    }
+
+    /// Turn one parallel assignment into a sequence of moves.
+    ///
+    /// Boissinot et al., Algorithm 1.  Two facts drive it:
+    ///
+    /// - A copy may be emitted as soon as nothing else still needs what its
+    ///   destination currently holds.  Emitting it frees its *source* to be
+    ///   overwritten in turn, so one copy can make another ready.
+    /// - When nothing is ready, every remaining copy is on a cycle.  Saving
+    ///   one of their destinations into a temporary breaks that cycle and
+    ///   makes it ready, and the cycle unwinds from there.
+    ///
+    /// `location` is what makes the second part work: it records where the
+    /// value that started in each place currently lives, so a copy reading a
+    /// value that has since been moved reads it from wherever it went.
+    fn sequentialize(&mut self, copies: &[Copy], out: &mut Vec<TACInstruction>) {
+        let mut source_of: HashMap<ValueId, Operand> = HashMap::new();
+        let mut location: HashMap<ValueId, TacOperand> = HashMap::new();
+        let mut pending: HashSet<ValueId> = HashSet::new();
+
+        for copy in copies {
+            source_of.insert(copy.dest, copy.source);
+            pending.insert(copy.dest);
+            // A value that is read starts out where it was defined.
+            if let Operand::Value(source) = copy.source {
+                location.insert(source, self.value(source));
+            }
+        }
+
+        // A destination nothing reads can be written straight away.
+        let mut ready: Vec<ValueId> = copies
+            .iter()
+            .map(|copy| copy.dest)
+            .filter(|dest| !location.contains_key(dest))
+            .collect();
+        let mut to_do: Vec<ValueId> = copies.iter().map(|copy| copy.dest).collect();
+
+        loop {
+            while let Some(dest) = ready.pop() {
+                let source = source_of[&dest];
+                let held_in = match source {
+                    Operand::Value(value) => location[&value].clone(),
+                    Operand::Imm(constant) => TacOperand::ImmInt(constant),
+                };
+
                 out.push(TACInstruction::new(
                     Opcode::Mov,
-                    Some(temporary.clone()),
-                    Some(source),
+                    Some(self.value(dest)),
+                    Some(held_in.clone()),
                     None,
                 ));
-                temporaries.push(temporary);
+                pending.remove(&dest);
+
+                if let Operand::Value(value) = source {
+                    let at_home = held_in == self.value(value);
+                    location.insert(value, self.value(dest));
+                    // The source has been read out of its own place, so
+                    // whatever was waiting to overwrite it may now do so.
+                    if at_home && pending.contains(&value) {
+                        ready.push(value);
+                    }
+                }
             }
 
-            // ... and only then is any destination written.
-            for (phi, temporary) in phis.iter().zip(temporaries) {
-                let destination = self.value(phi.dest);
-                out.push(TACInstruction::new(
-                    Opcode::Mov,
-                    Some(destination),
-                    Some(temporary),
-                    None,
-                ));
+            let Some(dest) = to_do.pop() else { break };
+            if !pending.contains(&dest) {
+                continue;
             }
+
+            // Nothing is ready and this copy is still outstanding, so it is on
+            // a cycle. One temporary breaks it, and the rest of the cycle
+            // follows from the ready list.
+            let temporary = self.fresh_copy();
+            out.push(TACInstruction::new(
+                Opcode::Mov,
+                Some(temporary.clone()),
+                Some(self.value(dest)),
+                None,
+            ));
+            location.insert(dest, temporary);
+            ready.push(dest);
         }
     }
 
@@ -396,5 +488,213 @@ fn binary_opcode(operator: BinOp) -> Opcode {
         BinOp::Lte => Opcode::Lte,
         BinOp::Gt => Opcode::Gt,
         BinOp::Gte => Opcode::Gte,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::middle::ssa::verify::verify_ssa;
+    use crate::middle::ssa::{BinOp, SlotOrigin};
+
+    /// The instructions of one block of the emitted TAC, as text.
+    fn emitted(cfg: &CFG, label: &str) -> Vec<String> {
+        cfg.blocks[label]
+            .instructions
+            .iter()
+            .map(TACInstruction::to_string)
+            .collect()
+    }
+
+    /// A loop whose header carries `phi_count` phi nodes, with the arguments
+    /// on the back edge chosen by the caller.
+    ///
+    /// ```text
+    /// entry:  <initial values>            done:  ret <first phi>
+    ///         jmp header                  latch: <body>
+    /// header: <phis>                             jmp header
+    ///         br .latch : .done
+    /// ```
+    struct Loop {
+        function: Function,
+        header: BlockId,
+        latch: BlockId,
+        done: BlockId,
+    }
+
+    impl Loop {
+        /// A loop with `initial` values computed in the entry block.
+        fn new(initial: &[i64]) -> (Self, Vec<ValueId>) {
+            let mut function =
+                Function::new("f".to_string(), "entry".to_string(), "exit".to_string());
+            let entry = function.entry();
+            let header = function.add_block("header".to_string());
+            let latch = function.add_block("latch".to_string());
+            let done = function.add_block("done".to_string());
+
+            let values: Vec<ValueId> = initial
+                .iter()
+                .map(|&constant| {
+                    function
+                        .emit(entry, Op::Copy(Operand::Imm(constant)))
+                        .expect("a copy defines a value")
+                })
+                .collect();
+
+            // Every edge is in place before any phi exists, so that each phi
+            // is created with one argument per predecessor.
+            function.set_terminator(entry, Terminator::Jump(header));
+            function.set_terminator(latch, Terminator::Jump(header));
+            function.set_terminator(
+                header,
+                Terminator::Branch {
+                    cond: Operand::Imm(1),
+                    then_block: latch,
+                    else_block: done,
+                },
+            );
+
+            (
+                Self {
+                    function,
+                    header,
+                    latch,
+                    done,
+                },
+                values,
+            )
+        }
+
+        /// Add a phi to the header taking `from_entry` on the way in.
+        fn phi(&mut self, variable: usize, from_entry: Operand) -> ValueId {
+            let slot = self.function.slot_for(SlotOrigin::Variable(variable));
+            let dest = self.function.add_phi(self.header, slot);
+            let position = self.function.block(self.header).phis.len() - 1;
+            self.function.block_mut(self.header).phis[position].args[0] = from_entry;
+            dest
+        }
+
+        /// Set what the phi at `position` takes along the back edge.
+        fn back_edge(&mut self, position: usize, value: Operand) {
+            self.function.block_mut(self.header).phis[position].args[1] = value;
+        }
+
+        /// Finish the function, returning `result`, and lower it to TAC.
+        fn lower(mut self, result: ValueId) -> CFG {
+            self.function
+                .set_terminator(self.done, Terminator::Return(Some(Operand::Value(result))));
+            assert_eq!(verify_ssa(&self.function), Ok(()), "{}", self.function);
+            to_cfg(&self.function)
+        }
+    }
+
+    #[test]
+    fn a_pair_of_phis_that_exchange_their_values_needs_a_temporary() {
+        // Arrange: `a, b = b, a` on the back edge -- the swap problem. Lowered
+        // in the order the phis are written it would be `a := b; b := a`,
+        // leaving both holding the old `b`.
+        let (mut fixture, initial) = Loop::new(&[1, 2]);
+        let first = fixture.phi(0, Operand::Value(initial[0]));
+        let second = fixture.phi(1, Operand::Value(initial[1]));
+        fixture.back_edge(0, Operand::Value(second));
+        fixture.back_edge(1, Operand::Value(first));
+
+        // Act
+        let cfg = fixture.lower(first);
+
+        // Assert: one value is saved, the cycle unwinds through it, and the
+        // saved value lands in the destination the cycle started from.
+        assert_eq!(
+            emitted(&cfg, "latch"),
+            vec![
+                "%phi1 = %v3".to_string(),
+                "%v3 = %v2".to_string(),
+                "%v2 = %phi1".to_string(),
+                "jmp .header".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chain_of_copies_is_ordered_so_that_nothing_reads_a_clobbered_value() {
+        // Arrange: `(a, c) := (v, a)` -- no cycle, but `c := a` has to happen
+        // before `a := v` overwrites what it reads.
+        let (mut fixture, initial) = Loop::new(&[1]);
+        let first = fixture.phi(0, Operand::Value(initial[0]));
+        let second = fixture.phi(1, Operand::Value(initial[0]));
+        let stepped = fixture
+            .function
+            .emit(
+                fixture.latch,
+                Op::Binary(BinOp::Add, Operand::Value(first), Operand::Imm(1)),
+            )
+            .expect("an addition defines a value");
+        fixture.back_edge(0, Operand::Value(stepped));
+        fixture.back_edge(1, Operand::Value(first));
+
+        // Act
+        let cfg = fixture.lower(second);
+
+        // Assert: the reader goes first, and no temporary is needed.
+        assert_eq!(
+            emitted(&cfg, "latch"),
+            vec![
+                "%v3 = %v1 + 1".to_string(),
+                "%v2 = %v1".to_string(),
+                "%v1 = %v3".to_string(),
+                "jmp .header".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_phi_that_takes_its_own_result_costs_nothing() {
+        // Arrange: what a loop produces for a variable it never assigns.
+        let (mut fixture, initial) = Loop::new(&[7]);
+        let carried = fixture.phi(0, Operand::Value(initial[0]));
+        fixture.back_edge(0, Operand::Value(carried));
+
+        // Act
+        let cfg = fixture.lower(carried);
+
+        // Assert: a move from a value to itself is not an assignment, and
+        // sequentialising it would have cost a temporary and two moves.
+        assert_eq!(emitted(&cfg, "latch"), vec!["jmp .header".to_string()]);
+    }
+
+    #[test]
+    fn a_phi_that_is_live_after_the_loop_is_not_overwritten_on_the_way_out() {
+        // Arrange: the lost-copy shape. The phi's value is read after the
+        // loop, and its argument is computed inside the loop, so a copy placed
+        // anywhere but the end of the back edge destroys one or the other.
+        let (mut fixture, initial) = Loop::new(&[1]);
+        let carried = fixture.phi(0, Operand::Value(initial[0]));
+        let stepped = fixture
+            .function
+            .emit(
+                fixture.latch,
+                Op::Binary(BinOp::Add, Operand::Value(carried), Operand::Imm(1)),
+            )
+            .expect("an addition defines a value");
+        fixture.back_edge(0, Operand::Value(stepped));
+
+        // Act
+        let cfg = fixture.lower(carried);
+
+        // Assert: the copy is on the back edge, after everything the block
+        // computes ...
+        assert_eq!(
+            emitted(&cfg, "latch"),
+            vec![
+                "%v2 = %v1 + 1".to_string(),
+                "%v1 = %v2".to_string(),
+                "jmp .header".to_string(),
+            ]
+        );
+
+        // ... and the exit path leaves the value alone, which is the whole
+        // point: what the loop last computed is what is read afterwards.
+        assert_eq!(emitted(&cfg, "done"), vec!["ret %v1".to_string()]);
     }
 }
