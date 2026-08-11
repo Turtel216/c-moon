@@ -89,10 +89,10 @@ pub fn run() -> ExitCode {
         ir.optimize();
     }
 
-    // Rebuild the middle-end in SSA form. Nothing optimises on the way
-    // through yet, so this preserves behaviour exactly; it runs at every
-    // optimisation level so that every test exercises it.
-    round_trip_through_ssa(&mut ir);
+    // Rebuild the middle-end in SSA form, and optimise it there when asked.
+    // Construction and destruction run at every optimisation level, so that
+    // every test exercises them.
+    optimize_through_ssa(&mut ir, cli.opt);
 
     let mut output = String::new();
     // Print AST to console
@@ -145,7 +145,7 @@ pub fn run() -> ExitCode {
 /// doubles the number of programs that exercise construction and destruction,
 /// which is the part most likely to miscompile, and keeps the two levels
 /// working on the same shape of IR.
-fn round_trip_through_ssa(ir: &mut ProgramIr) {
+fn optimize_through_ssa(ir: &mut ProgramIr, optimize: bool) {
     // Destructured so that the two side tables can be read while the functions
     // are being replaced; borrowing `ir` whole would not allow both.
     let ProgramIr {
@@ -162,6 +162,10 @@ fn round_trip_through_ssa(ir: &mut ProgramIr) {
         let promotable = ssa::promote::promotable(&function, array_sizes);
         ssa::mem2reg::promote_slots(&mut function, &promotable);
         ssa::verify::debug_assert_valid(&function, "promotion to SSA values");
+
+        if optimize {
+            ssa::passes::optimize(&mut function);
+        }
 
         *cfg = ssa::destruct::to_cfg(&function);
     }

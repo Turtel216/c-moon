@@ -28,6 +28,7 @@ pub mod build;
 pub mod destruct;
 pub mod dom;
 pub mod mem2reg;
+pub mod passes;
 pub mod promote;
 pub mod verify;
 
@@ -490,7 +491,11 @@ impl Function {
     }
 
     /// Every block of the function, in arena order.
-    pub fn block_ids(&self) -> impl Iterator<Item = BlockId> {
+    ///
+    /// Rust note: `use<>` says the iterator borrows nothing, so a loop over it
+    /// may still change the function.  Without it, edition 2024 assumes the
+    /// iterator captures `&self` and the borrow checker refuses.
+    pub fn block_ids(&self) -> impl Iterator<Item = BlockId> + use<> {
         (0..self.blocks.len()).map(BlockId::from_index)
     }
 
@@ -529,7 +534,7 @@ impl Function {
     }
 
     /// Every slot of the function, in arena order.
-    pub fn slot_ids(&self) -> impl Iterator<Item = SlotId> {
+    pub fn slot_ids(&self) -> impl Iterator<Item = SlotId> + use<> {
         (0..self.slots.len()).map(SlotId::from_index)
     }
 
@@ -614,6 +619,20 @@ impl Function {
         self.insts.push(Inst { dest, op });
         self.blocks[block.index()].insts.insert(position, inst);
         dest
+    }
+
+    /// Keep only the phi nodes of `block` that `keep` accepts.
+    ///
+    /// A phi's recorded definition site is its position in the block's list,
+    /// so removing one renumbers those after it; the survivors' sites are
+    /// corrected here rather than left for the verifier to catch.
+    pub fn retain_phis(&mut self, block: BlockId, keep: impl FnMut(&Phi) -> bool) {
+        let mut keep = keep;
+        self.blocks[block.index()].phis.retain(|phi| keep(phi));
+
+        for (position, phi) in self.blocks[block.index()].phis.iter().enumerate() {
+            self.values[phi.dest.index()].site = DefSite::Phi(block, position);
+        }
     }
 
     /// Remove an instruction from a block.
