@@ -253,16 +253,14 @@ impl Op {
 
     /// Can this operation be removed when its result is unused?
     ///
-    /// A store or a call may be doing something the value it returns does not
-    /// account for, so neither is dead merely because nothing reads it.
+    /// A store or a call may be doing something its result does not account
+    /// for, so neither is dead merely because nothing reads it.  Everything
+    /// else -- reading an incoming argument, reading memory, taking an address
+    /// -- is worth exactly its result, so an unread result makes it dead.
     pub fn is_pure(&self) -> bool {
         !matches!(
             self,
-            Op::SlotStore { .. }
-                | Op::ArrayStore { .. }
-                | Op::Store { .. }
-                | Op::Call { .. }
-                | Op::GetParam(_)
+            Op::SlotStore { .. } | Op::ArrayStore { .. } | Op::Store { .. } | Op::Call { .. }
         )
     }
 

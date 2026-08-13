@@ -15,6 +15,7 @@
 //! copy of the truth, and the verifier cannot see it go stale.
 
 pub mod copyprop;
+pub mod dce;
 pub mod sccp;
 
 use super::Function;
@@ -28,6 +29,7 @@ type Pass = fn(&mut Function) -> bool;
 const PASSES: &[(&str, Pass)] = &[
     ("sparse conditional constant propagation", sccp::run),
     ("copy propagation", copyprop::run),
+    ("dead-code elimination", dce::run),
 ];
 
 /// Optimise one function to a fixed point.
