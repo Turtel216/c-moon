@@ -15,6 +15,7 @@
 //! copy of the truth, and the verifier cannot see it go stale.
 
 pub mod copyprop;
+pub mod sccp;
 
 use super::Function;
 use super::verify;
@@ -24,7 +25,10 @@ use super::verify;
 type Pass = fn(&mut Function) -> bool;
 
 /// The passes, in the order one round runs them.
-const PASSES: &[(&str, Pass)] = &[("copy propagation", copyprop::run)];
+const PASSES: &[(&str, Pass)] = &[
+    ("sparse conditional constant propagation", sccp::run),
+    ("copy propagation", copyprop::run),
+];
 
 /// Optimise one function to a fixed point.
 ///

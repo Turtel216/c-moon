@@ -43,7 +43,7 @@ pub fn run(function: &mut Function) -> bool {
         return false;
     }
 
-    rewrite_operands(function, &resolved);
+    function.substitute_operands(&resolved);
 
     // Every read of these has just been replaced, so the definitions have no
     // reader left.
@@ -139,39 +139,6 @@ fn resolve(start: ValueId, direct: &HashMap<ValueId, Operand>) -> Option<Operand
     }
 
     Some(current)
-}
-
-/// Rewrite every operand in the function through `resolved`.
-fn rewrite_operands(function: &mut Function, resolved: &HashMap<ValueId, Operand>) {
-    let substitute = |operand: &mut Operand| {
-        if let Operand::Value(value) = *operand
-            && let Some(&replacement) = resolved.get(&value)
-        {
-            *operand = replacement;
-        }
-    };
-
-    for block in function.block_ids() {
-        for phi in &mut function.block_mut(block).phis {
-            phi.args.iter_mut().for_each(substitute);
-        }
-
-        let insts = function.block(block).insts.clone();
-        for inst in insts {
-            function
-                .inst_mut(inst)
-                .op
-                .operands_mut()
-                .into_iter()
-                .for_each(substitute);
-        }
-
-        function
-            .block_mut(block)
-            .terminator_operands_mut()
-            .into_iter()
-            .for_each(substitute);
-    }
 }
 
 #[cfg(test)]

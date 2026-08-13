@@ -25,6 +25,7 @@
 //! block's phi nodes in the same call.
 
 pub mod build;
+pub mod defuse;
 pub mod destruct;
 pub mod dom;
 pub mod mem2reg;
@@ -621,6 +622,47 @@ impl Function {
         dest
     }
 
+    /// Replace every read of a value in `replacement` with what it maps to.
+    ///
+    /// Definitions are left alone: this changes what instructions read, not
+    /// what they produce, so the instruction that defined a substituted value
+    /// stays until something removes it for being unread.
+    ///
+    /// # Returns
+    ///
+    /// Whether any operand was replaced.
+    pub fn substitute_operands(&mut self, replacement: &HashMap<ValueId, Operand>) -> bool {
+        let mut replaced = false;
+        let mut substitute = |operand: &mut Operand| {
+            if let Operand::Value(value) = *operand
+                && let Some(&with) = replacement.get(&value)
+            {
+                *operand = with;
+                replaced = true;
+            }
+        };
+
+        for block in 0..self.blocks.len() {
+            for phi in &mut self.blocks[block].phis {
+                phi.args.iter_mut().for_each(&mut substitute);
+            }
+            for inst in self.blocks[block].insts.clone() {
+                self.insts[inst.index()]
+                    .op
+                    .operands_mut()
+                    .into_iter()
+                    .for_each(&mut substitute);
+            }
+            self.blocks[block]
+                .term
+                .operands_mut()
+                .into_iter()
+                .for_each(&mut substitute);
+        }
+
+        replaced
+    }
+
     /// Keep only the phi nodes of `block` that `keep` accepts.
     ///
     /// A phi's recorded definition site is its position in the block's list,
@@ -831,7 +873,11 @@ impl Function {
     /// **Every [`BlockId`] held across this call is invalidated**: the arena is
     /// compacted so that block indices stay dense, which is what dominance
     /// needs.
-    pub fn retain_reachable(&mut self) {
+    ///
+    /// # Returns
+    ///
+    /// Whether any block was deleted.
+    pub fn retain_reachable(&mut self) -> bool {
         let mut reachable = vec![false; self.blocks.len()];
         let mut stack = vec![self.entry];
         reachable[self.entry.index()] = true;
@@ -845,7 +891,7 @@ impl Function {
         }
 
         if reachable.iter().all(|&kept| kept) {
-            return;
+            return false;
         }
 
         // New index of every surviving block, in their old relative order.
@@ -902,6 +948,7 @@ impl Function {
         }
         self.entry =
             renumbered[self.entry.index()].expect("Compiler Bug: entry became unreachable");
+        true
     }
 }
 

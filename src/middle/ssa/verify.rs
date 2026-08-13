@@ -18,8 +18,9 @@ use std::fmt;
 
 use crate::printer::ir_printer::{InstText, ValueText};
 
+use super::defuse::{DefUse, UsePosition};
 use super::dom::{DomTree, Graph};
-use super::{BlockId, DefSite, Function, InstId, Op, Operand, ValueId};
+use super::{BlockId, DefSite, Function, InstId, Op, ValueId};
 
 /// One broken invariant.
 ///
@@ -380,13 +381,14 @@ fn check_definitions(function: &Function, errors: &mut Vec<SsaError>) {
         }
     }
 
-    for (block, use_site) in uses(function) {
-        if let Operand::Value(value) = use_site.operand
-            && !defined.contains_key(&value)
-        {
+    for (value, sites) in DefUse::compute(function).all() {
+        if defined.contains_key(&value) {
+            continue;
+        }
+        for site in sites {
             errors.push(SsaError::DanglingUse {
                 value: value_text(function, value),
-                used_in: use_site.describe(function, block),
+                used_in: use_text(function, site.block, site.position),
             });
         }
     }
@@ -451,136 +453,61 @@ fn check_dominance(function: &Function, errors: &mut Vec<SsaError>) {
         }
     }
 
-    for (block, use_site) in uses(function) {
-        let Operand::Value(value) = use_site.operand else {
-            continue;
-        };
+    for (value, sites) in DefUse::compute(function).all() {
         let Some(&(defined_in, defined_at)) = site.get(&value) else {
             continue; // already reported as a dangling use
         };
 
-        match use_site.position {
-            // A phi argument is not used in the phi's own block: it is used at
-            // the end of the predecessor it arrives from, which is the block
-            // the definition has to reach.
-            UsePosition::PhiArgument { phi, predecessor } => {
-                if !tree.dominates(defined_in, predecessor) {
-                    errors.push(SsaError::PhiArgumentNotDominated {
-                        block: function.block(block).label.clone(),
-                        phi: value_text(function, phi),
-                        value: value_text(function, value),
-                        predecessor: function.block(predecessor).label.clone(),
-                    });
+        for use_site in sites {
+            let block = use_site.block;
+            match use_site.position {
+                // A phi argument is not used in the phi's own block: it is
+                // used at the end of the predecessor it arrives from, which is
+                // the block the definition has to reach.
+                UsePosition::Phi { phi, argument } => {
+                    let predecessor = function.block(block).preds()[argument];
+                    if !tree.dominates(defined_in, predecessor) {
+                        errors.push(SsaError::PhiArgumentNotDominated {
+                            block: function.block(block).label.clone(),
+                            phi: value_text(function, function.block(block).phis[phi].dest),
+                            value: value_text(function, value),
+                            predecessor: function.block(predecessor).label.clone(),
+                        });
+                    }
+                }
+
+                UsePosition::Inst { order, .. } | UsePosition::Terminator { order } => {
+                    let dominated = if defined_in == block {
+                        defined_at < order
+                    } else {
+                        tree.dominates(defined_in, block)
+                    };
+                    if !dominated {
+                        errors.push(SsaError::UseNotDominated {
+                            value: value_text(function, value),
+                            defined_in: function.block(defined_in).label.clone(),
+                            used_in: function.block(block).label.clone(),
+                            at: use_text(function, block, use_site.position),
+                        });
+                    }
                 }
             }
-
-            UsePosition::Inst { order, .. } | UsePosition::Terminator { order } => {
-                let dominated = if defined_in == block {
-                    defined_at < order
-                } else {
-                    tree.dominates(defined_in, block)
-                };
-                if !dominated {
-                    errors.push(SsaError::UseNotDominated {
-                        value: value_text(function, value),
-                        defined_in: function.block(defined_in).label.clone(),
-                        used_in: function.block(block).label.clone(),
-                        at: use_site.describe(function, block),
-                    });
-                }
-            }
         }
     }
 }
 
-/// Where in a block an operand is read.
-#[derive(Debug, Clone, Copy)]
-enum UsePosition {
-    /// Argument of a phi, arriving from `predecessor`.
-    PhiArgument { phi: ValueId, predecessor: BlockId },
-    /// Operand of an instruction, `order` places into the block.
-    Inst { inst: InstId, order: usize },
-    /// Operand of the block's terminator, which is last.
-    Terminator { order: usize },
-}
-
-/// One place a value is read.
-#[derive(Debug, Clone, Copy)]
-struct Use {
-    operand: Operand,
-    position: UsePosition,
-}
-
-impl Use {
-    /// The text a message should quote for this use.
-    fn describe(&self, function: &Function, block: BlockId) -> String {
-        match self.position {
-            UsePosition::PhiArgument { phi, .. } => {
-                format!("phi {}", value_text(function, phi))
-            }
-            UsePosition::Inst { inst, .. } => inst_text(function, inst),
-            UsePosition::Terminator { .. } => {
-                format!("the transfer ending .{}", function.block(block).label)
-            }
+/// The text a message should quote for a use.
+fn use_text(function: &Function, block: BlockId, position: UsePosition) -> String {
+    match position {
+        UsePosition::Phi { phi, .. } => format!(
+            "phi {}",
+            value_text(function, function.block(block).phis[phi].dest)
+        ),
+        UsePosition::Inst { inst, .. } => inst_text(function, inst),
+        UsePosition::Terminator { .. } => {
+            format!("the transfer ending .{}", function.block(block).label)
         }
     }
-}
-
-/// Every read of an operand in the function, with the block it happens in.
-fn uses(function: &Function) -> Vec<(BlockId, Use)> {
-    let mut found = Vec::new();
-
-    for block in function.block_ids() {
-        let body = function.block(block);
-
-        for phi in &body.phis {
-            for (position, &argument) in phi.args.iter().enumerate() {
-                // A phi argument with no matching predecessor is reported by
-                // the arity check; there is no edge to blame it on here.
-                let Some(&predecessor) = body.preds().get(position) else {
-                    continue;
-                };
-                found.push((
-                    block,
-                    Use {
-                        operand: argument,
-                        position: UsePosition::PhiArgument {
-                            phi: phi.dest,
-                            predecessor,
-                        },
-                    },
-                ));
-            }
-        }
-
-        for (position, &inst) in body.insts.iter().enumerate() {
-            for operand in function.inst(inst).op.operands() {
-                found.push((
-                    block,
-                    Use {
-                        operand,
-                        position: UsePosition::Inst {
-                            inst,
-                            order: position + 1,
-                        },
-                    },
-                ));
-            }
-        }
-
-        let order = body.insts.len() + 1;
-        for operand in body.terminator().operands() {
-            found.push((
-                block,
-                Use {
-                    operand,
-                    position: UsePosition::Terminator { order },
-                },
-            ));
-        }
-    }
-
-    found
 }
 
 /// One value, as a message should refer to it.
@@ -609,7 +536,7 @@ fn site_text(function: &Function, site: DefSite) -> String {
 mod tests {
     use super::*;
 
-    use crate::middle::ssa::{Op, SlotOrigin, Terminator};
+    use crate::middle::ssa::{Op, Operand, SlotOrigin, Terminator};
 
     /// A function with an entry block and nothing in it.
     fn function() -> Function {
