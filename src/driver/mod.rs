@@ -84,11 +84,6 @@ pub fn run() -> ExitCode {
     let ctx = LoweringContext::new(&resolution_map);
     let mut ir = ctx.lower_program(&ast);
 
-    // Optimization passes if optimizations are enabled
-    if cli.opt {
-        ir.optimize();
-    }
-
     // Rebuild the middle-end in SSA form, and optimise it there when asked.
     // Construction and destruction run at every optimisation level, so that
     // every test exercises them.

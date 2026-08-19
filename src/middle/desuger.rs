@@ -1,11 +1,8 @@
 //! Responsible for desugering the AST into the IR
 //!
-//! The Optimizations that can be applied are:
-//!   - Constant folding
-//!   - Algebraic simplification
-//!   - Constant propagation
-//!   - Dead code elimination
-//!   - Unreachable code elimination
+//! What comes out is unoptimised three-address code. Optimisation happens
+//! afterwards, on the SSA form the middle-end builds from it -- see
+//! [`ssa::passes`](crate::middle::ssa::passes).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -34,19 +31,6 @@ impl ProgramIr {
             functions: BTreeMap::new(),
             array_sizes: HashMap::new(),
             var_names: HashMap::new(),
-        }
-    }
-
-    /// Run the optmizations passes on the Program IR.
-    /// The optimizations applied to each ``CFG`` inside the ``ProgramIr`` are:
-    ///   - Constant folding
-    ///   - Algebraic simplification
-    ///   - Constant propagation
-    ///   - Dead code elimination
-    ///   - Unreachable code elimination
-    pub fn optimize(&mut self) -> () {
-        for (_, cfg) in self.functions.iter_mut() {
-            while !cfg.run_optimizations() {}
         }
     }
 }
