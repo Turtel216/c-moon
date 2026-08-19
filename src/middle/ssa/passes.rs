@@ -17,6 +17,7 @@
 pub mod copyprop;
 pub mod dce;
 pub mod sccp;
+pub mod simplify;
 
 use super::Function;
 use super::verify;
@@ -28,6 +29,7 @@ type Pass = fn(&mut Function) -> bool;
 /// The passes, in the order one round runs them.
 const PASSES: &[(&str, Pass)] = &[
     ("sparse conditional constant propagation", sccp::run),
+    ("algebraic simplification", simplify::run),
     ("copy propagation", copyprop::run),
     ("dead-code elimination", dce::run),
 ];
