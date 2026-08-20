@@ -529,6 +529,7 @@ fn site_text(function: &Function, site: DefSite) -> String {
             position,
             function.block(block).label
         ),
+        DefSite::Removed => "a definition that has been removed".to_string(),
     }
 }
 

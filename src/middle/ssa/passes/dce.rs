@@ -83,6 +83,9 @@ fn mark(function: &Function) -> Live {
             DefSite::Phi(block, position) => {
                 worklist.extend(function.block(block).phis[position].args.iter().copied());
             }
+            // Reading a value whose definition is gone is a broken function,
+            // which the verifier reports; there is nothing to keep alive.
+            DefSite::Removed => {}
         }
     }
 

@@ -14,6 +14,7 @@
 //! and these functions are small; a chain kept up to date by hand is a second
 //! copy of the truth, and the verifier cannot see it go stale.
 
+pub mod blocks;
 pub mod copyprop;
 pub mod dce;
 pub mod sccp;
@@ -32,6 +33,7 @@ const PASSES: &[(&str, Pass)] = &[
     ("algebraic simplification", simplify::run),
     ("copy propagation", copyprop::run),
     ("dead-code elimination", dce::run),
+    ("block merging", blocks::run),
 ];
 
 /// Optimise one function to a fixed point.

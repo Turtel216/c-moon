@@ -146,9 +146,20 @@ pub struct ValueDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefSite {
     /// Defined by an instruction.
+    ///
+    /// An instruction keeps its place in the arena even after it is taken out
+    /// of a block, so this stays meaningful either way.
     Inst(InstId),
     /// Defined by the phi at the given position of the given block.
     Phi(BlockId, usize),
+    /// The definition is gone, so nothing may read this value any more.
+    ///
+    /// A phi is identified by *where* it is, so removing one -- or the block
+    /// it was in -- leaves nothing for the values it defined to point at.
+    /// Saying so is better than leaving an index that means something else
+    /// now: the verifier reports any use that survives its definition, and a
+    /// live definition claiming to be removed is reported too.
+    Removed,
 }
 
 /// A value's source-level identity, for debug output and diagnostics.
@@ -668,7 +679,17 @@ impl Function {
     /// corrected here rather than left for the verifier to catch.
     pub fn retain_phis(&mut self, block: BlockId, keep: impl FnMut(&Phi) -> bool) {
         let mut keep = keep;
-        self.blocks[block.index()].phis.retain(|phi| keep(phi));
+        let mut dropped = Vec::new();
+        self.blocks[block.index()].phis.retain(|phi| {
+            let kept = keep(phi);
+            if !kept {
+                dropped.push(phi.dest);
+            }
+            kept
+        });
+        for value in dropped {
+            self.values[value.index()].site = DefSite::Removed;
+        }
 
         for (position, phi) in self.blocks[block.index()].phis.iter().enumerate() {
             self.values[phi.dest.index()].site = DefSite::Phi(block, position);
@@ -861,6 +882,61 @@ impl Function {
         (predecessors, successors)
     }
 
+    /// Absorb `second` into `first`, which must be its only way in.
+    ///
+    /// `second` keeps its identity as a block but loses everything in it, so
+    /// nothing reaches it any more; deleting it is
+    /// [`Function::retain_reachable`]'s job, which the caller does once rather
+    /// than after every merge.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `first` ends by jumping to `second`, `second` is entered
+    /// from nowhere else, and `second` has no phi nodes -- a phi in a block
+    /// with one way in is a copy, and belongs to copy propagation rather than
+    /// here.
+    pub fn merge_blocks(&mut self, first: BlockId, second: BlockId) {
+        assert_eq!(
+            *self.blocks[first.index()].terminator(),
+            Terminator::Jump(second),
+            "Compiler Bug: .{} does not jump to .{}",
+            self.blocks[first.index()].label,
+            self.blocks[second.index()].label
+        );
+        assert_eq!(
+            self.blocks[second.index()].preds(),
+            [first],
+            "Compiler Bug: .{} is entered from somewhere other than .{}",
+            self.blocks[second.index()].label,
+            self.blocks[first.index()].label
+        );
+        assert!(
+            self.blocks[second.index()].phis.is_empty(),
+            "Compiler Bug: .{} still has phi nodes to merge away",
+            self.blocks[second.index()].label
+        );
+
+        let body = std::mem::take(&mut self.blocks[second.index()].insts);
+        self.blocks[first.index()].insts.extend(body);
+
+        // The successors are inherited along with the terminator, so their
+        // predecessor entries move from the absorbed block to the absorbing
+        // one -- in place, so that phi arguments keep their positions.
+        let inherited = std::mem::replace(
+            &mut self.blocks[second.index()].term,
+            Terminator::Return(None),
+        );
+        for successor in inherited.successors() {
+            for pred in &mut self.blocks[successor.index()].preds {
+                if *pred == second {
+                    *pred = first;
+                }
+            }
+        }
+        self.blocks[second.index()].preds.clear();
+        self.blocks[first.index()].term = inherited;
+    }
+
     /// Delete every block the entry cannot reach, renumbering the rest.
     ///
     /// Dominance is undefined for unreachable blocks, so this runs before any
@@ -941,7 +1017,12 @@ impl Function {
         }
         for value in &mut self.values {
             if let DefSite::Phi(block, _) = &mut value.site {
-                remap(block);
+                match renumbered[block.index()] {
+                    Some(renumbered) => *block = renumbered,
+                    // The phi went with its block. Nothing may read the value
+                    // any more, and the verifier is what checks that.
+                    None => value.site = DefSite::Removed,
+                }
             }
         }
         self.entry =
