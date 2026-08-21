@@ -290,6 +290,21 @@ impl DomTree {
             && self.exit[b.index()] <= self.exit[a.index()]
     }
 
+    /// The blocks each block immediately dominates, by block index.
+    ///
+    /// This is the dominator tree as adjacency lists, which is what a walk
+    /// over it needs.  Children come out in reverse postorder, so anything
+    /// driven by this walk -- and any name it hands out -- is reproducible.
+    pub fn children(&self) -> Vec<Vec<BlockId>> {
+        let mut children = vec![Vec::new(); self.immediate.len()];
+        for &block in &self.order {
+            if let Some(idom) = self.immediate_dominator(block) {
+                children[idom.index()].push(block);
+            }
+        }
+        children
+    }
+
     /// The dominance frontier of every block, by block index.
     ///
     /// The frontier of `a` is the set of blocks `a` does *not* dominate but

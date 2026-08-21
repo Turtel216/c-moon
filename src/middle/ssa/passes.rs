@@ -17,6 +17,7 @@
 pub mod blocks;
 pub mod copyprop;
 pub mod dce;
+pub mod gvn;
 pub mod sccp;
 pub mod simplify;
 
@@ -31,6 +32,7 @@ type Pass = fn(&mut Function) -> bool;
 const PASSES: &[(&str, Pass)] = &[
     ("sparse conditional constant propagation", sccp::run),
     ("algebraic simplification", simplify::run),
+    ("global value numbering", gvn::run),
     ("copy propagation", copyprop::run),
     ("dead-code elimination", dce::run),
     ("block merging", blocks::run),

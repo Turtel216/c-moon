@@ -176,7 +176,7 @@ pub struct SourceName {
 /// There is deliberately no variant for a label or a slot: an operand is
 /// always a value, which is what lets the verifier check every use against its
 /// definition without a per-opcode table of which fields are really inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Operand {
     /// The result of another instruction or phi.
     Value(ValueId),
@@ -198,7 +198,7 @@ impl Operand {
 ///
 /// The set matches the TAC opcodes it is built from; relational operations
 /// produce 0 or 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,

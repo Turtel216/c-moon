@@ -210,7 +210,7 @@ impl<'a> Renaming<'a> {
     /// stack when the block is reached is exactly the definition that reaches
     /// it.  The pushes a block made are undone on the way back out.
     fn run(mut self, tree: &DomTree) {
-        let children = dominator_children(self.function, tree);
+        let children = tree.children();
 
         // An explicit stack rather than recursion, for the same reason the
         // rest of the module avoids it: a deep enough function would otherwise
@@ -414,19 +414,6 @@ enum Action {
 enum Step {
     Enter(BlockId),
     Leave(BlockId),
-}
-
-/// The children of every block in the dominator tree, by block index.
-fn dominator_children(function: &Function, tree: &DomTree) -> Vec<Vec<BlockId>> {
-    let mut children = vec![Vec::new(); function.block_count()];
-    // Reverse postorder gives the children a stable order, so renaming --
-    // and the version numbers it hands out -- is reproducible.
-    for &block in tree.reverse_postorder() {
-        if let Some(idom) = tree.immediate_dominator(block) {
-            children[idom.index()].push(block);
-        }
-    }
-    children
 }
 
 #[cfg(test)]
