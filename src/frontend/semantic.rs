@@ -10,8 +10,8 @@ use std::fmt;
 
 use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
-    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, ParamDecl, Stmt, StmtKind,
-    UnaryOp,
+    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Stmt,
+    StmtKind, UnaryOp,
 };
 use crate::frontend::scope::ScopeStack;
 use crate::frontend::span::Span;
@@ -246,7 +246,10 @@ fn arguments(count: usize) -> String {
 /// crashing a later phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
+    /// `int`: a 32-bit signed integer, as on every ABI this compiler targets.
     Int,
+    /// `long int`: a 64-bit signed integer.
+    Long,
     Void,
     /// A fixed-size array of a primitive type, e.g. `int arr[3]` -> `Array(Int, 3)`.
     Array(Box<Type>, usize),
@@ -258,6 +261,7 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Int => write!(f, "int"),
+            Type::Long => write!(f, "long int"),
             Type::Void => write!(f, "void"),
             Type::Array(elem, size) => write!(f, "{elem}[{size}]"),
             Type::Pointer(inner) => write!(f, "{inner}*"),
@@ -282,6 +286,7 @@ impl Type {
     fn from_ctype(ty: &CType, span: Span, context: &'static str) -> SemanticResult<Self> {
         match ty {
             CType::Int => Ok(Type::Int),
+            CType::Long => Ok(Type::Long),
             CType::Void => Ok(Type::Void),
             CType::Array(elem, Some(size)) => Ok(Type::Array(
                 Box::new(Type::from_ctype(elem, span, context)?),
@@ -299,6 +304,33 @@ impl Type {
                 span,
                 context,
             }),
+        }
+    }
+
+    /// Whether this is one of the integer types, which are the only ones
+    /// arithmetic, comparisons and conditions accept.
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Type::Int | Type::Long)
+    }
+
+    /// The type both operands of an arithmetic or relational operator are
+    /// converted to before it is applied.
+    ///
+    /// C calls this the usual arithmetic conversions. With two integer types
+    /// they come down to one rule: if either side is the wider one, both sides
+    /// are widened to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless both types are integers, which the caller checks first.
+    pub fn common(lhs: &Type, rhs: &Type) -> Type {
+        assert!(
+            lhs.is_integer() && rhs.is_integer(),
+            "Compiler Bug: the usual arithmetic conversions apply to integers only"
+        );
+        match (lhs, rhs) {
+            (Type::Long, _) | (_, Type::Long) => Type::Long,
+            _ => Type::Int,
         }
     }
 }
@@ -329,14 +361,67 @@ struct VarInfo {
     span: Span,
 }
 
+/// What semantic analysis worked out about every typed node of the tree.
+///
+/// The middle-end lowers with it: an `int` is 32 bits wide and a `long int` is
+/// 64, so the type an expression was given here decides the width of the
+/// instruction it becomes and where a conversion has to be inserted. Types are
+/// recorded in a side table keyed by [`NodeId`], like the renamer's
+/// resolution map, so the AST itself stays untouched.
+#[derive(Debug, Default)]
+pub struct TypeMap {
+    /// The type of every expression that was checked.
+    exprs: HashMap<NodeId, Type>,
+    /// The declared type of every variable and parameter declaration.
+    decls: HashMap<NodeId, Type>,
+    /// Every function's signature, by name.
+    functions: HashMap<String, FunctionSig>,
+}
+
+impl TypeMap {
+    /// The type of the expression `id` names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the expression was never checked, which means the middle-end
+    /// is lowering a tree semantic analysis did not accept.
+    pub fn expr(&self, id: NodeId) -> &Type {
+        self.exprs
+            .get(&id)
+            .expect("Compiler Bug: expression was never type checked")
+    }
+
+    /// The declared type of the declaration `id` names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the declaration was never checked.
+    pub fn decl(&self, id: NodeId) -> &Type {
+        self.decls
+            .get(&id)
+            .expect("Compiler Bug: declaration was never type checked")
+    }
+
+    /// The signature of the function called `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no such function was declared.
+    pub fn function(&self, name: &str) -> &FunctionSig {
+        self.functions
+            .get(name)
+            .expect("Compiler Bug: call to a function that was never declared")
+    }
+}
+
 /// Semantic analyzer for declarations/statements/expressions.
 #[derive(Debug, Default)]
 pub struct SemanticAnalyzer {
     /// Variable types, innermost scope last.
     symbols: ScopeStack<VarInfo>,
-    /// Signatures of every function in the translation unit, collected before
-    /// bodies are checked so functions may be called before they are defined.
-    functions: HashMap<String, FunctionSig>,
+    /// The types every checked node was given, handed to the middle-end once
+    /// the whole unit has been accepted.
+    types: TypeMap,
     /// Return type of the function whose body is being checked, and the
     /// signature that declared it.
     current_function: Option<(Type, Span)>,
@@ -346,6 +431,11 @@ pub struct SemanticAnalyzer {
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The types of every node, once analysis has reported no errors.
+    pub fn into_types(self) -> TypeMap {
+        self.types
     }
 
     /// Analyze a translation unit (top-level declarations).
@@ -383,11 +473,11 @@ impl SemanticAnalyzer {
 
             let sig = FunctionSig {
                 return_ty: Type::from_ctype(return_ty, decl.span, "in this return type")?,
-                params: Self::param_signatures(params)?,
+                params: self.param_signatures(params)?,
                 span: decl.span,
             };
 
-            if let Some(previous) = self.functions.insert(name.clone(), sig) {
+            if let Some(previous) = self.types.functions.insert(name.clone(), sig) {
                 return Err(SemanticError::RedeclaredFunction {
                     name: name.clone(),
                     span: decl.name_span,
@@ -399,13 +489,16 @@ impl SemanticAnalyzer {
         Ok(())
     }
 
-    /// Translates a parameter list into semantic types.
-    fn param_signatures(params: &[ParamDecl]) -> SemanticResult<Vec<ParamSig>> {
+    /// Translates a parameter list into semantic types, recording the type of
+    /// each parameter declaration as it goes.
+    fn param_signatures(&mut self, params: &[ParamDecl]) -> SemanticResult<Vec<ParamSig>> {
         params
             .iter()
             .map(|param| {
+                let ty = Type::from_ctype(&param.ty, param.span, "in this parameter")?;
+                self.types.decls.insert(param.id, ty.clone());
                 Ok(ParamSig {
-                    ty: Type::from_ctype(&param.ty, param.span, "in this parameter")?,
+                    ty,
                     span: param.span,
                 })
             })
@@ -450,6 +543,8 @@ impl SemanticAnalyzer {
                 context: "a variable cannot have type `void`",
             });
         }
+
+        self.types.decls.insert(decl.id, var_ty.clone());
 
         let info = VarInfo {
             ty: var_ty.clone(),
@@ -663,10 +758,20 @@ impl SemanticAnalyzer {
     /// Checks a controlling expression, which C requires to be a scalar.
     fn analyze_condition(&mut self, condition: &Expr, context: &'static str) -> SemanticResult<()> {
         let cond_ty = self.analyze_expr(condition)?;
-        Self::expect_type(&Type::Int, &cond_ty, condition.span, None, context)
+        Self::expect_integer(&cond_ty, condition.span, context)
     }
 
+    /// Checks one expression and records the type it was given.
+    ///
+    /// Every expression goes through here exactly once, so the recorded types
+    /// cover the whole tree the middle-end will lower.
     fn analyze_expr(&mut self, expr: &Expr) -> SemanticResult<Type> {
+        let ty = self.check_expr(expr)?;
+        self.types.exprs.insert(expr.id, ty.clone());
+        Ok(ty)
+    }
+
+    fn check_expr(&mut self, expr: &Expr) -> SemanticResult<Type> {
         match &expr.kind {
             ExprKind::Literal(literal) => Self::literal_type(literal, expr.span),
 
@@ -709,9 +814,16 @@ impl SemanticAnalyzer {
     }
 
     /// The type of a literal. Only integer literals are supported so far.
+    ///
+    /// C gives an unsuffixed integer literal the first type of `int`, `long
+    /// int`, ... that can represent it, so a literal too large for 32 bits is
+    /// already a `long int` where it is written.
     fn literal_type(literal: &Literal, span: Span) -> SemanticResult<Type> {
         match literal {
-            Literal::Int(_) => Ok(Type::Int),
+            Literal::Int(value) => match i32::try_from(*value) {
+                Ok(_) => Ok(Type::Int),
+                Err(_) => Ok(Type::Long),
+            },
             Literal::Float(_) => Err(SemanticError::unsupported_literal("floating-point", span)),
             Literal::Char(_) => Err(SemanticError::unsupported_literal("character", span)),
             Literal::String(_) => Err(SemanticError::unsupported_literal("string", span)),
@@ -729,13 +841,7 @@ impl SemanticAnalyzer {
         };
 
         let index_ty = self.analyze_expr(index)?;
-        Self::expect_type(
-            &Type::Int,
-            &index_ty,
-            index.span,
-            None,
-            "an array index must be an integer",
-        )?;
+        Self::expect_integer(&index_ty, index.span, "an array index must be an integer")?;
         Ok(*elem_ty)
     }
 
@@ -749,11 +855,11 @@ impl SemanticAnalyzer {
             });
         };
 
-        let Some(sig) = self.functions.get(name).cloned() else {
+        let Some(sig) = self.types.functions.get(name).cloned() else {
             return Err(SemanticError::UndeclaredFunction {
                 name: name.clone(),
                 span: callee.span,
-                suggestion: suggest::nearest(name, self.functions.keys().map(String::as_str))
+                suggestion: suggest::nearest(name, self.types.functions.keys().map(String::as_str))
                     .map(str::to_owned),
             });
         };
@@ -804,26 +910,25 @@ impl SemanticAnalyzer {
         }
 
         // For the current subset every arithmetic, comparison, logical and
-        // bitwise operator takes two ints...
+        // bitwise operator takes two integers...
         let lhs_ty = self.analyze_expr(lhs)?;
         let rhs_ty = self.analyze_expr(rhs)?;
-        Self::expect_type(
-            &Type::Int,
-            &lhs_ty,
-            lhs.span,
-            None,
-            OPERANDS_MUST_BE_INTEGERS,
-        )?;
-        Self::expect_type(
-            &Type::Int,
-            &rhs_ty,
-            rhs.span,
-            None,
-            OPERANDS_MUST_BE_INTEGERS,
-        )?;
+        Self::expect_integer(&lhs_ty, lhs.span, OPERANDS_MUST_BE_INTEGERS)?;
+        Self::expect_integer(&rhs_ty, rhs.span, OPERANDS_MUST_BE_INTEGERS)?;
 
-        // ... and yields an int, comparisons and logical operators included.
-        Ok(Type::Int)
+        // ... and yields the type they are both converted to, except that a
+        // comparison or a logical operator yields the 0 or 1 of an `int`.
+        Ok(match op {
+            BinaryOp::Eq
+            | BinaryOp::Neq
+            | BinaryOp::Lt
+            | BinaryOp::Lte
+            | BinaryOp::Gt
+            | BinaryOp::Gte
+            | BinaryOp::LogicalAnd
+            | BinaryOp::LogicalOr => Type::Int,
+            _ => Type::common(&lhs_ty, &rhs_ty),
+        })
     }
 
     fn analyze_unary(&mut self, op: UnaryOp, operand: &Expr, span: Span) -> SemanticResult<Type> {
@@ -837,14 +942,13 @@ impl SemanticAnalyzer {
             | UnaryOp::PreDec
             | UnaryOp::PostInc
             | UnaryOp::PostDec => {
-                Self::expect_type(
-                    &Type::Int,
-                    &operand_ty,
-                    operand.span,
-                    None,
-                    OPERANDS_MUST_BE_INTEGERS,
-                )?;
-                Ok(Type::Int)
+                Self::expect_integer(&operand_ty, operand.span, OPERANDS_MUST_BE_INTEGERS)?;
+                // `!x` answers a question and so is an `int`; the rest keep
+                // the width they were given.
+                match op {
+                    UnaryOp::Not => Ok(Type::Int),
+                    _ => Ok(operand_ty),
+                }
             }
             UnaryOp::AddressOf => {
                 if !Self::is_lvalue(operand) {
@@ -874,7 +978,33 @@ impl SemanticAnalyzer {
         )
     }
 
-    /// Checks that `found` is acceptable where `expected` is required.
+    /// Checks that `found` is one of the integer types.
+    ///
+    /// # Arguments
+    ///
+    /// * `found` - the type of the expression written there
+    /// * `span` - the expression to blame
+    /// * `context` - why an integer is required
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::TypeError`] blaming `span`, reporting `int` as
+    /// the expected type: it is the narrower of the two that would do.
+    fn expect_integer(found: &Type, span: Span, context: &'static str) -> SemanticResult<()> {
+        match found.is_integer() {
+            true => Ok(()),
+            false => Err(SemanticError::TypeError {
+                expected: Type::Int,
+                found: found.clone(),
+                span,
+                origin: None,
+                context,
+            }),
+        }
+    }
+
+    /// Checks that a value of type `found` may be used where `expected` is
+    /// required, implicitly converting it if C says so.
     ///
     /// # Arguments
     ///
@@ -898,8 +1028,13 @@ impl SemanticAnalyzer {
         if expected == found {
             return Ok(());
         }
+        // An integer converts to any other integer type: `long int x = i;`
+        // widens, `int i = x;` truncates, and both are silent in C.
+        if expected.is_integer() && found.is_integer() {
+            return Ok(());
+        }
         // Allow assigning integer literal 0 (NULL) to any pointer type.
-        if matches!(expected, Type::Pointer(_)) && *found == Type::Int {
+        if matches!(expected, Type::Pointer(_)) && found.is_integer() {
             return Ok(());
         }
         Err(SemanticError::TypeError {
@@ -1040,6 +1175,55 @@ mod tests {
     fn rejects_dereference_of_non_pointer() {
         let error = analyze_err("int main() { int x = 1; return *x; }");
         assert!(matches!(error, SemanticError::NotDereferenceable { .. }));
+    }
+
+    #[test]
+    fn accepts_long_declarations_and_the_conversions_between_the_two() {
+        analyze_ok(
+            "int main() { long int wide = 5; int narrow = wide; wide = narrow; return narrow; }",
+        );
+    }
+
+    #[test]
+    fn arithmetic_on_a_long_and_an_int_yields_a_long() {
+        // A `long int` may only be initialized from something that converts to
+        // one, so accepting this is the analyzer saying the sum is 64 bits.
+        analyze_ok("int main() { int a = 1; long int b = 2; long int c = a + b; return c; }");
+    }
+
+    #[test]
+    fn a_comparison_of_longs_is_an_int() {
+        analyze_ok("int main() { long int a = 1; long int b = 2; int less = a < b; return less; }");
+    }
+
+    #[test]
+    fn rejects_a_pointer_where_an_integer_is_required() {
+        // The two integer types convert to each other, but a pointer is not
+        // one of them.
+        let error = analyze_err("long int main() { int x = 1; long int y = &x; return y; }");
+        match error {
+            SemanticError::TypeError {
+                expected, found, ..
+            } => {
+                assert_eq!(expected, Type::Long);
+                assert_eq!(found, Type::Pointer(Box::new(Type::Int)));
+            }
+            other => panic!("expected TypeError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_integer_literal_too_large_for_an_int_is_a_long() {
+        // Arrange / Act / Assert
+        let span = Span::new(1, 1, 0, 1);
+        assert_eq!(
+            SemanticAnalyzer::literal_type(&Literal::Int(2147483647), span),
+            Ok(Type::Int)
+        );
+        assert_eq!(
+            SemanticAnalyzer::literal_type(&Literal::Int(2147483648), span),
+            Ok(Type::Long)
+        );
     }
 
     #[test]

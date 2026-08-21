@@ -139,7 +139,10 @@ pub struct ParamDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CType {
     Void,
+    /// `int`, a 32-bit signed integer.
     Int,
+    /// `long int`, a 64-bit signed integer. `long` on its own means the same.
+    Long,
     Char,
     Float,
     Double,
@@ -155,6 +158,7 @@ impl fmt::Display for CType {
         match self {
             CType::Void => write!(f, "void"),
             CType::Int => write!(f, "int"),
+            CType::Long => write!(f, "long int"),
             CType::Char => write!(f, "char"),
             CType::Float => write!(f, "float"),
             CType::Double => write!(f, "double"),
@@ -229,6 +233,10 @@ mod tests {
         assert_eq!(
             CType::Struct("Point".to_string()).to_string(),
             "struct Point"
+        );
+        assert_eq!(
+            CType::Pointer(Box::new(CType::Long)).to_string(),
+            "long int*"
         );
     }
 }

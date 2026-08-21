@@ -346,9 +346,17 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses the base type of a declaration, e.g. the `int` of `int *p[4]`.
+    ///
+    /// `long` is the one specifier written as more than one word: `long` and
+    /// `long int` name the same type, so the optional `int` is consumed here.
     fn parse_type_specifier(&mut self) -> PResult<CType> {
         let ty = match self.current().kind {
             TokenKind::Int => CType::Int,
+            TokenKind::Long => {
+                self.advance();
+                self.match_kind(TokenKind::Int);
+                return Ok(CType::Long);
+            }
             TokenKind::Char => CType::Char,
             TokenKind::Float => CType::Float,
             TokenKind::Double => CType::Double,
@@ -792,6 +800,7 @@ impl<'a> Parser<'a> {
         matches!(
             kind,
             TokenKind::Int
+                | TokenKind::Long
                 | TokenKind::Char
                 | TokenKind::Float
                 | TokenKind::Double
@@ -808,16 +817,22 @@ impl<'a> Parser<'a> {
     /// Whether the cursor sits on a cast such as `(int)x`, as opposed to a
     /// parenthesised expression.
     ///
-    /// Two tokens of lookahead are enough for the supported type syntax: `(`
-    /// followed by a type keyword, followed by either `)` or the start of the
-    /// declarator being cast to.
+    /// A few tokens of lookahead are enough for the supported type syntax: `(`
+    /// followed by a type specifier, followed by either `)` or the start of the
+    /// declarator being cast to. Every specifier is one token except `long
+    /// int`, which is two.
     fn at_cast(&self) -> bool {
-        self.check(TokenKind::LParen)
-            && self.peek_kind(1).is_some_and(Self::starts_type)
-            && matches!(
-                self.peek_kind(2),
-                Some(TokenKind::RParen | TokenKind::Identifier)
-            )
+        if !self.check(TokenKind::LParen) || !self.peek_kind(1).is_some_and(Self::starts_type) {
+            return false;
+        }
+        let after_specifier = match (self.peek_kind(1), self.peek_kind(2)) {
+            (Some(TokenKind::Long), Some(TokenKind::Int)) => self.peek_kind(3),
+            _ => self.peek_kind(2),
+        };
+        matches!(
+            after_specifier,
+            Some(TokenKind::RParen | TokenKind::Identifier)
+        )
     }
 
     // ### Token stream helpers ###
