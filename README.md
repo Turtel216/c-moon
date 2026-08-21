@@ -1,65 +1,45 @@
-# C-Moon 
+# C-Moon
 
 A lightweight, optimizing C-to-x86 compiler built from scratch in Rust.
 
-This project is an educational compiler designed to compile a strict subset of the C programming language into standard x86 assembly. It features a hand-coded recursive descent parser, a custom Three-Address Code (TAC) intermediate representation, and implemented optimization passes.
+This project is an educational compiler designed to compile a strict subset of the C programming language into standard x86 assembly. It features a hand-coded recursive descent parser, an SSA-based optimizer, and a target-independent backend.
 
 ## Architecture
 
-The compiler is structured as a classic three-phase pipeline to separate language semantics from machine architecture:
+The compiler is a classic pipeline, with each stage handing off a representation suited to the work it does:
 
-1. **Frontend:** A hand-rolled Lexer (scanner plus a small preprocessor) and Recursive Descent Parser that construct an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass. Every node carries a source span, which the diagnostics renderer turns into an annotated snippet.
-2. **Middle-End:** Lowers the AST into a linear, architecture-independent Three-Address Code (TAC) IR. This phase is responsible for target-independent optimizations.
-3. **Backend:** Translates the optimized IR into machine code. It is split into stages that are the same for every machine -- CFG linearization, liveness analysis, a linear scan register allocator and stack frame layout -- and one module per target that supplies the rest. A target is described by the `Target` trait: its register file, frame parameters, instruction selection and assembly syntax. x86-64 with the System V AMD64 ABI is the only one implemented, and everything before instruction selection is reused as it stands by any target added next.
+1. **Frontend:** A hand-rolled lexer (scanner plus a small preprocessor) and recursive descent parser build an Abstract Syntax Tree (AST), followed by semantic analysis for type and scope checking and a name resolution (renamer) pass. Every node carries a source span, which the diagnostics renderer turns into an annotated snippet.
+2. **Middle-End:** The AST is lowered into a linear, architecture-independent Three-Address Code (TAC) form. TAC is a boundary format only: the compiler immediately rebuilds each function into Static Single Assignment (SSA) form, where memory locations that qualify (plain scalar variables, not arrays or anything with its address taken) are promoted to SSA values. All optimization runs on this SSA representation, after which it is destructed back into TAC for the backend.
+3. **Backend:** Translates TAC into machine code. It is split into stages that are the same for every machine -- CFG linearization, liveness analysis, a linear scan register allocator and stack frame layout -- and one module per target that supplies the rest. A target is described by the `Target` trait: its register file, frame parameters, instruction selection and assembly syntax. x86-64 with the System V AMD64 ABI is the only one implemented, and everything before instruction selection is reused as it stands by any target added next.
 
-## Development Roadmap
+## Optimizations
 
-**Phase 1: The Frontend (Done)**
-- [x] **Lexical Analysis (Scanner):** Tokenization of C source code.
-- [x] **Syntax Analysis (Parser):** Hand-rolled recursive descent parser building an AST.
-- [x] **AST Visualization:** Debug tooling to print the AST structure to the console.
-- [x] **Semantic Analysis:** Symbol table generation, variable scoping, and basic type checking.
-- [x] **Renamer:** Name resolution (Scope Renamer) pass.
+All optimizations run on the SSA form, to a fixed point, in the following order:
 
-**Phase 2: The Middle-End (Done)**
-- [x] **IR Generation:** Lowering the AST into Three-Address Code (TAC).
-- [x] **Control Flow Graph (CFG):** Building basic blocks for optimization analysis.
-- [x] **Optimization - Constant Folding:** Evaluating static expressions at compile time.
-- [x] **Optimization - Algebraic Simplification:** Replacing complex arithmetic with simpler, equivalent operations or identities.
-- [x] **Optimization - Constant Propagation:** Replacing variables with known constant values downstream.
-- [x] **Optimization - Dead Code Elimination:** Pruning instructions that compute unused values.
-- [x] **Optimization - Unreachable Code Elimination:** Removing basic blocks that have no incoming execution paths.
-
-**Phase 3: The Backend (Done)**
-- [x] **Instruction Selection:** Mapping TAC operations to x86 instructions.
-- [x] **Register Allocation:** Implementing a Linear Scan Register Allocator.
-- [x] **Code Emission:** Generating valid `.s` files assembled via GCC.
-- [x] **Target abstraction:** Machine-independent stages behind a `Target` trait,
-      so a second architecture reuses them.
-
-**Phase 4: Diagnostics (Done)**
-- [x] **Source snippets:** `rustc`-style errors that quote the offending line and underline it.
-- [x] **Error codes:** every diagnostic carries a stable `E0xxx` code.
-- [x] **Secondary spans:** the earlier declaration, the parameter or the return type that explains the error is quoted alongside it.
-- [x] **Suggestions:** an unknown name proposes the closest one in scope.
-- [x] **Error recovery:** the parser and the analyzer both keep going, so one run reports every problem it can.
-
-**Phase 5: Support more C language features (In Progress)**
-- [x] Preprocessor macros (Partially)
-- [x] Static sized arrays
-- [x] Pointers
-- [ ] add additional data types 
-- [ ] `extern` keyword and linking to GCC compiled C programs and standard library
+* **Sparse Conditional Constant Propagation (SCCP):** Propagates constants, folds the arithmetic they make constant, and prunes branches whose condition is known, all in one pass -- which is what lets each of the three make the others stronger.
+* **Algebraic Simplification:** Identities that hold regardless of the unknown operand's value, such as `x * 1 -> x` and `x - x -> 0`.
+* **Global Value Numbering (GVN):** Recognizes two instructions that compute the same operation over the same SSA values and reuses the first result instead of recomputing it, scoped by dominance.
+* **Copy Propagation:** Replaces every read of a copy with the value it copies, including resolving trivial phi nodes.
+* **Dead-Code Elimination (DCE):** A mark-and-sweep pass over the def-use graph that removes any instruction whose result is never observed.
+* **Block Merging:** Joins a block into its unique predecessor when that predecessor is its only way in, removing the jump between them.
 
 ## Supported Language Subset
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
-* **Data Types:** `int`, `int[size]`;
-* **Control Flow:** `if` / `else`, `while` and `for` loops, `return`
-* **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
+* **Data Types:** `int`, `int[size]`, pointers.
+* **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
+* **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`).
 * **Functions:** Declarations, definitions, and calls with arguments.
-* **Preprocessor macros** object like macros such as ``#define X 5`` and simple non-recursive function like macros.
-* **Pointers**: Support for referencing and dereferencing. Does not support pointer arithmetic yet.
+* **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
+* **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
+
+### Roadmap
+
+* [ ] Additional data types (`char`, `float`, `double`, `struct` are parsed but rejected by semantic analysis today).
+* [ ] Pointer arithmetic.
+* [ ] Global variables.
+* [ ] `extern` keyword and linking against GCC-compiled C programs and the standard library.
+* [ ] Remaining operators already recognized by the parser but not yet lowered (`%`, `&&`, `||`, bitwise and shift operators).
 
 ## Diagnostics
 
@@ -81,9 +61,10 @@ error[E0203]: the name `a` is defined multiple times
 error: aborting due to 1 previous error
 ```
 
-Colour is used on a terminal and dropped when the output is redirected or when
-`NO_COLOR` is set. The `tests/ui` suite pins every message down as a snapshot,
-so a change in wording shows up as a reviewable diff.
+Every diagnostic carries a stable `E0xxx` code, an unknown name is offered the
+closest match in scope, and both the parser and the analyzer keep going after
+an error so one run reports every problem it can. Colour is used on a
+terminal and dropped when the output is redirected or when `NO_COLOR` is set.
 
 ## Getting Started
 
@@ -93,30 +74,9 @@ Build the project:
 cargo build --release
 ```
 
-Run the test suite:
-```bash
-cargo test
-```
-
-The end-to-end suite follows the methodology of `rustc`'s own `compiletest`:
-each test is a C file under `tests/` that declares its expectations in `//@`
-header directives, split into three suites -- `run-pass` (compile, link, run,
-check the exit status), `codegen` (`CHECK` directives matched against the
-emitted assembly) and `ui` (diagnostics compared against checked-in `.stderr`
-snapshots). Every `run-pass` fixture runs twice, with and without `--opt`.
-
-```bash
-cargo test --test compiletest -- pointers   # filter by name
-cargo test --test compiletest -- --list     # list every fixture
-BLESS=1 cargo test --test compiletest       # re-record ui snapshots
-```
-
-See [`tests/README.md`](tests/README.md) for the directive reference and for
-how to add a test.
-
 The Compiler CLI:
 
-``` bash
+```bash
 Usage: c-moon [OPTIONS] <SOURCE_FILE>
 
 Arguments:
@@ -131,3 +91,23 @@ Options:
   -h, --help        Print help
 ```
 
+## Test Suite
+
+The end-to-end suite follows the methodology of `rustc`'s own `compiletest`:
+each test is a C file under `tests/` that declares its expectations in `//@`
+header directives, split into three suites -- `run-pass` (compile, link, run,
+check the exit status), `codegen` (`CHECK` directives matched against the
+emitted assembly) and `ui` (diagnostics compared against checked-in `.stderr`
+snapshots). Every `run-pass` fixture runs against both the unoptimized and the
+optimized pipeline, and also against GCC as a ground truth for the expected
+exit code.
+
+```bash
+cargo test                                  # everything
+cargo test --test compiletest -- pointers   # filter by name
+cargo test --test compiletest -- --list     # list every fixture
+BLESS=1 cargo test --test compiletest       # re-record ui snapshots
+```
+
+See [`tests/README.md`](tests/README.md) for the full directive reference and
+for how to add a test.
