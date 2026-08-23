@@ -36,6 +36,7 @@ pub mod verify;
 use std::collections::HashMap;
 
 use crate::frontend::renamer::VarId;
+use crate::middle::ir::Width;
 
 /// Identifies one basic block within a function.
 ///
@@ -213,12 +214,20 @@ pub enum BinOp {
 }
 
 /// What an instruction does.
+///
+/// Operations that compute or touch memory carry the [`Width`] they do it at:
+/// `int` arithmetic wraps where `long int` arithmetic does not, and an `int`
+/// object in memory is half the size. The rest only move a value from one home
+/// to another, which is correct at any width and so records none.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// `dest = lhs <op> rhs`
-    Binary(BinOp, Operand, Operand),
+    /// `dest = lhs <op> rhs`, computed at the given width.
+    Binary(BinOp, Width, Operand, Operand),
     /// `dest = source`
     Copy(Operand),
+    /// `dest = ` `value` converted to the width `to`, sign-extending or
+    /// truncating as the two widths require.
+    Convert { to: Width, value: Operand },
     /// `dest = callee(args...)`
     Call { callee: String, args: Vec<Operand> },
     /// `dest = ` the incoming argument at this position.
@@ -231,21 +240,35 @@ pub enum Op {
     Undef,
 
     /// `dest = slot`
-    SlotLoad { slot: SlotId },
+    SlotLoad { slot: SlotId, width: Width },
     /// `slot = value`
-    SlotStore { slot: SlotId, value: Operand },
-    /// `dest = base[index]`
-    ArrayLoad { base: SlotId, index: Operand },
+    SlotStore {
+        slot: SlotId,
+        value: Operand,
+        width: Width,
+    },
+    /// `dest = base[index]`, where the width is the array's element type and
+    /// so also what scales the index.
+    ArrayLoad {
+        base: SlotId,
+        index: Operand,
+        width: Width,
+    },
     /// `base[index] = value`
     ArrayStore {
         base: SlotId,
         index: Operand,
         value: Operand,
+        width: Width,
     },
-    /// `dest = *address`
-    Load { address: Operand },
+    /// `dest = *address`, reading as much as the pointee type occupies.
+    Load { address: Operand, width: Width },
     /// `*address = value`
-    Store { address: Operand, value: Operand },
+    Store {
+        address: Operand,
+        value: Operand,
+        width: Width,
+    },
     /// `dest = &slot`
     AddrOf { slot: SlotId },
 }
@@ -278,15 +301,15 @@ impl Op {
     /// The operands this operation reads, in order.
     pub fn operands(&self) -> Vec<Operand> {
         match self {
-            Op::Binary(_, lhs, rhs) => vec![*lhs, *rhs],
-            Op::Copy(source) => vec![*source],
+            Op::Binary(_, _, lhs, rhs) => vec![*lhs, *rhs],
+            Op::Copy(source) | Op::Convert { value: source, .. } => vec![*source],
             Op::Call { args, .. } => args.clone(),
             Op::GetParam(_) | Op::Undef | Op::SlotLoad { .. } | Op::AddrOf { .. } => Vec::new(),
             Op::SlotStore { value, .. } => vec![*value],
             Op::ArrayLoad { index, .. } => vec![*index],
             Op::ArrayStore { index, value, .. } => vec![*index, *value],
-            Op::Load { address } => vec![*address],
-            Op::Store { address, value } => vec![*address, *value],
+            Op::Load { address, .. } => vec![*address],
+            Op::Store { address, value, .. } => vec![*address, *value],
         }
     }
 
@@ -298,15 +321,15 @@ impl Op {
     /// map over [`Op::operands`].
     pub fn operands_mut(&mut self) -> Vec<&mut Operand> {
         match self {
-            Op::Binary(_, lhs, rhs) => vec![lhs, rhs],
-            Op::Copy(source) => vec![source],
+            Op::Binary(_, _, lhs, rhs) => vec![lhs, rhs],
+            Op::Copy(source) | Op::Convert { value: source, .. } => vec![source],
             Op::Call { args, .. } => args.iter_mut().collect(),
             Op::GetParam(_) | Op::Undef | Op::SlotLoad { .. } | Op::AddrOf { .. } => Vec::new(),
             Op::SlotStore { value, .. } => vec![value],
             Op::ArrayLoad { index, .. } => vec![index],
             Op::ArrayStore { index, value, .. } => vec![index, value],
-            Op::Load { address } => vec![address],
-            Op::Store { address, value } => vec![address, value],
+            Op::Load { address, .. } => vec![address],
+            Op::Store { address, value, .. } => vec![address, value],
         }
     }
 }
@@ -341,9 +364,10 @@ pub enum Terminator {
     /// Continue at another block.
     Jump(BlockId),
     /// Continue at `then_block` when `cond` is non-zero, `else_block`
-    /// otherwise.
+    /// otherwise.  Only `width` bits of `cond` say whether it is zero.
     Branch {
         cond: Operand,
+        width: Width,
         then_block: BlockId,
         else_block: BlockId,
     },

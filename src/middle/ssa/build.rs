@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::middle::ir::{self, CFG, Opcode, TACInstruction};
+use crate::middle::ir::{self, CFG, Opcode, TACInstruction, Width};
 
 use super::{BinOp, BlockId, Function, Op, Operand, SlotOrigin, Terminator};
 
@@ -77,6 +77,10 @@ pub fn split_critical_edges(function: &mut Function) {
         function.split_edge(from, to);
     }
 }
+
+/// The width an address is held at: a pointer, and an index into an array,
+/// are full machine words whatever they point at or index.
+const ADDRESS: Width = Width::Bits64;
 
 /// The state of one function's translation.
 struct Builder {
@@ -177,15 +181,16 @@ impl Builder {
                 .emit(block, Op::GetParam(*index as usize))
                 .expect("Compiler Bug: get_param defines a value");
             let slot = self.slot(arg(instr, &instr.dest));
-            placed.push((slot, value));
+            placed.push((slot, value, instr.width));
         }
 
-        for (slot, value) in placed {
+        for (slot, value, width) in placed {
             self.function.emit(
                 block,
                 Op::SlotStore {
                     slot,
                     value: Operand::Value(value),
+                    width,
                 },
             );
         }
@@ -212,18 +217,35 @@ impl Builder {
             | Opcode::Gt
             | Opcode::Gte => {
                 let operator = binary_operator(&instr.opcode);
-                let lhs = self.operand(block, arg(instr, &instr.arg1));
-                let rhs = self.operand(block, arg(instr, &instr.arg2));
-                self.define(block, instr, Op::Binary(operator, lhs, rhs));
+                let lhs = self.operand(block, arg(instr, &instr.arg1), instr.width);
+                let rhs = self.operand(block, arg(instr, &instr.arg2), instr.width);
+                self.define(block, instr, Op::Binary(operator, instr.width, lhs, rhs));
+            }
+
+            Opcode::Convert => {
+                // The operand is the other width, there being only two.
+                let from = match instr.width {
+                    Width::Bits32 => Width::Bits64,
+                    Width::Bits64 => Width::Bits32,
+                };
+                let value = self.operand(block, arg(instr, &instr.arg1), from);
+                self.define(
+                    block,
+                    instr,
+                    Op::Convert {
+                        to: instr.width,
+                        value,
+                    },
+                );
             }
 
             Opcode::Mov => {
-                let source = self.operand(block, arg(instr, &instr.arg1));
+                let source = self.operand(block, arg(instr, &instr.arg1), instr.width);
                 self.define(block, instr, Op::Copy(source));
             }
 
             Opcode::Param => {
-                let argument = self.operand(block, arg(instr, &instr.arg1));
+                let argument = self.operand(block, arg(instr, &instr.arg1), instr.width);
                 pending.push(argument);
             }
 
@@ -255,28 +277,57 @@ impl Builder {
 
             Opcode::ArrayLoad => {
                 let base = self.slot(arg(instr, &instr.arg1));
-                let index = self.operand(block, arg(instr, &instr.arg2));
-                self.define(block, instr, Op::ArrayLoad { base, index });
+                let index = self.operand(block, arg(instr, &instr.arg2), ADDRESS);
+                self.define(
+                    block,
+                    instr,
+                    Op::ArrayLoad {
+                        base,
+                        index,
+                        width: instr.width,
+                    },
+                );
             }
 
             Opcode::ArrayStore => {
                 // `dest` names the array written into, which is an input.
                 let base = self.slot(arg(instr, &instr.dest));
-                let index = self.operand(block, arg(instr, &instr.arg1));
-                let value = self.operand(block, arg(instr, &instr.arg2));
-                self.function
-                    .emit(block, Op::ArrayStore { base, index, value });
+                let index = self.operand(block, arg(instr, &instr.arg1), ADDRESS);
+                let value = self.operand(block, arg(instr, &instr.arg2), instr.width);
+                self.function.emit(
+                    block,
+                    Op::ArrayStore {
+                        base,
+                        index,
+                        value,
+                        width: instr.width,
+                    },
+                );
             }
 
             Opcode::Load => {
-                let address = self.operand(block, arg(instr, &instr.arg1));
-                self.define(block, instr, Op::Load { address });
+                let address = self.operand(block, arg(instr, &instr.arg1), ADDRESS);
+                self.define(
+                    block,
+                    instr,
+                    Op::Load {
+                        address,
+                        width: instr.width,
+                    },
+                );
             }
 
             Opcode::Store => {
-                let address = self.operand(block, arg(instr, &instr.arg1));
-                let value = self.operand(block, arg(instr, &instr.arg2));
-                self.function.emit(block, Op::Store { address, value });
+                let address = self.operand(block, arg(instr, &instr.arg1), ADDRESS);
+                let value = self.operand(block, arg(instr, &instr.arg2), instr.width);
+                self.function.emit(
+                    block,
+                    Op::Store {
+                        address,
+                        value,
+                        width: instr.width,
+                    },
+                );
             }
 
             Opcode::AddrOf => {
@@ -305,7 +356,10 @@ impl Builder {
             [jump] if jump.opcode == Opcode::Jump => Terminator::Jump(self.target(jump)),
 
             [ret] if ret.opcode == Opcode::Ret => {
-                let value = ret.arg1.as_ref().map(|value| self.operand(block, value));
+                let value = ret
+                    .arg1
+                    .as_ref()
+                    .map(|value| self.operand(block, value, ret.width));
                 Terminator::Return(value)
             }
 
@@ -313,7 +367,7 @@ impl Builder {
                 if matches!(branch.opcode, Opcode::BranchIf | Opcode::BranchIfNot)
                     && jump.opcode == Opcode::Jump =>
             {
-                let cond = self.operand(block, arg(branch, &branch.arg1));
+                let cond = self.operand(block, arg(branch, &branch.arg1), branch.width);
                 let branched = self.target_of(branch, &branch.arg2);
                 let fallthrough = self.target(jump);
 
@@ -331,6 +385,7 @@ impl Builder {
                 } else {
                     Terminator::Branch {
                         cond,
+                        width: branch.width,
                         then_block,
                         else_block,
                     }
@@ -360,20 +415,25 @@ impl Builder {
             Op::SlotStore {
                 slot,
                 value: Operand::Value(value),
+                width: instr.opcode.result_width(instr.width),
             },
         );
     }
 
     /// Translate a TAC operand into something an instruction can read,
     /// emitting the load a variable needs.
-    fn operand(&mut self, block: BlockId, operand: &ir::Operand) -> Operand {
+    ///
+    /// `width` is how much of the operand the reader is defined on, which is
+    /// what the load has to fetch: reading eight bytes of a four-byte object
+    /// would reach past it.
+    fn operand(&mut self, block: BlockId, operand: &ir::Operand, width: Width) -> Operand {
         match operand {
             ir::Operand::ImmInt(value) => Operand::Imm(*value),
             ir::Operand::Var(_) | ir::Operand::Temp(_) => {
                 let slot = self.slot(operand);
                 let value = self
                     .function
-                    .emit(block, Op::SlotLoad { slot })
+                    .emit(block, Op::SlotLoad { slot, width })
                     .expect("Compiler Bug: a load defines a value");
                 Operand::Value(value)
             }
@@ -491,13 +551,26 @@ mod tests {
         TacOperand::Label(name.to_string())
     }
 
+    /// An instruction on `long int`-sized operands, which is what most of
+    /// these fixtures are about.
     fn instr(
         opcode: Opcode,
         dest: Option<TacOperand>,
         arg1: Option<TacOperand>,
         arg2: Option<TacOperand>,
     ) -> TACInstruction {
-        TACInstruction::new(opcode, dest, arg1, arg2)
+        TACInstruction::new(opcode, Width::Bits64, dest, arg1, arg2)
+    }
+
+    /// A branch on the result of a comparison, which is an `int`.
+    fn branch_unless(condition: TacOperand, target: &str) -> TACInstruction {
+        TACInstruction::new(
+            Opcode::BranchIfNot,
+            Width::Bits32,
+            None,
+            Some(condition),
+            Some(label(target)),
+        )
     }
 
     fn mov(dest: TacOperand, source: TacOperand) -> TACInstruction {
@@ -591,11 +664,11 @@ mod tests {
 function f {
 .entry:
     %v0 = 1
-    store_slot %r0, %v0
-    %v1 = load_slot %r0
-    %v2 = %v1 + 2
-    store_slot %t1, %v2
-    %v3 = load_slot %t1
+    store_slot.64 %r0, %v0
+    %v1 = load_slot.64 %r0
+    %v2 = %v1 +.64 2
+    store_slot.64 %t1, %v2
+    %v3 = load_slot.64 %t1
     ret %v3
 }
 "
@@ -679,8 +752,8 @@ function f {
 function f {
 .entry:
     %v0 = call g(1, 2)
-    store_slot %t1, %v0
-    %v1 = load_slot %t1
+    store_slot.64 %t1, %v0
+    %v1 = load_slot.64 %t1
     ret %v1
 }
 "
@@ -742,9 +815,9 @@ function f {
 .entry:
     %v0 = get_param 0
     %v1 = get_param 1
-    store_slot %r0, %v0
-    store_slot %r1, %v1
-    %v2 = load_slot %r0
+    store_slot.64 %r0, %v0
+    store_slot.64 %r1, %v1
+    %v2 = load_slot.64 %r0
     ret %v2
 }
 "
@@ -870,7 +943,7 @@ function f {
 function f {
 .entry:
     %r0.0 = 1
-    %v2 = %r0.0 + 2
+    %v2 = %r0.0 +.64 2
     ret %v2
 }
 "
@@ -1031,10 +1104,10 @@ function f {
 function f {
 .entry:
     %v0 = 1
-    store_slot %r0, %v0
+    store_slot.64 %r0, %v0
     %v1 = addr_of %r0
-    store %v1, 5
-    %v3 = load_slot %r0
+    store.64 %v1, 5
+    %v3 = load_slot.64 %r0
     ret %v3
 }
 "
@@ -1075,8 +1148,8 @@ function f {
             "\
 function f {
 .entry:
-    array_store %r0[0] = 1
-    %v0 = array_load %r0[0]
+    array_store.64 %r0[0] = 1
+    %v0 = array_load.64 %r0[0]
     ret %v0
 }
 "
@@ -1099,12 +1172,7 @@ function f {
                         Some(var(0)),
                         Some(TacOperand::ImmInt(5)),
                     ),
-                    instr(
-                        Opcode::BranchIfNot,
-                        None,
-                        Some(temp("t1")),
-                        Some(label("done")),
-                    ),
+                    branch_unless(temp("t1"), "done"),
                     jump("body"),
                 ],
             ),

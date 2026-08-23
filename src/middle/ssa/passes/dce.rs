@@ -121,6 +121,8 @@ fn sweep(function: &mut Function, live: &Live) -> bool {
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     use crate::middle::ssa::verify::verify_ssa;
     use crate::middle::ssa::{BinOp, BlockId, Op, SlotOrigin, Terminator};
 
@@ -130,7 +132,7 @@ mod tests {
 
     fn add(function: &mut Function, block: BlockId, lhs: Operand, rhs: Operand) -> ValueId {
         function
-            .emit(block, Op::Binary(BinOp::Add, lhs, rhs))
+            .emit(block, Op::Binary(BinOp::Add, Width::Bits64, lhs, rhs))
             .expect("an addition defines a value")
     }
 
@@ -196,6 +198,7 @@ mod tests {
             Op::SlotStore {
                 slot,
                 value: Operand::Value(sum),
+                width: Width::Bits64,
             },
         );
         function.set_terminator(entry, Terminator::Return(None));
@@ -222,6 +225,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: left,
                 else_block: right,
+                width: Width::Bits64,
             },
         );
         function.set_terminator(join, Terminator::Return(None));
@@ -258,6 +262,7 @@ mod tests {
                 cond: Operand::Value(condition),
                 then_block: left,
                 else_block: right,
+                width: Width::Bits64,
             },
         );
 

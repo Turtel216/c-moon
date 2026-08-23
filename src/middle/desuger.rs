@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use crate::frontend::ast::{
-    BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, Stmt, StmtKind, UnaryOp,
+    BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, Stmt, StmtKind, UnaryOp,
 };
 use crate::frontend::renamer::ResolutionMap;
+use crate::frontend::semantic::{Type, TypeMap};
 use crate::middle::ir::*;
 
 /// Complete program IR representation
@@ -18,8 +19,12 @@ use crate::middle::ir::*;
 pub struct ProgramIr {
     /// Program Functions
     pub functions: BTreeMap<String, CFG>,
-    /// Maps variable id → array element count for each local array.
+    /// Maps variable id → the bytes each local array occupies.
     /// Used by the backend to allocate stack space.
+    ///
+    /// Bytes rather than elements because the element type decides how many
+    /// each one takes: `int a[3]` is twelve bytes and `long int a[3]` is
+    /// twenty-four.
     pub array_sizes: HashMap<usize, usize>,
     /// Maps variable id → the name it was declared with, for IR dumps.
     pub var_names: HashMap<usize, String>,
@@ -41,20 +46,27 @@ pub struct LoweringContext<'a> {
     pub program: ProgramIr,
     /// Resolution map used for conflicting identifiers
     res_map: &'a ResolutionMap,
+    /// The type of every expression and declaration, which is what decides
+    /// the width of the instruction each one becomes.
+    types: &'a TypeMap,
+    /// Width of the value the function being lowered returns.
+    return_width: Width,
     /// Current ``CFG`` being lowered
     current_cfg: Option<CFG>,
     current_block: String,
     temp_counter: usize,
     label_counter: usize,
-    /// Tracks local array sizes: var_id → element count.
+    /// Tracks local array sizes: var_id → bytes occupied.
     array_sizes: HashMap<usize, usize>,
 }
 
 impl<'a> LoweringContext<'a> {
-    pub fn new(res_map: &'a ResolutionMap) -> Self {
+    pub fn new(res_map: &'a ResolutionMap, types: &'a TypeMap) -> Self {
         Self {
             program: ProgramIr::new(),
             res_map,
+            types,
+            return_width: Width::Bits64,
             current_cfg: None,
             current_block: String::new(),
             temp_counter: 0,
@@ -72,20 +84,23 @@ impl<'a> LoweringContext<'a> {
                 DeclKind::Function {
                     name, body, params, ..
                 } => {
+                    self.return_width = width_of(&self.types.function(name).return_ty);
                     let bod = body.clone().unwrap(); // TODO: Fix unsafe unwrap and clone
 
-                    // Extract just the parameter names as a Vec<String>
-                    let param_names: Vec<usize> =
-                        params
-                            .iter()
-                            .map(|p| {
+                    // Each parameter as the variable it binds and the width
+                    // its declared type is held at.
+                    let parameters: Vec<(usize, Width)> = params
+                        .iter()
+                        .map(|p| {
+                            let var =
                                 *self.res_map.decl_to_var.get(&p.id).expect(
                                     "Compiler Bug: Ranamer failed to map function parameters",
-                                )
-                            })
-                            .collect();
+                                );
+                            (var, width_of(self.types.decl(p.id)))
+                        })
+                        .collect();
 
-                    self.lower_function(name, &param_names, &bod);
+                    self.lower_function(name, &parameters, &bod);
                 }
                 _ => {
                     todo!("Global variables not implemented yet")
@@ -95,7 +110,7 @@ impl<'a> LoweringContext<'a> {
         self.program
     }
 
-    fn lower_function(&mut self, name: &str, params: &[usize], body: &Stmt) {
+    fn lower_function(&mut self, name: &str, params: &[(usize, Width)], body: &Stmt) {
         // Setup a new CFG for this function
         let entry = format!("{}_entry", name);
         let exit = format!("{}_exit", name);
@@ -108,10 +123,11 @@ impl<'a> LoweringContext<'a> {
         self.current_block = entry.clone();
 
         // Bind parameters to local variables
-        for (index, param_id) in params.iter().enumerate() {
+        for (index, &(param_id, width)) in params.iter().enumerate() {
             self.emit(TACInstruction::new(
                 Opcode::GetParam,
-                Some(Operand::Var(*param_id)), // dest: local variable
+                width,
+                Some(Operand::Var(param_id)), // dest: local variable
                 Some(Operand::ImmInt(index as i64)), // arg1: parameter index
                 None,
             ));
@@ -123,7 +139,7 @@ impl<'a> LoweringContext<'a> {
         // Fallthrough to exit if the last block didn't explicitly return
         let cur = self.current_block.clone();
         if cur != exit {
-            self.emit(TACInstruction::new(
+            self.emit(TACInstruction::transfer(
                 Opcode::Jump,
                 None,
                 Some(Operand::Label(exit.clone())),
@@ -196,12 +212,13 @@ impl<'a> LoweringContext<'a> {
                 let else_label = self.create_block("if_else");
                 let end_label = self.create_block("if_end");
 
-                let cond = self.lower_expression(condition);
+                let (cond, width) = self.lower_condition(condition);
 
                 let cur = self.current_block.clone();
                 // if !cond -> else
                 self.emit(TACInstruction::new(
                     Opcode::BranchIfNot,
+                    width,
                     None,
                     Some(cond),
                     Some(Operand::Label(else_label.clone())),
@@ -209,7 +226,7 @@ impl<'a> LoweringContext<'a> {
                 self.add_edge(&cur, &else_label);
 
                 // otherwise -> then
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(then_label.clone())),
@@ -221,7 +238,7 @@ impl<'a> LoweringContext<'a> {
                 self.set_current_block(then_label.clone());
                 self.lower_statement(then_branch);
                 let then_end = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(end_label.clone())),
@@ -235,7 +252,7 @@ impl<'a> LoweringContext<'a> {
                     self.lower_statement(e);
                 }
                 let else_end = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(end_label.clone())),
@@ -253,7 +270,7 @@ impl<'a> LoweringContext<'a> {
 
                 // preheader -> cond
                 let preheader = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(cond_label.clone())),
@@ -263,11 +280,12 @@ impl<'a> LoweringContext<'a> {
 
                 // cond block
                 self.set_current_block(cond_label.clone());
-                let cond = self.lower_expression(condition);
+                let (cond, width) = self.lower_condition(condition);
 
                 // if !cond -> end
                 self.emit(TACInstruction::new(
                     Opcode::BranchIfNot,
+                    width,
                     None,
                     Some(cond),
                     Some(Operand::Label(end_label.clone())),
@@ -275,7 +293,7 @@ impl<'a> LoweringContext<'a> {
                 self.add_edge(&cond_label, &end_label);
 
                 // else -> body
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(body_label.clone())),
@@ -289,7 +307,7 @@ impl<'a> LoweringContext<'a> {
 
                 // back-edge body -> cond
                 let body_end = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(cond_label.clone())),
@@ -312,25 +330,26 @@ impl<'a> LoweringContext<'a> {
                                 .get(&d.id)
                                 .expect("Compiler Bug: Renamer failed to map declaration");
 
-                            if let DeclKind::Variable {
-                                ty: crate::frontend::ast::CType::Array(_, Some(size)),
-                                ..
-                            } = &d.kind
-                            {
-                                // Record the array size for backend stack allocation.
-                                // No TAC instructions needed — the array lives
-                                // entirely on the stack.
-                                self.array_sizes.insert(*stmt_id, *size);
+                            let stmt_id = *stmt_id;
+                            if let Type::Array(element, count) = self.types.decl(d.id) {
+                                // Record the array's storage for backend stack
+                                // allocation. No TAC instructions needed --
+                                // the array lives entirely on the stack.
+                                let bytes = count * width_of(element).bytes() as usize;
+                                self.array_sizes.insert(stmt_id, bytes);
                             } else if let DeclKind::Variable {
                                 initializer: Some(init),
                                 ..
                             } = &d.kind
                             {
-                                // Scalar variable with initializer.
-                                let rhs = self.lower_expression(init);
+                                // Scalar variable with initializer, converted
+                                // to the declared type the way C converts it.
+                                let width = width_of(self.types.decl(d.id));
+                                let rhs = self.lower_converted(init, width);
                                 self.emit(TACInstruction::new(
                                     Opcode::Mov,
-                                    Some(Operand::Var(*stmt_id)),
+                                    width,
+                                    Some(Operand::Var(stmt_id)),
                                     Some(rhs),
                                     None,
                                 ));
@@ -342,13 +361,21 @@ impl<'a> LoweringContext<'a> {
             }
 
             StmtKind::Return(expr_opt) => {
-                let ret_val = if let Some(expr) = expr_opt {
-                    Some(self.lower_expression(expr))
-                } else {
-                    None
-                };
+                // The value is converted to the declared return type here, so
+                // the caller always receives what the signature promises.
+                let ret_val = expr_opt
+                    .as_ref()
+                    .map(|expr| self.lower_converted(expr, self.return_width));
 
-                self.emit(TACInstruction::new(Opcode::Ret, None, ret_val, None));
+                // The width is the return type's: `ret` reads exactly the
+                // value the function promised its caller and no more.
+                self.emit(TACInstruction::new(
+                    Opcode::Ret,
+                    self.return_width,
+                    None,
+                    ret_val,
+                    None,
+                ));
 
                 let exit_label = self.current_cfg.as_ref().unwrap().exit.clone();
 
@@ -381,7 +408,7 @@ impl<'a> LoweringContext<'a> {
                     self.lower_statement(init);
                 }
                 let preheader = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(cond_label.clone())),
@@ -392,11 +419,12 @@ impl<'a> LoweringContext<'a> {
                 // cond block
                 self.set_current_block(cond_label.clone());
                 if let Some(condition) = condition {
-                    let cond = self.lower_expression(condition);
+                    let (cond, width) = self.lower_condition(condition);
 
                     // if !cond -> end
                     self.emit(TACInstruction::new(
                         Opcode::BranchIfNot,
+                        width,
                         None,
                         Some(cond),
                         Some(Operand::Label(end_label.clone())),
@@ -407,7 +435,7 @@ impl<'a> LoweringContext<'a> {
                 // straight through to the body.
 
                 // else -> body
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(body_label.clone())),
@@ -424,7 +452,7 @@ impl<'a> LoweringContext<'a> {
 
                 // back-edge body -> cond
                 let body_end = self.current_block.clone();
-                self.emit(TACInstruction::new(
+                self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(cond_label.clone())),
@@ -436,6 +464,56 @@ impl<'a> LoweringContext<'a> {
                 self.set_current_block(end_label);
             }
         }
+    }
+
+    /// The width a value of the type `expr` was given is held at.
+    fn width_of_expr(&self, expr: &Expr) -> Width {
+        width_of(self.types.expr(expr.id))
+    }
+
+    /// Lower a controlling expression.
+    ///
+    /// # Returns
+    ///
+    /// The value to test and the width to test it at, which is the width of
+    /// its own type: only that many bits of it mean anything.
+    fn lower_condition(&mut self, condition: &Expr) -> (Operand, Width) {
+        let width = self.width_of_expr(condition);
+        (self.lower_expression(condition), width)
+    }
+
+    /// Lower `expr` and convert its value to `target`, as C converts it when
+    /// it is assigned, passed or returned somewhere of that width.
+    fn lower_converted(&mut self, expr: &Expr, target: Width) -> Operand {
+        let from = self.width_of_expr(expr);
+        let value = self.lower_expression(expr);
+        self.convert(value, from, target)
+    }
+
+    /// Emit the conversion of `value` from one integer width to another.
+    ///
+    /// Converting a value to the width it already has is what most of the
+    /// program does, so that case emits nothing at all.
+    fn convert(&mut self, value: Operand, from: Width, to: Width) -> Operand {
+        if from == to {
+            return value;
+        }
+        // A literal travels through the IR sign-extended, so its conversion is
+        // a matter of writing it down differently rather than of running an
+        // instruction.
+        if let Operand::ImmInt(constant) = value {
+            return Operand::ImmInt(to.narrow(constant));
+        }
+
+        let dest = self.fresh_temp();
+        self.emit(TACInstruction::new(
+            Opcode::Convert,
+            to,
+            Some(dest.clone()),
+            Some(value),
+            None,
+        ));
+        dest
     }
 
     fn lower_expression(&mut self, expr: &Expr) -> Operand {
@@ -455,7 +533,10 @@ impl<'a> LoweringContext<'a> {
             ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
                 if matches!(lhs.kind, ExprKind::Unary(UnaryOp::Deref, _)) =>
             {
-                let rhs_op = self.lower_expression(rhs);
+                // The object written is as wide as what the pointer points to,
+                // and the value is converted to it before the store.
+                let width = self.width_of_expr(lhs);
+                let rhs_op = self.lower_converted(rhs, width);
 
                 // Extract the pointer expression from the LHS dereference.
                 let ptr_expr = match &lhs.kind {
@@ -468,6 +549,7 @@ impl<'a> LoweringContext<'a> {
                 // Store: *addr_op = rhs_op
                 self.emit(TACInstruction::new(
                     Opcode::Store,
+                    width,
                     None,
                     Some(addr_op),
                     Some(rhs_op.clone()),
@@ -480,7 +562,10 @@ impl<'a> LoweringContext<'a> {
             ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
                 if matches!(lhs.kind, ExprKind::Index { .. }) =>
             {
-                let rhs_op = self.lower_expression(rhs);
+                // An element is as wide as the array's element type, which is
+                // also what scales the index into a byte offset.
+                let width = self.width_of_expr(lhs);
+                let rhs_op = self.lower_converted(rhs, width);
 
                 // Extract the array base variable and index from the LHS.
                 let (array_base, index_expr) = match &lhs.kind {
@@ -489,11 +574,12 @@ impl<'a> LoweringContext<'a> {
                 };
 
                 let base_var = self.lower_expression(array_base);
-                let idx_op = self.lower_expression(index_expr);
+                let idx_op = self.lower_index(index_expr);
 
                 // ArrayStore: dest=base_var, arg1=index, arg2=value
                 self.emit(TACInstruction::new(
                     Opcode::ArrayStore,
+                    width,
                     Some(base_var.clone()),
                     Some(idx_op),
                     Some(rhs_op.clone()),
@@ -504,7 +590,8 @@ impl<'a> LoweringContext<'a> {
 
             // x = rhs
             ExprKind::Binary(BinaryOp::Assign, lhs, rhs) => {
-                let rhs_op = self.lower_expression(rhs);
+                let width = self.width_of_expr(lhs);
+                let rhs_op = self.lower_converted(rhs, width);
                 let lhs_var = self.expect_lvalue_var(lhs);
 
                 let lhs_id = self
@@ -515,6 +602,7 @@ impl<'a> LoweringContext<'a> {
 
                 self.emit(TACInstruction::new(
                     Opcode::Mov,
+                    width,
                     Some(Operand::Var(*lhs_id)),
                     Some(rhs_op.clone()),
                     None,
@@ -524,8 +612,15 @@ impl<'a> LoweringContext<'a> {
 
             // Arithmetic + comparisons used by if/while conditions.
             ExprKind::Binary(op, lhs, rhs) => {
-                let l = self.lower_expression(lhs);
-                let r = self.lower_expression(rhs);
+                // C's usual arithmetic conversions: both operands are brought
+                // to the type they have in common, and the operation is
+                // computed at its width. A comparison narrows again on its own
+                // -- its result is the 0 or 1 of an `int` -- which is why the
+                // width recorded here is the one the operands are compared at.
+                let types = self.types;
+                let width = width_of(&Type::common(types.expr(lhs.id), types.expr(rhs.id)));
+                let l = self.lower_converted(lhs, width);
+                let r = self.lower_converted(rhs, width);
                 let t = self.fresh_temp();
 
                 let opcode = match op {
@@ -544,6 +639,7 @@ impl<'a> LoweringContext<'a> {
 
                 self.emit(TACInstruction::new(
                     opcode,
+                    width,
                     Some(t.clone()),
                     Some(l),
                     Some(r),
@@ -552,10 +648,22 @@ impl<'a> LoweringContext<'a> {
             }
 
             ExprKind::Call { callee, args } => {
-                // Lower arguments
+                // Lower arguments, each converted to the type its parameter
+                // was declared with.
+                let signature = match &callee.kind {
+                    ExprKind::Identifier(name) => self.types.function(name),
+                    _ => panic!("Compiler Bug: call to something that is not a named function"),
+                };
+                let param_widths: Vec<Width> = signature
+                    .params
+                    .iter()
+                    .map(|param| width_of(&param.ty))
+                    .collect();
+                let return_width = width_of(&signature.return_ty);
+
                 let mut arg_operands = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_operands.push(self.lower_expression(arg));
+                for (arg, &width) in args.iter().zip(&param_widths) {
+                    arg_operands.push(self.lower_converted(arg, width));
                 }
 
                 // Determine the target of the call.
@@ -566,15 +674,23 @@ impl<'a> LoweringContext<'a> {
                     _ => self.lower_expression(callee),
                 };
 
-                // Emit Param instructions
-                for arg_op in arg_operands {
-                    self.emit(TACInstruction::new(Opcode::Param, None, Some(arg_op), None));
+                // Emit Param instructions, each as wide as the parameter it
+                // is passed for.
+                for (arg_op, &width) in arg_operands.into_iter().zip(&param_widths) {
+                    self.emit(TACInstruction::new(
+                        Opcode::Param,
+                        width,
+                        None,
+                        Some(arg_op),
+                        None,
+                    ));
                 }
 
                 // Emit the Call instruction
                 let ret_temp = self.fresh_temp();
                 self.emit(TACInstruction::new(
                     Opcode::Call,
+                    return_width,
                     Some(ret_temp.clone()),
                     Some(callee_op),
                     Some(Operand::ImmInt(args.len() as i64)),
@@ -586,12 +702,13 @@ impl<'a> LoweringContext<'a> {
             // arr[idx] — rvalue array element access
             ExprKind::Index { array, index } => {
                 let base_var = self.lower_expression(array);
-                let idx_op = self.lower_expression(index);
+                let idx_op = self.lower_index(index);
                 let dest = self.fresh_temp();
 
                 // ArrayLoad: dest = base_var[idx_op]
                 self.emit(TACInstruction::new(
                     Opcode::ArrayLoad,
+                    self.width_of_expr(expr),
                     Some(dest.clone()),
                     Some(base_var),
                     Some(idx_op),
@@ -605,9 +722,11 @@ impl<'a> LoweringContext<'a> {
                 let inner_op = self.lower_expression(inner);
                 let dest = self.fresh_temp();
 
-                // AddrOf: dest = addr_of inner_op
+                // AddrOf: dest = addr_of inner_op. An address is a full word
+                // whatever it points at.
                 self.emit(TACInstruction::new(
                     Opcode::AddrOf,
+                    Width::Bits64,
                     Some(dest.clone()),
                     Some(inner_op),
                     None,
@@ -621,9 +740,10 @@ impl<'a> LoweringContext<'a> {
                 let ptr_op = self.lower_expression(inner);
                 let dest = self.fresh_temp();
 
-                // Load: dest = *ptr_op
+                // Load: dest = *ptr_op, as wide as the object pointed at.
                 self.emit(TACInstruction::new(
                     Opcode::Load,
+                    self.width_of_expr(expr),
                     Some(dest.clone()),
                     Some(ptr_op),
                     None,
@@ -632,14 +752,38 @@ impl<'a> LoweringContext<'a> {
                 dest
             }
 
+            // A cast between integer types is exactly the conversion an
+            // assignment would have performed, written out by hand.
+            ExprKind::Cast(_, operand) => self.lower_converted(operand, self.width_of_expr(expr)),
+
             _ => panic!("Expr {:?} not supported in this lowering phase", expr.kind),
         }
     }
 
-    fn expect_lvalue_var(&self, expr: &Expr) -> u32 {
+    /// Lower a subscript, which addresses memory and is therefore needed at
+    /// full width however narrow the index expression's own type is.
+    fn lower_index(&mut self, index: &Expr) -> Operand {
+        self.lower_converted(index, Width::Bits64)
+    }
+
+    fn expect_lvalue_var(&self, expr: &Expr) -> NodeId {
         match &expr.kind {
             ExprKind::Identifier(_) => expr.id,
             _ => panic!("Expected assignable identifier lvalue, got {:?}", expr.kind),
         }
+    }
+}
+
+/// The machine width a value of type `ty` is held at.
+///
+/// An `int` is the one narrow type there is; everything else the compiler can
+/// lower -- `long int`, a pointer, the address an array name decays to -- is a
+/// full machine word. `void` never holds anything, and is given the width a
+/// plain copy uses so that a call to a void function still has a destination
+/// the backend can name.
+pub fn width_of(ty: &Type) -> Width {
+    match ty {
+        Type::Int => Width::Bits32,
+        Type::Long | Type::Pointer(_) | Type::Array(_, _) | Type::Void => Width::Bits64,
     }
 }

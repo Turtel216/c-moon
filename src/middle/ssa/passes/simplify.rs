@@ -37,7 +37,7 @@ pub fn run(function: &mut Function) -> bool {
 
 /// The simpler operation this one is equivalent to, if there is one.
 fn simplify(op: &Op) -> Option<Op> {
-    let Op::Binary(operator, lhs, rhs) = *op else {
+    let Op::Binary(operator, width, lhs, rhs) = *op else {
         return None;
     };
     let same = matches!((lhs, rhs), (Operand::Value(left), Operand::Value(right)) if left == right);
@@ -60,7 +60,7 @@ fn simplify(op: &Op) -> Option<Op> {
             // Strength reduction: doubling is an addition, which every machine
             // this targets does faster than a multiplication.
             (Operand::Imm(2), other) | (other, Operand::Imm(2)) => {
-                Some(Op::Binary(BinOp::Add, other, other))
+                Some(Op::Binary(BinOp::Add, width, other, other))
             }
             _ => None,
         },
@@ -83,6 +83,8 @@ fn simplify(op: &Op) -> Option<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::middle::ir::Width;
 
     use crate::middle::ssa::Terminator;
     use crate::middle::ssa::verify::verify_ssa;
@@ -107,7 +109,7 @@ mod tests {
 
         let (lhs, rhs) = operands(opaque);
         let result = function
-            .emit(entry, Op::Binary(operator, lhs, rhs))
+            .emit(entry, Op::Binary(operator, Width::Bits64, lhs, rhs))
             .expect("a binary operation defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(result))));
 
@@ -150,10 +152,10 @@ mod tests {
     #[test]
     fn doubling_becomes_an_addition() {
         let (op, opaque) = simplified(BinOp::Mul, |x| (x, Operand::Imm(2)));
-        assert_eq!(op, Op::Binary(BinOp::Add, opaque, opaque));
+        assert_eq!(op, Op::Binary(BinOp::Add, Width::Bits64, opaque, opaque));
 
         let (op, opaque) = simplified(BinOp::Mul, |x| (Operand::Imm(2), x));
-        assert_eq!(op, Op::Binary(BinOp::Add, opaque, opaque));
+        assert_eq!(op, Op::Binary(BinOp::Add, Width::Bits64, opaque, opaque));
     }
 
     #[test]
@@ -178,7 +180,10 @@ mod tests {
         // The divisor may be zero, and what that produces is not the
         // compiler's to decide.
         let (op, opaque) = simplified(BinOp::Div, |x| (Operand::Imm(0), x));
-        assert_eq!(op, Op::Binary(BinOp::Div, Operand::Imm(0), opaque));
+        assert_eq!(
+            op,
+            Op::Binary(BinOp::Div, Width::Bits64, Operand::Imm(0), opaque)
+        );
     }
 
     #[test]
@@ -194,7 +199,12 @@ mod tests {
         let compared = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Eq, Operand::Value(first), Operand::Value(second)),
+                Op::Binary(
+                    BinOp::Eq,
+                    Width::Bits64,
+                    Operand::Value(first),
+                    Operand::Value(second),
+                ),
             )
             .expect("a comparison defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(compared))));
@@ -214,7 +224,12 @@ mod tests {
         let doubled = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Mul, Operand::Value(opaque), Operand::Imm(2)),
+                Op::Binary(
+                    BinOp::Mul,
+                    Width::Bits64,
+                    Operand::Value(opaque),
+                    Operand::Imm(2),
+                ),
             )
             .expect("a multiplication defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(doubled))));

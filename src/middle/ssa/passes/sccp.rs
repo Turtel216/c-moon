@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::middle::ir::Width;
 use crate::middle::ssa::defuse::{DefUse, Use, UsePosition};
 use crate::middle::ssa::{BinOp, BlockId, Function, InstId, Op, Operand, Terminator, ValueId};
 
@@ -195,18 +196,26 @@ impl<'a> Solver<'a> {
     /// What an operation produces, given what is known about its operands.
     fn evaluate(&self, op: &Op) -> Known {
         match op {
-            Op::Binary(operator, lhs, rhs) => {
+            Op::Binary(operator, width, lhs, rhs) => {
                 match (self.operand(*lhs), self.operand(*rhs)) {
                     // One operand that could be anything is enough.
                     (Known::Anything, _) | (_, Known::Anything) => Known::Anything,
                     (Known::Constant(left), Known::Constant(right)) => {
-                        fold(*operator, left, right).map_or(Known::Anything, Known::Constant)
+                        fold(*operator, *width, left, right)
+                            .map_or(Known::Anything, Known::Constant)
                     }
                     // Something is still unknown, so this is too -- for now.
                     _ => Known::Nothing,
                 }
             }
             Op::Copy(source) => self.operand(*source),
+
+            // A conversion of a known value is known: the constant is held
+            // sign-extended, so narrowing it is all there is to do.
+            Op::Convert { to, value } => match self.operand(*value) {
+                Known::Constant(constant) => Known::Constant(to.narrow(constant)),
+                other => other,
+            },
 
             // The undefined value is materialised as zero when SSA is left, so
             // that is what it is worth here.
@@ -236,6 +245,7 @@ impl<'a> Solver<'a> {
                 cond,
                 then_block,
                 else_block,
+                ..
             } => match self.operand(*cond) {
                 // Nothing is known about the condition yet, so neither side
                 // has been proved reachable. Optimism: assume neither until
@@ -331,19 +341,24 @@ fn apply(function: &mut Function, solution: &Solution) -> bool {
 /// `None` when the operation has no compile-time answer, which is division by
 /// zero.  The program is free to do that; the compiler is not free to decide
 /// what it produces.
-fn fold(operator: BinOp, lhs: i64, rhs: i64) -> Option<i64> {
+fn fold(operator: BinOp, width: Width, lhs: i64, rhs: i64) -> Option<i64> {
     // Wrapping arithmetic throughout: overflow is undefined in C, and the
     // target wraps, so folding must agree with what the hardware would have
     // done rather than crash the compiler.
+    //
+    // It has to wrap where the hardware would, too: narrowing the result to
+    // the width the instruction computes at is what makes a folded `int`
+    // overflow come out as the machine's 32-bit answer rather than the one an
+    // `i64` would have given.
     Some(match operator {
-        BinOp::Add => lhs.wrapping_add(rhs),
-        BinOp::Sub => lhs.wrapping_sub(rhs),
-        BinOp::Mul => lhs.wrapping_mul(rhs),
+        BinOp::Add => width.narrow(lhs.wrapping_add(rhs)),
+        BinOp::Sub => width.narrow(lhs.wrapping_sub(rhs)),
+        BinOp::Mul => width.narrow(lhs.wrapping_mul(rhs)),
         BinOp::Div => {
             if rhs == 0 {
                 return None;
             }
-            lhs.wrapping_div(rhs)
+            width.narrow(lhs.wrapping_div(rhs))
         }
         BinOp::Eq => i64::from(lhs == rhs),
         BinOp::Neq => i64::from(lhs != rhs),
@@ -380,13 +395,18 @@ mod tests {
         let sum = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Add, Operand::Imm(2), Operand::Imm(3)),
+                Op::Binary(BinOp::Add, Width::Bits64, Operand::Imm(2), Operand::Imm(3)),
             )
             .expect("an addition defines a value");
         let product = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Mul, Operand::Value(sum), Operand::Imm(4)),
+                Op::Binary(
+                    BinOp::Mul,
+                    Width::Bits64,
+                    Operand::Value(sum),
+                    Operand::Imm(4),
+                ),
             )
             .expect("a multiplication defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(product))));
@@ -418,6 +438,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: taken,
                 else_block: untaken,
+                width: Width::Bits64,
             },
         );
 
@@ -452,6 +473,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: left,
                 else_block: right,
+                width: Width::Bits64,
             },
         );
 
@@ -494,7 +516,12 @@ mod tests {
         let stepped = function
             .emit(
                 latch,
-                Op::Binary(BinOp::Add, Operand::Value(counter), Operand::Imm(1)),
+                Op::Binary(
+                    BinOp::Add,
+                    Width::Bits64,
+                    Operand::Value(counter),
+                    Operand::Imm(1),
+                ),
             )
             .expect("an addition defines a value");
         function.block_mut(header).phis[0].args = vec![Operand::Imm(0), Operand::Value(stepped)];
@@ -502,7 +529,12 @@ mod tests {
         let test = function
             .emit(
                 header,
-                Op::Binary(BinOp::Lt, Operand::Value(counter), Operand::Imm(10)),
+                Op::Binary(
+                    BinOp::Lt,
+                    Width::Bits64,
+                    Operand::Value(counter),
+                    Operand::Imm(10),
+                ),
             )
             .expect("a comparison defines a value");
         function.set_terminator(
@@ -511,6 +543,7 @@ mod tests {
                 cond: Operand::Value(test),
                 then_block: latch,
                 else_block: done,
+                width: Width::Bits64,
             },
         );
         function.set_terminator(done, Terminator::Return(Some(Operand::Value(counter))));
@@ -539,7 +572,7 @@ mod tests {
         let quotient = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Div, Operand::Imm(1), Operand::Imm(0)),
+                Op::Binary(BinOp::Div, Width::Bits64, Operand::Imm(1), Operand::Imm(0)),
             )
             .expect("a division defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(quotient))));
@@ -586,7 +619,7 @@ mod tests {
         let sum = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Add, Operand::Imm(2), Operand::Imm(3)),
+                Op::Binary(BinOp::Add, Width::Bits64, Operand::Imm(2), Operand::Imm(3)),
             )
             .expect("an addition defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(sum))));

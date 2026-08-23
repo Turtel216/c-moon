@@ -156,30 +156,41 @@ impl Lowering<'_> {
         let dest = inst.dest.map(|value| self.value(value));
 
         match &inst.op {
-            Op::Binary(operator, lhs, rhs) => out.push(TACInstruction::new(
+            Op::Binary(operator, width, lhs, rhs) => out.push(TACInstruction::new(
                 binary_opcode(*operator),
+                *width,
                 dest,
                 Some(self.operand(*lhs)),
                 Some(self.operand(*rhs)),
             )),
 
-            Op::Copy(source) => out.push(TACInstruction::new(
+            // A copy moves a value between homes without looking at it, so
+            // the whole register goes: see `TACInstruction::width`.
+            Op::Copy(source) => out.push(TACInstruction::transfer(
                 Opcode::Mov,
                 dest,
                 Some(self.operand(*source)),
                 None,
             )),
 
+            Op::Convert { to, value } => out.push(TACInstruction::new(
+                Opcode::Convert,
+                *to,
+                dest,
+                Some(self.operand(*value)),
+                None,
+            )),
+
             Op::Call { callee, args } => {
                 for argument in args {
-                    out.push(TACInstruction::new(
+                    out.push(TACInstruction::transfer(
                         Opcode::Param,
                         None,
                         Some(self.operand(*argument)),
                         None,
                     ));
                 }
-                out.push(TACInstruction::new(
+                out.push(TACInstruction::transfer(
                     Opcode::Call,
                     dest,
                     Some(TacOperand::Label(callee.clone())),
@@ -187,7 +198,7 @@ impl Lowering<'_> {
                 ));
             }
 
-            Op::GetParam(index) => out.push(TACInstruction::new(
+            Op::GetParam(index) => out.push(TACInstruction::transfer(
                 Opcode::GetParam,
                 dest,
                 Some(TacOperand::ImmInt(*index as i64)),
@@ -197,56 +208,72 @@ impl Lowering<'_> {
             // An undefined value is materialised as zero: the program is
             // reading a variable it never wrote, so any value is as correct as
             // any other, and a fixed one keeps the output reproducible.
-            Op::Undef => out.push(TACInstruction::new(
+            Op::Undef => out.push(TACInstruction::transfer(
                 Opcode::Mov,
                 dest,
                 Some(TacOperand::ImmInt(0)),
                 None,
             )),
 
-            Op::SlotLoad { slot } => out.push(TACInstruction::new(
+            Op::SlotLoad { slot, width } => out.push(TACInstruction::new(
                 Opcode::Mov,
+                *width,
                 dest,
                 Some(self.slot(*slot)),
                 None,
             )),
 
-            Op::SlotStore { slot, value } => out.push(TACInstruction::new(
+            Op::SlotStore { slot, value, width } => out.push(TACInstruction::new(
                 Opcode::Mov,
+                *width,
                 Some(self.slot(*slot)),
                 Some(self.operand(*value)),
                 None,
             )),
 
-            Op::ArrayLoad { base, index } => out.push(TACInstruction::new(
+            Op::ArrayLoad { base, index, width } => out.push(TACInstruction::new(
                 Opcode::ArrayLoad,
+                *width,
                 dest,
                 Some(self.slot(*base)),
                 Some(self.operand(*index)),
             )),
 
-            Op::ArrayStore { base, index, value } => out.push(TACInstruction::new(
+            Op::ArrayStore {
+                base,
+                index,
+                value,
+                width,
+            } => out.push(TACInstruction::new(
                 Opcode::ArrayStore,
+                *width,
                 Some(self.slot(*base)),
                 Some(self.operand(*index)),
                 Some(self.operand(*value)),
             )),
 
-            Op::Load { address } => out.push(TACInstruction::new(
+            Op::Load { address, width } => out.push(TACInstruction::new(
                 Opcode::Load,
+                *width,
                 dest,
                 Some(self.operand(*address)),
                 None,
             )),
 
-            Op::Store { address, value } => out.push(TACInstruction::new(
+            Op::Store {
+                address,
+                value,
+                width,
+            } => out.push(TACInstruction::new(
                 Opcode::Store,
+                *width,
                 None,
                 Some(self.operand(*address)),
                 Some(self.operand(*value)),
             )),
 
-            Op::AddrOf { slot } => out.push(TACInstruction::new(
+            // An address is a full machine word whatever it points at.
+            Op::AddrOf { slot } => out.push(TACInstruction::transfer(
                 Opcode::AddrOf,
                 dest,
                 Some(self.slot(*slot)),
@@ -337,7 +364,7 @@ impl Lowering<'_> {
                     Operand::Imm(constant) => TacOperand::ImmInt(constant),
                 };
 
-                out.push(TACInstruction::new(
+                out.push(TACInstruction::transfer(
                     Opcode::Mov,
                     Some(self.value(dest)),
                     Some(held_in.clone()),
@@ -365,7 +392,7 @@ impl Lowering<'_> {
             // a cycle. One temporary breaks it, and the rest of the cycle
             // follows from the ready list.
             let temporary = self.fresh_copy();
-            out.push(TACInstruction::new(
+            out.push(TACInstruction::transfer(
                 Opcode::Mov,
                 Some(temporary.clone()),
                 Some(self.value(dest)),
@@ -386,7 +413,7 @@ impl Lowering<'_> {
         match self.function.block(block).terminator() {
             Terminator::Jump(target) => {
                 let label = self.label(*target);
-                out.push(TACInstruction::new(
+                out.push(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(TacOperand::Label(label.clone())),
@@ -397,6 +424,7 @@ impl Lowering<'_> {
 
             Terminator::Branch {
                 cond,
+                width,
                 then_block,
                 else_block,
             } => {
@@ -404,11 +432,12 @@ impl Lowering<'_> {
                 let untaken = self.label(*else_block);
                 out.push(TACInstruction::new(
                     Opcode::BranchIf,
+                    *width,
                     None,
                     Some(self.operand(*cond)),
                     Some(TacOperand::Label(taken.clone())),
                 ));
-                out.push(TACInstruction::new(
+                out.push(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(TacOperand::Label(untaken.clone())),
@@ -418,7 +447,7 @@ impl Lowering<'_> {
             }
 
             Terminator::Return(value) => {
-                out.push(TACInstruction::new(
+                out.push(TACInstruction::transfer(
                     Opcode::Ret,
                     None,
                     value.map(|value| self.operand(value)),
@@ -495,6 +524,8 @@ fn binary_opcode(operator: BinOp) -> Opcode {
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     use crate::middle::ssa::verify::verify_ssa;
     use crate::middle::ssa::{BinOp, SlotOrigin};
 
@@ -552,6 +583,7 @@ mod tests {
                     cond: Operand::Imm(1),
                     then_block: latch,
                     else_block: done,
+                    width: Width::Bits64,
                 },
             );
 
@@ -608,9 +640,9 @@ mod tests {
         assert_eq!(
             emitted(&cfg, "latch"),
             vec![
-                "%phi1 = %v3".to_string(),
-                "%v3 = %v2".to_string(),
-                "%v2 = %phi1".to_string(),
+                "%phi1 =.64 %v3".to_string(),
+                "%v3 =.64 %v2".to_string(),
+                "%v2 =.64 %phi1".to_string(),
                 "jmp .header".to_string(),
             ]
         );
@@ -627,7 +659,12 @@ mod tests {
             .function
             .emit(
                 fixture.latch,
-                Op::Binary(BinOp::Add, Operand::Value(first), Operand::Imm(1)),
+                Op::Binary(
+                    BinOp::Add,
+                    Width::Bits64,
+                    Operand::Value(first),
+                    Operand::Imm(1),
+                ),
             )
             .expect("an addition defines a value");
         fixture.back_edge(0, Operand::Value(stepped));
@@ -640,9 +677,9 @@ mod tests {
         assert_eq!(
             emitted(&cfg, "latch"),
             vec![
-                "%v3 = %v1 + 1".to_string(),
-                "%v2 = %v1".to_string(),
-                "%v1 = %v3".to_string(),
+                "%v3 = %v1 +.64 1".to_string(),
+                "%v2 =.64 %v1".to_string(),
+                "%v1 =.64 %v3".to_string(),
                 "jmp .header".to_string(),
             ]
         );
@@ -674,7 +711,12 @@ mod tests {
             .function
             .emit(
                 fixture.latch,
-                Op::Binary(BinOp::Add, Operand::Value(carried), Operand::Imm(1)),
+                Op::Binary(
+                    BinOp::Add,
+                    Width::Bits64,
+                    Operand::Value(carried),
+                    Operand::Imm(1),
+                ),
             )
             .expect("an addition defines a value");
         fixture.back_edge(0, Operand::Value(stepped));
@@ -687,8 +729,8 @@ mod tests {
         assert_eq!(
             emitted(&cfg, "latch"),
             vec![
-                "%v2 = %v1 + 1".to_string(),
-                "%v1 = %v2".to_string(),
+                "%v2 = %v1 +.64 1".to_string(),
+                "%v1 =.64 %v2".to_string(),
                 "jmp .header".to_string(),
             ]
         );

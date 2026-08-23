@@ -36,15 +36,18 @@
 
 use std::collections::HashMap;
 
+use crate::middle::ir::Width;
 use crate::middle::ssa::dom::{DomTree, Graph};
 use crate::middle::ssa::{BinOp, BlockId, Function, InstId, Op, Operand, SlotId, ValueId};
 
 /// What makes two computations the same.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
-    /// An operator and its operands, with the commutative ones ordered so that
-    /// `a + b` and `b + a` are one expression.
-    Binary(BinOp, Operand, Operand),
+    /// An operator, the width it computes at and its operands, with the
+    /// commutative ones ordered so that `a + b` and `b + a` are one
+    /// expression. Two operations of different widths are two expressions:
+    /// they can disagree wherever the narrower one wraps.
+    Binary(BinOp, Width, Operand, Operand),
     /// The address of a slot, which never changes within a function.
     AddrOf(SlotId),
     /// A merge, which is only ever congruent to another merge in the same
@@ -189,7 +192,7 @@ impl Numbering<'_> {
     /// time it runs -- see the note on memory above.
     fn key(&self, op: &Op) -> Option<Key> {
         match *op {
-            Op::Binary(operator, lhs, rhs) => {
+            Op::Binary(operator, width, lhs, rhs) => {
                 let (lhs, rhs) = (self.canonical(lhs), self.canonical(rhs));
                 // Ordering the operands of a commutative operator is what
                 // makes `a + b` and `b + a` one expression rather than two.
@@ -198,7 +201,7 @@ impl Numbering<'_> {
                 } else {
                     (lhs, rhs)
                 };
-                Some(Key::Binary(operator, lhs, rhs))
+                Some(Key::Binary(operator, width, lhs, rhs))
             }
             Op::AddrOf { slot } => Some(Key::AddrOf(slot)),
 
@@ -206,6 +209,7 @@ impl Numbering<'_> {
             // that define nothing. Listed rather than caught by a wildcard, so
             // that a new operation has to be classified before it compiles.
             Op::Copy(_)
+            | Op::Convert { .. }
             | Op::Call { .. }
             | Op::GetParam(_)
             | Op::Undef
@@ -305,7 +309,7 @@ mod tests {
         rhs: Operand,
     ) -> ValueId {
         function
-            .emit(block, Op::Binary(operator, lhs, rhs))
+            .emit(block, Op::Binary(operator, Width::Bits64, lhs, rhs))
             .expect("a binary operation defines a value")
     }
 
@@ -422,6 +426,7 @@ mod tests {
                 cond: a,
                 then_block: arm,
                 else_block: join,
+                width: Width::Bits64,
             },
         );
 
@@ -444,7 +449,13 @@ mod tests {
         let entry = function.entry();
         let slot = function.slot_for(SlotOrigin::Variable(0));
         let first = function
-            .emit(entry, Op::SlotLoad { slot })
+            .emit(
+                entry,
+                Op::SlotLoad {
+                    slot,
+                    width: Width::Bits64,
+                },
+            )
             .expect("a load defines a value");
         function.emit(
             entry,
@@ -454,7 +465,13 @@ mod tests {
             },
         );
         let second = function
-            .emit(entry, Op::SlotLoad { slot })
+            .emit(
+                entry,
+                Op::SlotLoad {
+                    slot,
+                    width: Width::Bits64,
+                },
+            )
             .expect("a load defines a value");
         let total = binary(
             &mut function,
@@ -510,6 +527,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: left,
                 else_block: right,
+                width: Width::Bits64,
             },
         );
 

@@ -16,11 +16,12 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::printer::ir_printer::{InstText, ValueText};
+use crate::middle::ir::Width;
+use crate::printer::ir_printer::{InstText, SlotText, ValueText};
 
 use super::defuse::{DefUse, UsePosition};
 use super::dom::{DomTree, Graph};
-use super::{BlockId, DefSite, Function, InstId, Op, ValueId};
+use super::{BlockId, DefSite, Function, InstId, Op, SlotId, ValueId};
 
 /// One broken invariant.
 ///
@@ -88,6 +89,16 @@ pub enum SsaError {
     /// An edge from a block that branches into a block with several
     /// predecessors.  Phi nodes on such an edge have nowhere to be lowered to.
     CriticalEdge { from: String, to: String },
+
+    /// One memory location read or written at two different widths.  A slot
+    /// stands for a variable, a variable has one type, and the backend gives
+    /// it exactly that type's worth of storage -- so a wider access than the
+    /// first one would run past the end of it.
+    SlotWidthDisagrees {
+        slot: String,
+        first: Width,
+        second: Width,
+    },
 }
 
 impl fmt::Display for SsaError {
@@ -164,6 +175,15 @@ impl fmt::Display for SsaError {
                 "`{inst}` in .{block} reads an incoming argument outside the entry block's \
                  opening run of them"
             ),
+            SsaError::SlotWidthDisagrees {
+                slot,
+                first,
+                second,
+            } => write!(
+                f,
+                "{slot} is accessed at {first} bits and also at {second} bits"
+            ),
+
             SsaError::CriticalEdge { from, to } => write!(
                 f,
                 "the edge .{from} -> .{to} is critical: .{from} branches and .{to} is entered \
@@ -203,6 +223,7 @@ pub fn verify_ssa(function: &Function) -> Result<(), Vec<SsaError>> {
     check_definitions(function, &mut errors);
     check_parameter_prologue(function, &mut errors);
     check_critical_edges(function, &mut errors);
+    check_slot_widths(function, &mut errors);
 
     if errors.is_empty() {
         check_dominance(function, &mut errors);
@@ -245,6 +266,56 @@ pub fn assert_valid(function: &Function, after: &str) {
             listed.join("\n"),
             function
         );
+    }
+}
+
+/// Every access to a memory location must be as wide as the last.
+///
+/// The width comes from the type of the variable the slot stands for, so two
+/// accesses of different widths mean an earlier pass lost track of what that
+/// type was.
+fn check_slot_widths(function: &Function, errors: &mut Vec<SsaError>) {
+    let mut seen: HashMap<SlotId, Width> = HashMap::new();
+
+    for block in function.block_ids() {
+        for &inst in &function.block(block).insts {
+            // An array is indexed by element, so an element access measures
+            // its slot just as a whole-variable access measures one. Every
+            // other operation is listed rather than caught by a wildcard, so
+            // that a new one touching memory has to be classified here.
+            let (slot, width) = match function.inst(inst).op {
+                Op::SlotLoad { slot, width }
+                | Op::SlotStore { slot, width, .. }
+                | Op::ArrayLoad {
+                    base: slot, width, ..
+                }
+                | Op::ArrayStore {
+                    base: slot, width, ..
+                } => (slot, width),
+
+                // `AddrOf` hands out an address without reading or writing
+                // what is at it, and the rest name no slot at all.
+                Op::AddrOf { .. }
+                | Op::Binary(..)
+                | Op::Copy(_)
+                | Op::Convert { .. }
+                | Op::Call { .. }
+                | Op::GetParam(_)
+                | Op::Undef
+                | Op::Load { .. }
+                | Op::Store { .. } => continue,
+            };
+
+            if let Some(first) = seen.insert(slot, width)
+                && first != width
+            {
+                errors.push(SsaError::SlotWidthDisagrees {
+                    slot: SlotText { function, slot }.to_string(),
+                    first,
+                    second: width,
+                });
+            }
+        }
     }
 }
 
@@ -537,6 +608,8 @@ fn site_text(function: &Function, site: DefSite) -> String {
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     use crate::middle::ssa::{Op, Operand, SlotOrigin, Terminator};
 
     /// A function with an entry block and nothing in it.
@@ -585,6 +658,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: left,
                 else_block: right,
+                width: Width::Bits64,
             },
         );
         function.set_terminator(join, Terminator::Return(None));
@@ -612,6 +686,33 @@ mod tests {
 
         // Act / Assert
         assert_eq!(verify_ssa(&function), Ok(()));
+    }
+
+    #[test]
+    fn a_slot_accessed_at_two_widths_is_reported() {
+        // Arrange: one variable stored as a `long int` and read back as an
+        // `int`, which means an earlier pass lost track of its type.
+        let mut function = function();
+        let entry = function.entry();
+        let slot = function.slot_for(SlotOrigin::Variable(0));
+        function.emit(
+            entry,
+            Op::SlotStore {
+                slot,
+                value: Operand::Imm(1),
+                width: Width::Bits64,
+            },
+        );
+        function.emit(
+            entry,
+            Op::SlotLoad {
+                slot,
+                width: Width::Bits32,
+            },
+        );
+
+        // Act / Assert
+        assert_reports!(&function, SsaError::SlotWidthDisagrees { .. });
     }
 
     #[test]
@@ -829,6 +930,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: other,
                 else_block: join,
+                width: Width::Bits64,
             },
         );
         function.set_terminator(join, Terminator::Return(None));

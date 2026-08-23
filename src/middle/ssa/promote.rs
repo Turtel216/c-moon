@@ -60,7 +60,7 @@ pub const SETJMP_LIKE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjm
 ///
 /// * `function` - the function in its all-in-memory form, as construction
 ///   first builds it
-/// * `array_sizes` - element count of every array variable in the program
+/// * `array_sizes` - storage size of every array variable in the program
 ///
 /// # Returns
 ///
@@ -111,6 +111,7 @@ pub fn promotable(function: &Function, array_sizes: &HashMap<VarId, usize>) -> B
                 // operation carrying a slot a compile error here.
                 Op::Binary(..)
                 | Op::Copy(_)
+                | Op::Convert { .. }
                 | Op::Call { .. }
                 | Op::GetParam(_)
                 | Op::Undef
@@ -126,6 +127,8 @@ pub fn promotable(function: &Function, array_sizes: &HashMap<VarId, usize>) -> B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::middle::ir::Width;
 
     use crate::frontend::lexer::Lexer;
     use crate::frontend::parser::Parser;
@@ -157,10 +160,17 @@ mod tests {
             Op::SlotStore {
                 slot: scalar,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
         let loaded = function
-            .emit(entry, Op::SlotLoad { slot: scalar })
+            .emit(
+                entry,
+                Op::SlotLoad {
+                    slot: scalar,
+                    width: Width::Bits64,
+                },
+            )
             .expect("a load defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(loaded))));
 
@@ -182,6 +192,7 @@ mod tests {
             Op::SlotStore {
                 slot: pointer,
                 value: Operand::Value(address),
+                width: Width::Bits64,
             },
         );
 
@@ -202,6 +213,7 @@ mod tests {
                 base: array,
                 index: Operand::Imm(0),
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
         let element = function
@@ -210,6 +222,7 @@ mod tests {
                 Op::ArrayLoad {
                     base: array,
                     index: Operand::Imm(0),
+                    width: Width::Bits64,
                 },
             )
             .expect("an array load defines a value");
@@ -218,6 +231,7 @@ mod tests {
             Op::SlotStore {
                 slot: scalar,
                 value: Operand::Value(element),
+                width: Width::Bits64,
             },
         );
 
@@ -250,6 +264,7 @@ mod tests {
             Op::SlotStore {
                 slot: scalar,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
 
@@ -277,6 +292,7 @@ mod tests {
             Op::SlotStore {
                 slot: scalar,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
         function.emit(
@@ -304,6 +320,7 @@ mod tests {
             Op::SlotStore {
                 slot: plain,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
         function.emit(entry, Op::AddrOf { slot: pinned });

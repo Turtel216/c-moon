@@ -59,6 +59,8 @@ fn next_merge(function: &Function) -> Option<(BlockId, BlockId)> {
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     use crate::middle::ssa::verify::verify_ssa;
     use crate::middle::ssa::{Op, Operand, SlotOrigin};
 
@@ -116,6 +118,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: left,
                 else_block: join,
+                width: Width::Bits64,
             },
         );
         function.set_terminator(join, Terminator::Return(None));
@@ -181,6 +184,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: latch,
                 else_block: done,
+                width: Width::Bits64,
             },
         );
 

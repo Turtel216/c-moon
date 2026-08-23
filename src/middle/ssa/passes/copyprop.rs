@@ -145,6 +145,8 @@ fn resolve(start: ValueId, direct: &HashMap<ValueId, Operand>) -> Option<Operand
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     use crate::middle::ssa::verify::verify_ssa;
     use crate::middle::ssa::{BinOp, BlockId, SlotOrigin, Terminator};
 
@@ -170,6 +172,7 @@ mod tests {
                 cond: Operand::Imm(1),
                 then_block: latch,
                 else_block: done,
+                width: Width::Bits64,
             },
         );
         (function, header, latch, done)
@@ -192,7 +195,12 @@ mod tests {
         let sum = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Add, Operand::Value(third), Operand::Value(third)),
+                Op::Binary(
+                    BinOp::Add,
+                    Width::Bits64,
+                    Operand::Value(third),
+                    Operand::Value(third),
+                ),
             )
             .expect("an addition defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(sum))));
@@ -207,7 +215,7 @@ mod tests {
             "\
 function f {
 .entry:
-    %v3 = 7 + 7
+    %v3 = 7 +.64 7
     ret %v3
 }
 "
@@ -281,7 +289,12 @@ function f {
         let stepped = function
             .emit(
                 latch,
-                Op::Binary(BinOp::Add, Operand::Value(carried), Operand::Imm(1)),
+                Op::Binary(
+                    BinOp::Add,
+                    Width::Bits64,
+                    Operand::Value(carried),
+                    Operand::Imm(1),
+                ),
             )
             .expect("an addition defines a value");
         function.block_mut(header).phis[0].args =

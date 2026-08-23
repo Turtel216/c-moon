@@ -55,7 +55,7 @@ impl SlotUsage {
 
             for &inst in &function.block(block).insts {
                 match &function.inst(inst).op {
-                    Op::SlotLoad { slot } if promotable.contains(slot) => {
+                    Op::SlotLoad { slot, .. } if promotable.contains(slot) => {
                         if !written_here.contains(slot) {
                             usage.non_local.insert(*slot);
                         }
@@ -292,8 +292,8 @@ impl<'a> Renaming<'a> {
             }
 
             let action = match &self.function.inst(inst).op {
-                Op::SlotLoad { slot } if self.promotable.contains(slot) => Action::Load(*slot),
-                Op::SlotStore { slot, value } if self.promotable.contains(slot) => {
+                Op::SlotLoad { slot, .. } if self.promotable.contains(slot) => Action::Load(*slot),
+                Op::SlotStore { slot, value, .. } if self.promotable.contains(slot) => {
                     Action::Store(*slot, *value)
                 }
                 _ => Action::Keep,
@@ -419,6 +419,8 @@ enum Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::middle::ir::Width;
 
     use crate::middle::ssa::Terminator;
     use crate::middle::ssa::dom::{DomTree, Graph};
@@ -594,17 +596,31 @@ mod tests {
             Op::SlotStore {
                 slot: local,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
-        function.emit(entry, Op::SlotLoad { slot: local });
+        function.emit(
+            entry,
+            Op::SlotLoad {
+                slot: local,
+                width: Width::Bits64,
+            },
+        );
         function.emit(
             entry,
             Op::SlotStore {
                 slot: crossing,
                 value: Operand::Imm(2),
+                width: Width::Bits64,
             },
         );
-        function.emit(second, Op::SlotLoad { slot: crossing });
+        function.emit(
+            second,
+            Op::SlotLoad {
+                slot: crossing,
+                width: Width::Bits64,
+            },
+        );
 
         // Act
         let promotable = BTreeSet::from([local, crossing]);
@@ -631,9 +647,16 @@ mod tests {
             Op::SlotStore {
                 slot: pinned,
                 value: Operand::Imm(1),
+                width: Width::Bits64,
             },
         );
-        function.emit(entry, Op::SlotLoad { slot: pinned });
+        function.emit(
+            entry,
+            Op::SlotLoad {
+                slot: pinned,
+                width: Width::Bits64,
+            },
+        );
 
         // Act
         let usage = SlotUsage::compute(&function, &BTreeSet::new());
