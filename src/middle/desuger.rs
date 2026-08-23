@@ -769,6 +769,21 @@ impl<'a> LoweringContext<'a> {
                 dest
             }
 
+            // &*p -- the address of a dereferenced pointer, which is the
+            // pointer itself. C says the two operators cancel: neither is
+            // evaluated, and the result is `p` (C11 6.5.3.2p3). Lowering it
+            // literally would load through `p` and then ask for the address of
+            // that loaded value, a temporary which has no address to give.
+            ExprKind::Unary(UnaryOp::AddressOf, inner)
+                if matches!(inner.kind, ExprKind::Unary(UnaryOp::Deref, _)) =>
+            {
+                let ExprKind::Unary(UnaryOp::Deref, pointer) = &inner.kind else {
+                    unreachable!("the guard above matched a dereference")
+                };
+
+                self.lower_expression(pointer)
+            }
+
             // &x -- address-of
             ExprKind::Unary(UnaryOp::AddressOf, inner) => {
                 let inner_op = self.lower_expression(inner);
