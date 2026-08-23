@@ -26,12 +26,13 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 ## Supported Language Subset
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
-* **Data Types:** `int`, `int[size]`, pointers.
+* **Data Types:** `int` (32-bit), `long int` (64-bit), arrays of either, pointers.
 * **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`).
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
+* **Integer conversions:** the usual arithmetic conversions, the implicit conversion an assignment, argument or `return` performs, and casts between the two integer types.
 
 ### Roadmap
 

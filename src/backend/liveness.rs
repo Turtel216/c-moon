@@ -228,7 +228,7 @@ mod tests {
     use super::*;
 
     use crate::backend::linear::linearize_cfg;
-    use crate::middle::ir::{BasicBlock, Operand, TACInstruction};
+    use crate::middle::ir::{BasicBlock, Operand, TACInstruction, Width};
 
     /// A straight-line function: `t1 = 1; x = t1; ret x`.
     fn straight_line_cfg() -> CFG {
@@ -237,17 +237,25 @@ mod tests {
         entry.instructions = vec![
             TACInstruction::new(
                 Opcode::Mov,
+                Width::Bits64,
                 Some(Operand::Temp("t1".to_string())),
                 Some(Operand::ImmInt(1)),
                 None,
             ),
             TACInstruction::new(
                 Opcode::Mov,
+                Width::Bits64,
                 Some(Operand::Var(0)),
                 Some(Operand::Temp("t1".to_string())),
                 None,
             ),
-            TACInstruction::new(Opcode::Ret, None, Some(Operand::Var(0)), None),
+            TACInstruction::new(
+                Opcode::Ret,
+                Width::Bits64,
+                None,
+                Some(Operand::Var(0)),
+                None,
+            ),
         ];
         cfg.add_block(entry);
         cfg.add_block(BasicBlock::new("exit".to_string()));
@@ -300,6 +308,7 @@ mod tests {
         let mut entry = BasicBlock::new("entry".to_string());
         entry.instructions = vec![TACInstruction::new(
             Opcode::Mov,
+            Width::Bits64,
             Some(Operand::Var(0)),
             Some(Operand::ImmInt(0)),
             None,
@@ -308,12 +317,14 @@ mod tests {
         body.instructions = vec![
             TACInstruction::new(
                 Opcode::Add,
+                Width::Bits64,
                 Some(Operand::Var(0)),
                 Some(Operand::Var(0)),
                 Some(Operand::ImmInt(1)),
             ),
             TACInstruction::new(
                 Opcode::Jump,
+                Width::Bits64,
                 None,
                 Some(Operand::Label("body".to_string())),
                 None,
@@ -342,12 +353,14 @@ mod tests {
         entry.instructions = vec![
             TACInstruction::new(
                 Opcode::Call,
+                Width::Bits64,
                 Some(Operand::Temp("t1".to_string())),
                 Some(Operand::Label("f".to_string())),
                 Some(Operand::ImmInt(0)),
             ),
             TACInstruction::new(
                 Opcode::Call,
+                Width::Bits64,
                 None,
                 Some(Operand::Label("g".to_string())),
                 Some(Operand::ImmInt(0)),

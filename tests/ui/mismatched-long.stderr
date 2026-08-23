@@ -1,0 +1,10 @@
+error[E0204]: mismatched types
+  --> $DIR/mismatched-long.c:10:18
+   |
+ 4 | long int twice(long int value) {
+   |                -------------- expected because of this parameter
+...
+10 |     return twice(&x);
+   |                  ^^ expected `long int`, found `int*`
+
+error: aborting due to 1 previous error

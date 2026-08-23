@@ -142,8 +142,8 @@ fn data_flow(opcode: &Opcode) -> DataFlow {
         | Opcode::Gt
         | Opcode::Gte => flow(BOTH_ARGS, true),
 
-        // `dest = arg1`, and `dest = *arg1`.
-        Opcode::Mov | Opcode::Load => flow(ARG1, true),
+        // `dest = arg1`, `dest = *arg1`, and `dest = (width) arg1`.
+        Opcode::Mov | Opcode::Load | Opcode::Convert => flow(ARG1, true),
 
         // `dest = arg1[arg2]`.
         Opcode::ArrayLoad => flow(BOTH_ARGS, true),
@@ -173,9 +173,12 @@ fn data_flow(opcode: &Opcode) -> DataFlow {
 mod tests {
     use super::*;
 
+    use crate::middle::ir::Width;
+
     fn instruction(opcode: Opcode) -> TACInstruction {
         TACInstruction::new(
             opcode,
+            Width::Bits64,
             Some(Operand::Var(0)),
             Some(Operand::Temp("t1".to_string())),
             Some(Operand::Var(2)),
@@ -231,6 +234,7 @@ mod tests {
         // Arrange: `dest = call arg1(label), arg2(count)`.
         let call = TACInstruction::new(
             Opcode::Call,
+            Width::Bits64,
             Some(Operand::Temp("t9".to_string())),
             Some(Operand::Label("f".to_string())),
             Some(Operand::ImmInt(0)),

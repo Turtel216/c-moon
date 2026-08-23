@@ -80,8 +80,10 @@ pub fn run() -> ExitCode {
         }
     };
 
-    // Desuger AST into IR
-    let ctx = LoweringContext::new(&resolution_map);
+    // Desuger AST into IR. The types semantic analysis worked out come along:
+    // they are what decides how wide each instruction is.
+    let types = sem.into_types();
+    let ctx = LoweringContext::new(&resolution_map, &types);
     let mut ir = ctx.lower_program(&ast);
 
     // Rebuild the middle-end in SSA form, and optimise it there when asked.

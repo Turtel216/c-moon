@@ -132,7 +132,7 @@ fn depth_first_order(cfg: &CFG) -> Vec<String> {
 mod tests {
     use super::*;
 
-    use crate::middle::ir::{BasicBlock, Opcode, Operand};
+    use crate::middle::ir::{BasicBlock, Opcode, Operand, Width};
 
     /// A CFG shaped like an `if`/`else`: the two arms both fall through to an
     /// empty exit block.
@@ -156,6 +156,7 @@ mod tests {
                 .instructions
                 .push(TACInstruction::new(
                     Opcode::Mov,
+                    Width::Bits64,
                     Some(Operand::Var(0)),
                     Some(Operand::ImmInt(1)),
                     None,
@@ -198,6 +199,7 @@ mod tests {
         let mut orphan = BasicBlock::new("orphan".to_string());
         orphan.instructions.push(TACInstruction::new(
             Opcode::Jump,
+            Width::Bits64,
             None,
             Some(Operand::Label("exit".to_string())),
             None,

@@ -11,6 +11,22 @@
 //! - Values that must move between fixed ABI registers form a simultaneous
 //!   assignment, not a sequence of `mov`s -- see
 //!   [`FunctionLowering::emit_parallel_moves`].
+//!
+//! # Widths
+//!
+//! A value is only as wide as its C type: an `int` occupies the low 32 bits of
+//! wherever it lives and nothing is promised about the rest.  Every
+//! instruction that computes or touches memory therefore takes its width from
+//! the TAC instruction being lowered, which is what makes `int` arithmetic
+//! wrap at 32 bits the way the language says and keeps a four-byte object from
+//! being written eight bytes at a time.
+//!
+//! Where a value is only being carried from one home to another and the TAC
+//! says nothing about how wide it is -- shuffling arguments into their ABI
+//! registers, breaking a cycle of moves -- the whole register goes, as
+//! [`TRANSFER`].  Copying bits that mean nothing along with the ones that do is
+//! harmless: every reader takes only what its own width entitles it to, and
+//! everything the compiler moves this way has a whole word to live in.
 
 use std::collections::HashSet;
 
@@ -21,9 +37,23 @@ use crate::backend::x86::abi::{
     WORD_SIZE,
 };
 use crate::backend::x86::isa::{
-    ConditionCode, X86Function, X86Instruction, X86Operand, X86Register,
+    ConditionCode, RegisterWidth, X86Function, X86Instruction, X86Operand, X86Register,
 };
-use crate::middle::ir::{Opcode, Operand, TACInstruction};
+use crate::middle::ir::{Opcode, Operand, TACInstruction, Width};
+
+/// The width a plain move between homes is done at.
+///
+/// See the note on widths in the module documentation for why the whole
+/// register goes even when the value in it is narrower.
+const TRANSFER: RegisterWidth = RegisterWidth::Quad;
+
+/// The x86 view of an IR width.
+const fn view(width: Width) -> RegisterWidth {
+    match width {
+        Width::Bits32 => RegisterWidth::Double,
+        Width::Bits64 => RegisterWidth::Quad,
+    }
+}
 
 /// Builds the x86 instruction sequence for one function.
 pub struct FunctionLowering<'a> {
@@ -110,6 +140,7 @@ impl<'a> FunctionLowering<'a> {
             Opcode::Gte => self.lower_comparison(instr, ConditionCode::Ge),
 
             Opcode::Mov => self.lower_move(instr),
+            Opcode::Convert => self.lower_convert(instr),
             Opcode::Jump => {
                 let target = branch_target(instr.arg1.as_ref());
                 self.emit(X86Instruction::Jmp(target));
@@ -147,7 +178,11 @@ impl<'a> FunctionLowering<'a> {
         let layout = self.layout;
 
         self.emit(X86Instruction::Push(reg(FRAME_POINTER)));
-        self.emit(X86Instruction::Mov(reg(FRAME_POINTER), reg(STACK_POINTER)));
+        self.emit(X86Instruction::Mov(
+            TRANSFER,
+            reg(FRAME_POINTER),
+            reg(STACK_POINTER),
+        ));
 
         for &register in layout.callee_saved() {
             self.emit(X86Instruction::Push(reg(register)));
@@ -156,6 +191,7 @@ impl<'a> FunctionLowering<'a> {
         let reserved = layout.stack_adjust();
         if reserved > 0 {
             self.emit(X86Instruction::Sub(
+                TRANSFER,
                 reg(STACK_POINTER),
                 X86Operand::Imm(reserved.into()),
             ));
@@ -171,7 +207,11 @@ impl<'a> FunctionLowering<'a> {
         if layout.callee_saved().is_empty() {
             // Nothing was pushed below the frame pointer, so it alone says
             // where the caller's stack pointer was.
-            self.emit(X86Instruction::Mov(reg(STACK_POINTER), reg(FRAME_POINTER)));
+            self.emit(X86Instruction::Mov(
+                TRANSFER,
+                reg(STACK_POINTER),
+                reg(FRAME_POINTER),
+            ));
         } else {
             // Point the stack pointer at the topmost saved register, whatever
             // the body left it at, and pop them in reverse order.
@@ -197,17 +237,18 @@ impl<'a> FunctionLowering<'a> {
     fn lower_binary(
         &mut self,
         instr: &TACInstruction,
-        build: fn(X86Operand, X86Operand) -> X86Instruction,
+        build: fn(RegisterWidth, X86Operand, X86Operand) -> X86Instruction,
     ) {
         let (dest, lhs, rhs) = three_operands(instr);
+        let width = view(instr.width);
 
-        self.define(dest, |lowering, result| {
+        self.define(dest, width, |lowering, result| {
             // The instruction overwrites its left operand, so the left-hand
             // side is loaded into the result register first.
-            lowering.move_into(lhs, result);
+            lowering.move_into(lhs, result, width);
             let right = lowering.in_place(rhs);
             let right = lowering.encodable(right, SCRATCH2);
-            lowering.emit(build(reg(result), right));
+            lowering.emit(build(width, reg(result), right));
         });
     }
 
@@ -218,31 +259,37 @@ impl<'a> FunctionLowering<'a> {
     /// afterwards.
     fn lower_division(&mut self, instr: &TACInstruction) {
         let (dest, lhs, rhs) = three_operands(instr);
+        let width = view(instr.width);
 
-        self.move_into(lhs, RETURN_VALUE);
-        self.emit(X86Instruction::Cqo);
+        self.move_into(lhs, RETURN_VALUE, width);
+        self.emit(X86Instruction::SignExtendAccumulator(width));
 
         // `idiv` divides by a register or memory operand, never an immediate.
         let divisor = match self.in_place(rhs) {
             immediate @ X86Operand::Imm(_) => reg(self.ensure_register(immediate, SCRATCH2)),
             other => other,
         };
-        self.emit(X86Instruction::Idiv(divisor));
+        self.emit(X86Instruction::Idiv(width, divisor));
 
-        self.define(dest, |lowering, result| lowering.copy(RETURN_VALUE, result));
+        self.define(dest, width, |lowering, result| {
+            lowering.copy(RETURN_VALUE, result)
+        });
     }
 
     /// Lower `dest = lhs <cmp> rhs` into a 0 or 1 in `dest`.
     fn lower_comparison(&mut self, instr: &TACInstruction, condition: ConditionCode) {
         let (dest, lhs, rhs) = three_operands(instr);
+        // The operands are compared at the width they were written at; the
+        // answer is the 0 or 1 of an `int` whatever that was.
+        let width = view(instr.width);
 
         // Both operands cannot be memory, so the left one is loaded first.
-        let left = self.in_register(lhs, SCRATCH);
+        let left = self.in_register(lhs, SCRATCH, width);
         let right = self.in_place(rhs);
         let right = self.encodable(right, SCRATCH2);
-        self.emit(X86Instruction::Cmp(reg(left), right));
+        self.emit(X86Instruction::Cmp(width, reg(left), right));
 
-        self.define(dest, |lowering, result| {
+        self.define(dest, RegisterWidth::Double, |lowering, result| {
             // `setcc` writes one byte and leaves the rest of the register
             // untouched, so `movzx` from that byte supplies the zeroes.
             lowering.emit(X86Instruction::SetCC(condition, RETURN_VALUE));
@@ -254,18 +301,49 @@ impl<'a> FunctionLowering<'a> {
 
     fn lower_move(&mut self, instr: &TACInstruction) {
         let (dest, source) = two_operands(instr);
+        let width = view(instr.width);
 
         // A destination with no register of its own is written straight to the
         // frame; routing it through one would cost an instruction per move.
         if self.layout.register_of(dest).is_none()
             && let Some(offset) = self.layout.write_back_offset(dest)
         {
-            let value = self.storable(source, SCRATCH);
-            self.emit(X86Instruction::Mov(frame(offset), value));
+            let value = self.storable(source, SCRATCH, width);
+            self.emit(X86Instruction::Mov(width, frame(offset), value));
             return;
         }
 
-        self.define(dest, |lowering, result| lowering.move_into(source, result));
+        self.define(dest, width, |lowering, result| {
+            lowering.move_into(source, result, width)
+        });
+    }
+
+    /// Lower `dest = (width) source`, the conversion between `int` and
+    /// `long int`.
+    ///
+    /// Widening has to sign-extend, because both types are signed and only the
+    /// low 32 bits of the source say anything.  Narrowing is a 32-bit move:
+    /// writing a register's low half is exactly what dropping the high half
+    /// means here, since nothing may read an `int` any wider than that.
+    fn lower_convert(&mut self, instr: &TACInstruction) {
+        let (dest, source) = two_operands(instr);
+        let to = view(instr.width);
+
+        self.define(dest, to, |lowering, result| {
+            match lowering.in_place(source) {
+                // A literal is already held sign-extended, so converting one
+                // is a matter of writing down the value it takes at the new
+                // width -- and `movsx` could not have read it anyway.
+                X86Operand::Imm(constant) => {
+                    let converted = X86Operand::Imm(instr.width.narrow(constant));
+                    lowering.emit(X86Instruction::Mov(to, reg(result), converted));
+                }
+                value => match to {
+                    RegisterWidth::Quad => lowering.emit(X86Instruction::Movsx(result, value)),
+                    narrower => lowering.emit(X86Instruction::Mov(narrower, reg(result), value)),
+                },
+            }
+        });
     }
 
     /// Lower a conditional branch: jump when the condition value is non-zero
@@ -275,14 +353,19 @@ impl<'a> FunctionLowering<'a> {
         let target = branch_target(instr.arg2.as_ref());
 
         // `test x, x` sets ZF exactly when x is zero, and needs no immediate.
-        let value = self.in_register(condition, SCRATCH);
-        self.emit(X86Instruction::Test(reg(value), reg(value)));
+        // Only the condition's own width is looked at: anything above it is
+        // not part of the value and could make a zero look non-zero.
+        let width = view(instr.width);
+        let value = self.in_register(condition, SCRATCH, width);
+        self.emit(X86Instruction::Test(width, reg(value), reg(value)));
         self.emit(X86Instruction::Jcc(taken_when, target));
     }
 
     fn lower_return(&mut self, instr: &TACInstruction) {
+        // The value was converted to the return type before it got here, so
+        // moving the whole register is right whatever that type is.
         if let Some(value) = &instr.arg1 {
-            self.move_into(value, RETURN_VALUE);
+            self.move_into(value, RETURN_VALUE, TRANSFER);
         }
         // The frame is torn down once, in the epilogue.
         self.emit(X86Instruction::Jmp(self.epilogue.clone()));
@@ -306,6 +389,7 @@ impl<'a> FunctionLowering<'a> {
         let padding = (on_stack.len() % 2) as i32 * WORD_SIZE;
         if padding > 0 {
             self.emit(X86Instruction::Sub(
+                TRANSFER,
                 reg(STACK_POINTER),
                 X86Operand::Imm(padding.into()),
             ));
@@ -314,7 +398,7 @@ impl<'a> FunctionLowering<'a> {
         // Pushed right to left, so the first stack argument ends up closest
         // to the return address, where the callee looks for it.
         for argument in on_stack.iter().rev() {
-            let value = self.in_register(argument, SCRATCH);
+            let value = self.in_register(argument, SCRATCH, TRANSFER);
             self.emit(X86Instruction::Push(reg(value)));
         }
 
@@ -332,13 +416,16 @@ impl<'a> FunctionLowering<'a> {
         let pushed = padding + on_stack.len() as i32 * WORD_SIZE;
         if pushed > 0 {
             self.emit(X86Instruction::Add(
+                TRANSFER,
                 reg(STACK_POINTER),
                 X86Operand::Imm(pushed.into()),
             ));
         }
 
         if let Some(dest) = &instr.dest {
-            self.define(dest, |lowering, result| lowering.copy(RETURN_VALUE, result));
+            self.define(dest, TRANSFER, |lowering, result| {
+                lowering.copy(RETURN_VALUE, result)
+            });
         }
     }
 
@@ -365,12 +452,16 @@ impl<'a> FunctionLowering<'a> {
             };
             let source = abi::incoming_argument(index);
 
-            // Phase 1: frame destinations.
+            // Phase 1: frame destinations.  The write is as wide as the
+            // instruction says the parameter is, so one that keeps storage of
+            // its own is given exactly its type's worth of bytes and does not
+            // overwrite whatever is laid out next to it.
             if let Some(offset) = self.layout.write_back_offset(dest) {
                 // x86 has no memory-to-memory `mov`, so a stack-passed
                 // argument goes through a scratch register.
                 let value = self.ensure_register(source.clone(), SCRATCH);
-                self.emit(X86Instruction::Mov(frame(offset), reg(value)));
+                let width = view(instr.width);
+                self.emit(X86Instruction::Mov(width, frame(offset), reg(value)));
             }
 
             // Phase 2 is deferred until the whole run has been seen.
@@ -390,21 +481,23 @@ impl<'a> FunctionLowering<'a> {
         // `dest` names the array being written into, not a definition.
         let (base, index, value) = three_operands(instr);
 
-        let element = self.element(base, index);
+        let width = view(instr.width);
+        let element = self.element(base, index, instr.width);
         // The element is the instruction's one memory operand, so the value
         // has to be a register or an immediate.  `element` may be holding the
         // index in SCRATCH2, so the other scratch register is used here.
-        let value = self.storable(value, SCRATCH);
-        self.emit(X86Instruction::Mov(element, value));
+        let value = self.storable(value, SCRATCH, width);
+        self.emit(X86Instruction::Mov(width, element, value));
     }
 
     /// Lower `dest = base[index]`.
     fn lower_array_load(&mut self, instr: &TACInstruction) {
         let (dest, base, index) = three_operands(instr);
+        let width = view(instr.width);
 
-        let element = self.element(base, index);
-        self.define(dest, |lowering, result| {
-            lowering.emit(X86Instruction::Mov(reg(result), element));
+        let element = self.element(base, index, instr.width);
+        self.define(dest, width, |lowering, result| {
+            lowering.emit(X86Instruction::Mov(width, reg(result), element));
         });
     }
 
@@ -414,20 +507,25 @@ impl<'a> FunctionLowering<'a> {
     /// a scaled index, so an element access costs a single instruction either
     /// way.  Element 0 is at the lowest address of the array's storage, which
     /// is what lets the scale be positive.
-    fn element(&mut self, base: &Operand, index: &Operand) -> X86Operand {
+    fn element(&mut self, base: &Operand, index: &Operand, element: Width) -> X86Operand {
         let element_zero = self.layout.array_base(base);
+        // Elements sit as close together as their type allows, so the index is
+        // scaled by the element's own size rather than by a machine word.
+        let size = element.bytes();
 
         match index {
             Operand::ImmInt(constant) => {
                 let offset = constant
-                    .checked_mul(i64::from(WORD_SIZE))
+                    .checked_mul(i64::from(size))
                     .and_then(|bytes| i32::try_from(bytes).ok())
                     .expect("Compiler Bug: array index is too large to address");
                 frame(element_zero + offset)
             }
             computed => {
-                let index_register = self.in_register(computed, SCRATCH2);
-                X86Operand::indexed(FRAME_POINTER, index_register, WORD_SIZE as u8, element_zero)
+                // An index is a full word: it was widened before it got here,
+                // precisely so that the whole register can address with it.
+                let index_register = self.in_register(computed, SCRATCH2, TRANSFER);
+                X86Operand::indexed(FRAME_POINTER, index_register, size as u8, element_zero)
             }
         }
     }
@@ -440,7 +538,7 @@ impl<'a> FunctionLowering<'a> {
         let (dest, variable) = two_operands(instr);
         let offset = self.layout.pinned(variable);
 
-        self.define(dest, |lowering, result| {
+        self.define(dest, TRANSFER, |lowering, result| {
             lowering.emit(X86Instruction::Lea(reg(result), frame(offset)));
         });
     }
@@ -448,10 +546,13 @@ impl<'a> FunctionLowering<'a> {
     /// Lower `dest = *address`.
     fn lower_load(&mut self, instr: &TACInstruction) {
         let (dest, address) = two_operands(instr);
+        // As much is read as the object pointed at occupies.
+        let width = view(instr.width);
 
-        let pointer = self.in_register(address, SCRATCH2);
-        self.define(dest, |lowering, result| {
+        let pointer = self.in_register(address, SCRATCH2, TRANSFER);
+        self.define(dest, width, |lowering, result| {
             lowering.emit(X86Instruction::Mov(
+                width,
                 reg(result),
                 X86Operand::mem(pointer, 0),
             ));
@@ -465,9 +566,14 @@ impl<'a> FunctionLowering<'a> {
 
         // The store is the instruction's one memory operand, so the pointer
         // must be in a register and the value a register or an immediate.
-        let pointer = self.in_register(address, SCRATCH2);
-        let value = self.storable(value, SCRATCH);
-        self.emit(X86Instruction::Mov(X86Operand::mem(pointer, 0), value));
+        let width = view(instr.width);
+        let pointer = self.in_register(address, SCRATCH2, TRANSFER);
+        let value = self.storable(value, SCRATCH, width);
+        self.emit(X86Instruction::Mov(
+            width,
+            X86Operand::mem(pointer, 0),
+            value,
+        ));
     }
 
     // ### Emission helpers ###
@@ -483,12 +589,21 @@ impl<'a> FunctionLowering<'a> {
     /// and the write back to its frame slot is emitted afterwards.  Every
     /// instruction that defines a value goes through here, so spilling and
     /// address-taken variables are handled in exactly one place.
-    fn define(&mut self, dest: &Operand, produce: impl FnOnce(&mut Self, X86Register)) {
+    ///
+    /// `width` is how wide the value produced is, which is what the write back
+    /// stores: an address-taken `int` owns four bytes of frame and nothing
+    /// more.
+    fn define(
+        &mut self,
+        dest: &Operand,
+        width: RegisterWidth,
+        produce: impl FnOnce(&mut Self, X86Register),
+    ) {
         let result = self.layout.register_of(dest).unwrap_or(SCRATCH);
         produce(self, result);
 
         if let Some(offset) = self.layout.write_back_offset(dest) {
-            self.emit(X86Instruction::Mov(frame(offset), reg(result)));
+            self.emit(X86Instruction::Mov(width, frame(offset), reg(result)));
         }
     }
 
@@ -509,35 +624,56 @@ impl<'a> FunctionLowering<'a> {
 
     /// Get `value` into a register, loading it into `scratch` if it is not in
     /// one already.
-    fn in_register(&mut self, value: &Operand, scratch: X86Register) -> X86Register {
+    ///
+    /// `width` is how much of it the caller is about to look at, and so how
+    /// much of it is loaded.
+    fn in_register(
+        &mut self,
+        value: &Operand,
+        scratch: X86Register,
+        width: RegisterWidth,
+    ) -> X86Register {
         let operand = self.in_place(value);
-        self.ensure_register(operand, scratch)
+        match operand {
+            X86Operand::Reg(register) => register,
+            other => {
+                self.emit(X86Instruction::Mov(width, reg(scratch), other));
+                scratch
+            }
+        }
     }
 
     /// Get an x86 operand into a register, moving it into `scratch` unless it
     /// is one already.
+    ///
+    /// The whole register is moved: this is used where the operand is a value
+    /// being carried somewhere rather than one being computed with.
     fn ensure_register(&mut self, operand: X86Operand, scratch: X86Register) -> X86Register {
         match operand {
             X86Operand::Reg(register) => register,
             other => {
-                self.emit(X86Instruction::Mov(reg(scratch), other));
+                self.emit(X86Instruction::Mov(TRANSFER, reg(scratch), other));
                 scratch
             }
         }
     }
 
     /// Move `value` into `register`, unless it is already there.
-    fn move_into(&mut self, value: &Operand, register: X86Register) {
+    ///
+    /// `width` is how much of it the instruction about to read it is defined
+    /// on, and so how much is fetched: an `int` in the frame owns four bytes
+    /// and reading eight would reach past it.
+    fn move_into(&mut self, value: &Operand, register: X86Register, width: RegisterWidth) {
         let source = self.in_place(value);
         if source != reg(register) {
-            self.emit(X86Instruction::Mov(reg(register), source));
+            self.emit(X86Instruction::Mov(width, reg(register), source));
         }
     }
 
     /// Copy `from` into `to`, unless they are the same register.
     fn copy(&mut self, from: X86Register, to: X86Register) {
         if from != to {
-            self.emit(X86Instruction::Mov(reg(to), reg(from)));
+            self.emit(X86Instruction::Mov(TRANSFER, reg(to), reg(from)));
         }
     }
 
@@ -561,11 +697,20 @@ impl<'a> FunctionLowering<'a> {
     ///
     /// Only one of the two conversions can fire, so a single `scratch`
     /// register serves both.
-    fn storable(&mut self, value: &Operand, scratch: X86Register) -> X86Operand {
+    fn storable(
+        &mut self,
+        value: &Operand,
+        scratch: X86Register,
+        width: RegisterWidth,
+    ) -> X86Operand {
         let operand = self.in_place(value);
         match operand {
             X86Operand::Imm(_) => self.encodable(operand, scratch),
-            other => reg(self.ensure_register(other, scratch)),
+            X86Operand::Reg(register) => reg(register),
+            other => {
+                self.emit(X86Instruction::Mov(width, reg(scratch), other));
+                reg(scratch)
+            }
         }
     }
 
@@ -608,7 +753,7 @@ impl<'a> FunctionLowering<'a> {
                     // so break the cycle: keep one register's value in the
                     // scratch register and read it from there instead.
                     let stashed = pending[0].0;
-                    self.emit(X86Instruction::Mov(reg(SCRATCH), reg(stashed)));
+                    self.emit(X86Instruction::Mov(TRANSFER, reg(SCRATCH), reg(stashed)));
                     for (_, source) in pending.iter_mut() {
                         if *source == reg(stashed) {
                             *source = reg(SCRATCH);
@@ -620,7 +765,7 @@ impl<'a> FunctionLowering<'a> {
             };
 
             let (destination, source) = pending.remove(index);
-            self.emit(X86Instruction::Mov(reg(destination), source));
+            self.emit(X86Instruction::Mov(TRANSFER, reg(destination), source));
         }
     }
 }
@@ -769,7 +914,7 @@ mod tests {
         let mut state: HashMap<X86Register, X86Register> = HashMap::new();
         for instr in instructions {
             match instr {
-                X86Instruction::Mov(X86Operand::Reg(destination), X86Operand::Reg(source)) => {
+                X86Instruction::Mov(_, X86Operand::Reg(destination), X86Operand::Reg(source)) => {
                     // A register not yet written still holds its own marker.
                     let value = *state.get(source).unwrap_or(source);
                     state.insert(*destination, value);
@@ -920,6 +1065,7 @@ mod tests {
         assert_eq!(
             lowering.out,
             vec![X86Instruction::Mov(
+                TRANSFER,
                 reg(SCRATCH2),
                 X86Operand::Imm(i64::from(i32::MAX) + 1)
             )]

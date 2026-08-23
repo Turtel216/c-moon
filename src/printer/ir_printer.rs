@@ -56,6 +56,7 @@ impl fmt::Display for Opcode {
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::AddrOf => "addr_of",
+            Opcode::Convert => "convert",
         };
         write!(f, "{}", op_str)
     }
@@ -70,6 +71,9 @@ impl fmt::Display for TACInstruction {
             op.as_ref()
                 .map_or_else(|| "_".to_string(), |o| o.to_string())
         };
+        // Operations whose meaning depends on how wide they are say so, e.g.
+        // `t1 = a +.32 b`; the ones that just move a word do not.
+        let width = self.width;
 
         match self.opcode {
             // Binary Operations
@@ -86,16 +90,32 @@ impl fmt::Display for TACInstruction {
             | Opcode::Gte => {
                 write!(
                     f,
-                    "{} = {} {} {}",
+                    "{} = {} {}.{} {}",
                     format_op(&self.dest),
                     format_op(&self.arg1),
                     self.opcode,
+                    width,
                     format_op(&self.arg2)
                 )
             }
             // Data Movement
             Opcode::Mov => {
-                write!(f, "{} = {}", format_op(&self.dest), format_op(&self.arg1))
+                write!(
+                    f,
+                    "{} =.{} {}",
+                    format_op(&self.dest),
+                    width,
+                    format_op(&self.arg1)
+                )
+            }
+            Opcode::Convert => {
+                write!(
+                    f,
+                    "{} = convert.{} {}",
+                    format_op(&self.dest),
+                    width,
+                    format_op(&self.arg1)
+                )
             }
             // Unary Control Flow
             Opcode::Jump => {
@@ -119,8 +139,9 @@ impl fmt::Display for TACInstruction {
             Opcode::BranchIf | Opcode::BranchIfNot => {
                 write!(
                     f,
-                    "{} {} goto {}",
+                    "{}.{} {} goto {}",
                     self.opcode,
+                    width,
                     format_op(&self.arg1),
                     format_op(&self.arg2)
                 )
@@ -131,7 +152,7 @@ impl fmt::Display for TACInstruction {
                 // array_store base[index] = value
                 write!(
                     f,
-                    "array_store {}[{}] = {}",
+                    "array_store.{width} {}[{}] = {}",
                     format_op(&self.dest),
                     format_op(&self.arg1),
                     format_op(&self.arg2)
@@ -141,7 +162,7 @@ impl fmt::Display for TACInstruction {
                 // dest = array_load base[index]
                 write!(
                     f,
-                    "{} = array_load {}[{}]",
+                    "{} = array_load.{width} {}[{}]",
                     format_op(&self.dest),
                     format_op(&self.arg1),
                     format_op(&self.arg2)
@@ -153,7 +174,7 @@ impl fmt::Display for TACInstruction {
                 // dest = load addr
                 write!(
                     f,
-                    "{} = load {}",
+                    "{} = load.{width} {}",
                     format_op(&self.dest),
                     format_op(&self.arg1)
                 )
@@ -162,7 +183,7 @@ impl fmt::Display for TACInstruction {
                 // store addr, value
                 write!(
                     f,
-                    "store {}, {}",
+                    "store.{width} {}, {}",
                     format_op(&self.arg1),
                     format_op(&self.arg2)
                 )
@@ -310,14 +331,16 @@ impl fmt::Display for InstText<'_> {
         }
 
         match &instr.op {
-            ssa::Op::Binary(operator, lhs, rhs) => write!(
+            ssa::Op::Binary(operator, width, lhs, rhs) => write!(
                 f,
-                "{} {} {}",
+                "{} {}.{} {}",
                 operand(*lhs),
                 binary_symbol(*operator),
+                width,
                 operand(*rhs)
             ),
             ssa::Op::Copy(source) => write!(f, "{}", operand(*source)),
+            ssa::Op::Convert { to, value } => write!(f, "convert.{} {}", to, operand(*value)),
             ssa::Op::Call { callee, args } => {
                 write!(f, "call {}(", callee)?;
                 for (position, argument) in args.iter().enumerate() {
@@ -330,24 +353,54 @@ impl fmt::Display for InstText<'_> {
             }
             ssa::Op::GetParam(index) => write!(f, "get_param {}", index),
             ssa::Op::Undef => write!(f, "undef"),
-            ssa::Op::SlotLoad { slot: from } => write!(f, "load_slot {}", slot(*from)),
-            ssa::Op::SlotStore { slot: into, value } => {
-                write!(f, "store_slot {}, {}", slot(*into), operand(*value))
+            ssa::Op::SlotLoad { slot: from, width } => {
+                write!(f, "load_slot.{} {}", width, slot(*from))
             }
-            ssa::Op::ArrayLoad { base, index } => {
-                write!(f, "array_load {}[{}]", slot(*base), operand(*index))
-            }
-            ssa::Op::ArrayStore { base, index, value } => write!(
+            ssa::Op::SlotStore {
+                slot: into,
+                value,
+                width,
+            } => write!(
                 f,
-                "array_store {}[{}] = {}",
+                "store_slot.{} {}, {}",
+                width,
+                slot(*into),
+                operand(*value)
+            ),
+            ssa::Op::ArrayLoad { base, index, width } => {
+                write!(
+                    f,
+                    "array_load.{} {}[{}]",
+                    width,
+                    slot(*base),
+                    operand(*index)
+                )
+            }
+            ssa::Op::ArrayStore {
+                base,
+                index,
+                value,
+                width,
+            } => write!(
+                f,
+                "array_store.{} {}[{}] = {}",
+                width,
                 slot(*base),
                 operand(*index),
                 operand(*value)
             ),
-            ssa::Op::Load { address } => write!(f, "load {}", operand(*address)),
-            ssa::Op::Store { address, value } => {
-                write!(f, "store {}, {}", operand(*address), operand(*value))
-            }
+            ssa::Op::Load { address, width } => write!(f, "load.{} {}", width, operand(*address)),
+            ssa::Op::Store {
+                address,
+                value,
+                width,
+            } => write!(
+                f,
+                "store.{} {}, {}",
+                width,
+                operand(*address),
+                operand(*value)
+            ),
             ssa::Op::AddrOf { slot: of } => write!(f, "addr_of {}", slot(*of)),
         }
     }
@@ -406,11 +459,12 @@ impl fmt::Display for BlockText<'_> {
             ssa::Terminator::Jump(target) => writeln!(f, "    jmp .{}", label(*target)),
             ssa::Terminator::Branch {
                 cond,
+                width,
                 then_block,
                 else_block,
             } => writeln!(
                 f,
-                "    br {} ? .{} : .{}",
+                "    br.{width} {} ? .{} : .{}",
                 OperandText {
                     function,
                     operand: *cond

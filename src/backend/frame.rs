@@ -70,7 +70,7 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
     ///
     /// * `params` - the target's word size and stack alignment
     /// * `allocation` - the register allocation, whose spill slots come first
-    /// * `arrays` - element count per local array variable
+    /// * `arrays` - bytes of storage per local array variable
     /// * `addr_taken` - variables that `AddrOf` takes the address of
     ///
     /// Both collections are ordered, so a given function always produces the
@@ -95,12 +95,15 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
             addr_taken: HashMap::with_capacity(addr_taken.len()),
         };
 
-        // An array occupies `count` consecutive slots.  Element 0 goes at the
+        // An array occupies as many whole slots as its elements need: they sit
+        // packed at their own size -- four bytes for `int`, eight for `long
+        // int` -- and the array as a whole is rounded up to a slot so that
+        // everything after it stays word-aligned.  Element 0 goes at the
         // lowest address, i.e. in the last slot reserved, so that element `i`
-        // is at `element0 + i * word_size` and indexing can be folded into a
-        // single scaled-index memory operand.
-        for (&variable, &count) in arrays {
-            slots += count;
+        // is at `element0 + i * size` and indexing can be folded into a single
+        // scaled-index memory operand.
+        for (&variable, &bytes) in arrays {
+            slots += bytes.div_ceil(params.word_size as usize);
             let element_zero = layout.offset_of(slots);
             layout.arrays.insert(variable, element_zero);
         }
@@ -290,8 +293,8 @@ mod tests {
 
     #[test]
     fn array_elements_run_upward_from_the_lowest_slot() {
-        // Arrange: a three-element array and no spills.
-        let arrays = BTreeMap::from([(7, 3)]);
+        // Arrange: `long int a[3]`, twenty-four bytes, and no spills.
+        let arrays = BTreeMap::from([(7, 3 * 8)]);
 
         // Act
         let layout = layout(0, &arrays, &BTreeSet::new());
@@ -305,9 +308,25 @@ mod tests {
     }
 
     #[test]
+    fn an_array_of_ints_packs_two_elements_into_each_slot() {
+        // Arrange: `int a[3]`, twelve bytes, which is two whole slots.
+        let arrays = BTreeMap::from([(7, 3 * 4)]);
+
+        // Act
+        let layout = layout(0, &arrays, &BTreeSet::new());
+
+        // Assert: the array is rounded up to a slot boundary, so whatever is
+        // laid out after it stays word-aligned.
+        assert_eq!(
+            layout.array_base(&Operand::Var(7)),
+            -(layout.saved_bytes() + 2 * 8)
+        );
+    }
+
+    #[test]
     fn every_kind_of_frame_value_gets_its_own_space() {
-        // Arrange: one spill, one two-element array, one pinned variable.
-        let arrays = BTreeMap::from([(1, 2)]);
+        // Arrange: one spill, one array of two words, one pinned variable.
+        let arrays = BTreeMap::from([(1, 2 * 8)]);
         let pinned = BTreeSet::from([2]);
 
         // Act

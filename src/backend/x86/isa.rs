@@ -164,30 +164,40 @@ impl From<X86Register> for X86Operand {
 /// Operand types are as narrow as the hardware: `setcc` and `movzx` take
 /// registers because that is all they can encode here, and jumps take a label
 /// because nothing else is emitted.
+///
+/// An instruction that could apply to either operand size carries the
+/// [`RegisterWidth`] it applies to, which is what makes `int` arithmetic wrap
+/// where C says it does and keeps a four-byte object from being written eight
+/// bytes at a time.  The ones that are always full-word -- taking an address,
+/// pushing an argument slot -- carry none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum X86Instruction {
     /// `mov dst, src`
-    Mov(X86Operand, X86Operand),
+    Mov(RegisterWidth, X86Operand, X86Operand),
     /// `lea dst, src` -- the address of `src`, not its contents.
     Lea(X86Operand, X86Operand),
     /// `add dst, src`
-    Add(X86Operand, X86Operand),
+    Add(RegisterWidth, X86Operand, X86Operand),
     /// `sub dst, src`
-    Sub(X86Operand, X86Operand),
+    Sub(RegisterWidth, X86Operand, X86Operand),
     /// `imul dst, src` -- signed multiply.
-    Imul(X86Operand, X86Operand),
-    /// `cqo` -- sign-extend RAX into RDX:RAX, which `idiv` requires.
-    Cqo,
-    /// `idiv src` -- signed divide RDX:RAX, quotient in RAX.
-    Idiv(X86Operand),
+    Imul(RegisterWidth, X86Operand, X86Operand),
+    /// `cdq` / `cqo` -- sign-extend the accumulator into the high half of the
+    /// dividend, which `idiv` requires.
+    SignExtendAccumulator(RegisterWidth),
+    /// `idiv src` -- signed divide the accumulator pair, quotient in RAX.
+    Idiv(RegisterWidth, X86Operand),
     /// `cmp lhs, rhs` -- flags from `lhs - rhs`.
-    Cmp(X86Operand, X86Operand),
+    Cmp(RegisterWidth, X86Operand, X86Operand),
     /// `test lhs, rhs` -- flags from `lhs & rhs`.
-    Test(X86Operand, X86Operand),
+    Test(RegisterWidth, X86Operand, X86Operand),
     /// `setcc dst` -- set the low byte of `dst` from the condition.
     SetCC(ConditionCode, X86Register),
     /// `movzx dst, src` -- zero-extend `src`'s low byte into `dst`.
     Movzx(X86Register, X86Register),
+    /// `movsx dst, src` -- sign-extend `src`'s low 32 bits into the whole of
+    /// `dst`, which is how an `int` becomes a `long int`.
+    Movsx(X86Register, X86Operand),
     /// `push src`
     Push(X86Operand),
     /// `pop dst`

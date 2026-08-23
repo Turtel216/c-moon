@@ -90,9 +90,9 @@ fn compile_function<T: Target>(
 ///
 /// # Returns
 ///
-/// The element count of each array the function touches, and the variables
-/// whose address it takes.  Both are ordered so that the layout, and with it
-/// the emitted assembly, is reproducible.
+/// The bytes of storage each array the function touches needs, and the
+/// variables whose address it takes.  Both are ordered so that the layout,
+/// and with it the emitted assembly, is reproducible.
 fn frame_requirements(
     body: &LinearizedCfg,
     array_sizes: &HashMap<usize, usize>,
@@ -103,9 +103,9 @@ fn frame_requirements(
     for instr in body.instructions() {
         for operand in instruction_operands(instr) {
             if let Operand::Var(id) = operand
-                && let Some(&count) = array_sizes.get(id)
+                && let Some(&bytes) = array_sizes.get(id)
             {
-                arrays.insert(*id, count);
+                arrays.insert(*id, bytes);
             }
         }
 
