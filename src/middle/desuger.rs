@@ -740,6 +740,35 @@ impl<'a> LoweringContext<'a> {
                 dest
             }
 
+            // &arr[i] -- the address of an array element, which is where
+            // the element sits rather than where the array's name lives. The
+            // backend addresses an element in one instruction, so the index
+            // is handed to it as it stands instead of being turned into
+            // arithmetic here.
+            ExprKind::Unary(UnaryOp::AddressOf, inner)
+                if matches!(inner.kind, ExprKind::Index { .. }) =>
+            {
+                let ExprKind::Index { array, index } = &inner.kind else {
+                    unreachable!("the guard above matched an index expression")
+                };
+
+                let base_var = self.lower_expression(array);
+                let idx_op = self.lower_index(index);
+                let dest = self.fresh_temp();
+
+                // ArrayAddr: dest = &base_var[idx_op], measured in elements of
+                // the width the array holds.
+                self.emit(TACInstruction::new(
+                    Opcode::ArrayAddr,
+                    self.width_of_expr(inner),
+                    Some(dest.clone()),
+                    Some(base_var),
+                    Some(idx_op),
+                ));
+
+                dest
+            }
+
             // &x -- address-of
             ExprKind::Unary(UnaryOp::AddressOf, inner) => {
                 let inner_op = self.lower_expression(inner);

@@ -291,6 +291,9 @@ fn check_slot_widths(function: &Function, errors: &mut Vec<SsaError>) {
                 }
                 | Op::ArrayStore {
                     base: slot, width, ..
+                }
+                | Op::ArrayAddr {
+                    base: slot, width, ..
                 } => (slot, width),
 
                 // `AddrOf` hands out an address without reading or writing

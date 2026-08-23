@@ -139,6 +139,14 @@ pub enum Opcode {
     /// dest = destination, arg1 = base array var, arg2 = index
     ArrayLoad,
 
+    /// Take the address of an array element: dest = &arg1[arg2].
+    ///
+    /// The width is the array's element type, which is what scales the index
+    /// into a byte offset -- exactly as it does for an element access. The
+    /// value produced is an address, and so a full word; see
+    /// [`Opcode::result_width`].
+    ArrayAddr,
+
     /// Load a value through a pointer: dest = *arg1
     Load,
     /// Store a value through a pointer: *arg1 = arg2
@@ -170,8 +178,14 @@ impl Opcode {
     /// The width of the value this operation defines, given the width it
     /// computes at.
     pub const fn result_width(&self, width: Width) -> Width {
-        match self.is_relational() {
-            true => Width::Bits32,
+        if self.is_relational() {
+            return Width::Bits32;
+        }
+        // An address is a full word however narrow the object at it is: the
+        // width an element address carries scales its index and says nothing
+        // about the result.
+        match matches!(self, Opcode::ArrayAddr) {
+            true => Width::Bits64,
             false => width,
         }
     }
@@ -322,6 +336,14 @@ mod tests {
         // Arrange / Act / Assert
         assert_eq!(Width::Bits32.narrow(-7), -7);
         assert_eq!(Width::Bits64.narrow(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn an_element_address_is_a_full_word_however_narrow_the_element_is() {
+        // Arrange / Act / Assert: the width of `&a[i]` scales the index, so
+        // the address it produces is a machine word either way.
+        assert_eq!(Opcode::ArrayAddr.result_width(Width::Bits32), Width::Bits64);
+        assert_eq!(Opcode::ArrayAddr.result_width(Width::Bits64), Width::Bits64);
     }
 
     #[test]

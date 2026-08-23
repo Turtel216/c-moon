@@ -145,8 +145,8 @@ fn data_flow(opcode: &Opcode) -> DataFlow {
         // `dest = arg1`, `dest = *arg1`, and `dest = (width) arg1`.
         Opcode::Mov | Opcode::Load | Opcode::Convert => flow(ARG1, true),
 
-        // `dest = arg1[arg2]`.
-        Opcode::ArrayLoad => flow(BOTH_ARGS, true),
+        // `dest = arg1[arg2]` and `dest = &arg1[arg2]`.
+        Opcode::ArrayLoad | Opcode::ArrayAddr => flow(BOTH_ARGS, true),
 
         // `arg1[arg2] = ...`: `dest` names the array being written *into*,
         // so it is an input, not a definition.
@@ -226,6 +226,20 @@ mod tests {
 
         // Act / Assert
         assert!(uses(&instr).is_empty());
+        assert_eq!(instruction_def(&instr), Some(VirtualReg::Var(0)));
+    }
+
+    #[test]
+    fn taking_an_element_address_reads_the_index_and_defines_its_destination() {
+        // Arrange: `dest = &arg1[arg2]` addresses the array rather than
+        // reading it, but the index is a value like any other.
+        let instr = instruction(Opcode::ArrayAddr);
+
+        // Act / Assert
+        assert_eq!(
+            uses(&instr),
+            vec![VirtualReg::Temp("t1".to_string()), VirtualReg::Var(2)]
+        );
         assert_eq!(instruction_def(&instr), Some(VirtualReg::Var(0)));
     }
 

@@ -261,6 +261,13 @@ pub enum Op {
         value: Operand,
         width: Width,
     },
+    /// `dest = &base[index]`, where the width is the array's element type
+    /// and so what scales the index. The address itself is a full word.
+    ArrayAddr {
+        base: SlotId,
+        index: Operand,
+        width: Width,
+    },
     /// `dest = *address`, reading as much as the pointee type occupies.
     Load { address: Operand, width: Width },
     /// `*address = value`
@@ -306,7 +313,7 @@ impl Op {
             Op::Call { args, .. } => args.clone(),
             Op::GetParam(_) | Op::Undef | Op::SlotLoad { .. } | Op::AddrOf { .. } => Vec::new(),
             Op::SlotStore { value, .. } => vec![*value],
-            Op::ArrayLoad { index, .. } => vec![*index],
+            Op::ArrayLoad { index, .. } | Op::ArrayAddr { index, .. } => vec![*index],
             Op::ArrayStore { index, value, .. } => vec![*index, *value],
             Op::Load { address, .. } => vec![*address],
             Op::Store { address, value, .. } => vec![*address, *value],
@@ -326,7 +333,7 @@ impl Op {
             Op::Call { args, .. } => args.iter_mut().collect(),
             Op::GetParam(_) | Op::Undef | Op::SlotLoad { .. } | Op::AddrOf { .. } => Vec::new(),
             Op::SlotStore { value, .. } => vec![value],
-            Op::ArrayLoad { index, .. } => vec![index],
+            Op::ArrayLoad { index, .. } | Op::ArrayAddr { index, .. } => vec![index],
             Op::ArrayStore { index, value, .. } => vec![index, value],
             Op::Load { address, .. } => vec![address],
             Op::Store { address, value, .. } => vec![address, value],

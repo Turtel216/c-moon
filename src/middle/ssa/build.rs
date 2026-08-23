@@ -289,6 +289,20 @@ impl Builder {
                 );
             }
 
+            Opcode::ArrayAddr => {
+                let base = self.slot(arg(instr, &instr.arg1));
+                let index = self.operand(block, arg(instr, &instr.arg2), ADDRESS);
+                self.define(
+                    block,
+                    instr,
+                    Op::ArrayAddr {
+                        base,
+                        index,
+                        width: instr.width,
+                    },
+                );
+            }
+
             Opcode::ArrayStore => {
                 // `dest` names the array written into, which is an input.
                 let base = self.slot(arg(instr, &instr.dest));

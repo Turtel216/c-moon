@@ -53,6 +53,7 @@ impl fmt::Display for Opcode {
             Opcode::GetParam => "get_param",
             Opcode::ArrayStore => "array_store",
             Opcode::ArrayLoad => "array_load",
+            Opcode::ArrayAddr => "array_addr",
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::AddrOf => "addr_of",
@@ -163,6 +164,17 @@ impl fmt::Display for TACInstruction {
                 write!(
                     f,
                     "{} = array_load.{width} {}[{}]",
+                    format_op(&self.dest),
+                    format_op(&self.arg1),
+                    format_op(&self.arg2)
+                )
+            }
+
+            Opcode::ArrayAddr => {
+                // dest = &base[index]
+                write!(
+                    f,
+                    "{} = array_addr.{width} {}[{}]",
                     format_op(&self.dest),
                     format_op(&self.arg1),
                     format_op(&self.arg2)
@@ -371,6 +383,15 @@ impl fmt::Display for InstText<'_> {
                 write!(
                     f,
                     "array_load.{} {}[{}]",
+                    width,
+                    slot(*base),
+                    operand(*index)
+                )
+            }
+            ssa::Op::ArrayAddr { base, index, width } => {
+                write!(
+                    f,
+                    "array_addr.{} {}[{}]",
                     width,
                     slot(*base),
                     operand(*index)

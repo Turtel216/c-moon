@@ -50,6 +50,9 @@ enum Key {
     Binary(BinOp, Width, Operand, Operand),
     /// The address of a slot, which never changes within a function.
     AddrOf(SlotId),
+    /// The address of one element of a slot, which is as fixed as the slot's
+    /// own address once the index is.
+    ArrayAddr(SlotId, Operand),
     /// A merge, which is only ever congruent to another merge in the same
     /// block taking the same values along the same edges.
     Phi(BlockId, Vec<Operand>),
@@ -204,6 +207,7 @@ impl Numbering<'_> {
                 Some(Key::Binary(operator, width, lhs, rhs))
             }
             Op::AddrOf { slot } => Some(Key::AddrOf(slot)),
+            Op::ArrayAddr { base, index, .. } => Some(Key::ArrayAddr(base, self.canonical(index))),
 
             // Everything that reads memory or calls out, and the operations
             // that define nothing. Listed rather than caught by a wildcard, so
@@ -553,6 +557,66 @@ mod tests {
         // Assert
         assert_eq!(verify_ssa(&function), Ok(()));
         assert_eq!(function.block(join).phis.len(), 1);
+    }
+
+    #[test]
+    fn the_address_of_one_element_is_computed_once() {
+        // Arrange: `&a[i]` twice over. Nothing a program can do moves an
+        // element, so the second address is the first one.
+        let mut function = function();
+        let entry = function.entry();
+        let (index, _) = arguments(&mut function);
+        let base = function.slot_for(SlotOrigin::Variable(0));
+        let address = |function: &mut Function| {
+            function
+                .emit(
+                    entry,
+                    Op::ArrayAddr {
+                        base,
+                        index,
+                        width: Width::Bits32,
+                    },
+                )
+                .expect("an element address defines a value")
+        };
+        address(&mut function);
+        let second = address(&mut function);
+        function.set_terminator(entry, Terminator::Return(Some(Operand::Value(second))));
+
+        // Act
+        assert!(run(&mut function));
+
+        // Assert: two parameter reads and the one surviving address.
+        assert_eq!(verify_ssa(&function), Ok(()));
+        assert_eq!(instructions(&function, entry), 3);
+    }
+
+    #[test]
+    fn an_element_address_of_a_different_element_is_a_different_address() {
+        // Arrange: `&a[i]` and `&a[j]`, which are two elements apart.
+        let mut function = function();
+        let entry = function.entry();
+        let (first_index, second_index) = arguments(&mut function);
+        let base = function.slot_for(SlotOrigin::Variable(0));
+        let address = |function: &mut Function, index| {
+            function
+                .emit(
+                    entry,
+                    Op::ArrayAddr {
+                        base,
+                        index,
+                        width: Width::Bits32,
+                    },
+                )
+                .expect("an element address defines a value")
+        };
+        address(&mut function, first_index);
+        let second = address(&mut function, second_index);
+        function.set_terminator(entry, Terminator::Return(Some(Operand::Value(second))));
+
+        // Act / Assert
+        assert!(!run(&mut function));
+        assert_eq!(instructions(&function, entry), 4);
     }
 
     #[test]

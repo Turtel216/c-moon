@@ -161,6 +161,7 @@ impl<'a> FunctionLowering<'a> {
 
             Opcode::ArrayStore => self.lower_array_store(instr),
             Opcode::ArrayLoad => self.lower_array_load(instr),
+            Opcode::ArrayAddr => self.lower_element_address(instr),
 
             Opcode::Load => self.lower_load(instr),
             Opcode::Store => self.lower_store(instr),
@@ -498,6 +499,20 @@ impl<'a> FunctionLowering<'a> {
         let element = self.element(base, index, instr.width);
         self.define(dest, width, |lowering, result| {
             lowering.emit(X86Instruction::Mov(width, reg(result), element));
+        });
+    }
+
+    /// Lower `dest = &base[index]`.
+    ///
+    /// The address of an element is the memory operand an access to it would
+    /// have used, so `lea` computes it in a single instruction however the
+    /// index is written.
+    fn lower_element_address(&mut self, instr: &TACInstruction) {
+        let (dest, base, index) = three_operands(instr);
+
+        let element = self.element(base, index, instr.width);
+        self.define(dest, TRANSFER, |lowering, result| {
+            lowering.emit(X86Instruction::Lea(reg(result), element));
         });
     }
 

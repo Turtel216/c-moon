@@ -228,6 +228,7 @@ impl<'a> Solver<'a> {
             | Op::GetParam(_)
             | Op::SlotLoad { .. }
             | Op::ArrayLoad { .. }
+            | Op::ArrayAddr { .. }
             | Op::Load { .. }
             | Op::AddrOf { .. } => Known::Anything,
 

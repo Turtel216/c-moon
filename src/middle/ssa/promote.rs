@@ -102,7 +102,9 @@ pub fn promotable(function: &Function, array_sizes: &HashMap<VarId, usize>) -> B
 
                 // Indexed storage: several values live at one name, which a
                 // single SSA value cannot stand for.
-                Op::ArrayLoad { base, .. } | Op::ArrayStore { base, .. } => {
+                Op::ArrayLoad { base, .. }
+                | Op::ArrayStore { base, .. }
+                | Op::ArrayAddr { base, .. } => {
                     eligible.remove(base);
                 }
 

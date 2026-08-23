@@ -239,6 +239,14 @@ impl Lowering<'_> {
                 Some(self.operand(*index)),
             )),
 
+            Op::ArrayAddr { base, index, width } => out.push(TACInstruction::new(
+                Opcode::ArrayAddr,
+                *width,
+                dest,
+                Some(self.slot(*base)),
+                Some(self.operand(*index)),
+            )),
+
             Op::ArrayStore {
                 base,
                 index,
