@@ -717,6 +717,29 @@ impl<'a> LoweringContext<'a> {
                 dest
             }
 
+            // -x -- negation, which is what subtracting `x` from zero is.
+            // Written that way it needs no opcode of its own, and every pass
+            // that already knows how to fold, simplify and select a
+            // subtraction handles it as it stands.
+            ExprKind::Unary(UnaryOp::Neg, inner) => {
+                // The operand of a negation has the type of the whole
+                // expression, so this converts nothing today; it is what C
+                // says happens, and stays right if a narrower type is added.
+                let width = self.width_of_expr(expr);
+                let operand = self.lower_converted(inner, width);
+                let dest = self.fresh_temp();
+
+                self.emit(TACInstruction::new(
+                    Opcode::Sub,
+                    width,
+                    Some(dest.clone()),
+                    Some(Operand::ImmInt(0)),
+                    Some(operand),
+                ));
+
+                dest
+            }
+
             // &x -- address-of
             ExprKind::Unary(UnaryOp::AddressOf, inner) => {
                 let inner_op = self.lower_expression(inner);
