@@ -28,7 +28,8 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 *Currently targeting an MVP subset of C to establish the full pipeline:*
 * **Data Types:** `int` (32-bit), `long int` (64-bit), arrays of either, pointers.
 * **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
-* **Operators:** Arithmetic (`+`, `-`, `*`, `/`) and Relational (`==`, `!=`, `<`, `>`).
+* **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
+  and Logical (`&&`, `||`, `!`), the first two of which short-circuit.
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
@@ -40,7 +41,7 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 * [ ] Pointer arithmetic.
 * [ ] Global variables.
 * [ ] `extern` keyword and linking against GCC-compiled C programs and the standard library.
-* [ ] Remaining operators already recognized by the parser but not yet lowered (`%`, `&&`, `||`, bitwise and shift operators).
+* [ ] Remaining operators already recognized by the parser but not yet lowered (`%`, bitwise and shift operators).
 
 ## Diagnostics
 

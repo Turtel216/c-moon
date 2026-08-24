@@ -282,6 +282,11 @@ impl<'a> LoweringContext<'a> {
                 self.set_current_block(cond_label.clone());
                 let (cond, width) = self.lower_condition(condition);
 
+                // A short-circuiting condition branches on its way to a value,
+                // so the test is reached in the block the condition left off
+                // in rather than in the one it started in.
+                let cond_end = self.current_block.clone();
+
                 // if !cond -> end
                 self.emit(TACInstruction::new(
                     Opcode::BranchIfNot,
@@ -290,7 +295,7 @@ impl<'a> LoweringContext<'a> {
                     Some(cond),
                     Some(Operand::Label(end_label.clone())),
                 ));
-                self.add_edge(&cond_label, &end_label);
+                self.add_edge(&cond_end, &end_label);
 
                 // else -> body
                 self.emit(TACInstruction::transfer(
@@ -299,7 +304,7 @@ impl<'a> LoweringContext<'a> {
                     Some(Operand::Label(body_label.clone())),
                     None,
                 ));
-                self.add_edge(&cond_label, &body_label);
+                self.add_edge(&cond_end, &body_label);
 
                 // body block
                 self.set_current_block(body_label.clone());
@@ -421,6 +426,10 @@ impl<'a> LoweringContext<'a> {
                 if let Some(condition) = condition {
                     let (cond, width) = self.lower_condition(condition);
 
+                    // As in a `while`, a condition that branches on its way to
+                    // a value is tested in the block it left off in.
+                    let cond_end = self.current_block.clone();
+
                     // if !cond -> end
                     self.emit(TACInstruction::new(
                         Opcode::BranchIfNot,
@@ -429,19 +438,20 @@ impl<'a> LoweringContext<'a> {
                         Some(cond),
                         Some(Operand::Label(end_label.clone())),
                     ));
-                    self.add_edge(&cond_label, &end_label);
+                    self.add_edge(&cond_end, &end_label);
                 }
                 // An omitted condition is always true, so `for (;;)` falls
                 // straight through to the body.
 
                 // else -> body
+                let cond_end = self.current_block.clone();
                 self.emit(TACInstruction::transfer(
                     Opcode::Jump,
                     None,
                     Some(Operand::Label(body_label.clone())),
                     None,
                 ));
-                self.add_edge(&cond_label, &body_label);
+                self.add_edge(&cond_end, &body_label);
 
                 // body block, with the step at its end
                 self.set_current_block(body_label);
@@ -610,6 +620,12 @@ impl<'a> LoweringContext<'a> {
                 Operand::Var(*lhs_id)
             }
 
+            // `a && b` and `a || b`, whose right operand is evaluated only
+            // when the left one did not already settle the answer.
+            ExprKind::Binary(operator @ (BinaryOp::LogicalAnd | BinaryOp::LogicalOr), lhs, rhs) => {
+                self.lower_short_circuit(*operator, lhs, rhs)
+            }
+
             // Arithmetic + comparisons used by if/while conditions.
             ExprKind::Binary(op, lhs, rhs) => {
                 // C's usual arithmetic conversions: both operands are brought
@@ -740,6 +756,28 @@ impl<'a> LoweringContext<'a> {
                 dest
             }
 
+            // !x -- one when `x` is zero and zero otherwise, which is exactly
+            // what comparing it against zero answers. Like a negation it needs
+            // no opcode of its own, so every pass that already folds and
+            // selects an equality handles it as it stands.
+            ExprKind::Unary(UnaryOp::Not, inner) => {
+                // The comparison is made at the operand's own width; the
+                // answer is the 0 or 1 of an `int` however wide that was.
+                let width = self.width_of_expr(inner);
+                let operand = self.lower_expression(inner);
+                let dest = self.fresh_temp();
+
+                self.emit(TACInstruction::new(
+                    Opcode::Eq,
+                    width,
+                    Some(dest.clone()),
+                    Some(operand),
+                    Some(Operand::ImmInt(0)),
+                ));
+
+                dest
+            }
+
             // &arr[i] -- the address of an array element, which is where
             // the element sits rather than where the array's name lives. The
             // backend addresses an element in one instruction, so the index
@@ -827,6 +865,124 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    /// Lower `lhs && rhs` or `lhs || rhs`.
+    ///
+    /// Both operators leave the right operand unevaluated when the left one
+    /// already settles the answer, so neither can be a single instruction: the
+    /// right operand needs a block of its own that the left one may jump past.
+    /// The result is the 0 or 1 of an `int`, which is why the right operand is
+    /// compared against zero unless it already answers with one -- see
+    /// [`answers_zero_or_one`].
+    ///
+    /// ```text
+    ///     <lhs>                        <lhs>
+    ///     t = 0                        t = 1
+    ///     if !lhs goto and_end         if lhs goto or_end
+    ///     goto and_rhs                 goto or_rhs
+    ///   and_rhs:                     or_rhs:
+    ///     <rhs>                        <rhs>
+    ///     t = rhs != 0                 t = rhs != 0
+    ///     goto and_end                 goto or_end
+    ///   and_end:                     or_end:
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `operator` - [`BinaryOp::LogicalAnd`] or [`BinaryOp::LogicalOr`]
+    /// * `lhs` - the left operand, always evaluated
+    /// * `rhs` - the right operand, evaluated only when the left one leaves
+    ///   the answer open
+    ///
+    /// # Returns
+    ///
+    /// The temporary holding the operator's value, in the block control
+    /// reaches whichever way it went.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `operator` is any other binary operator.
+    fn lower_short_circuit(&mut self, operator: BinaryOp, lhs: &Expr, rhs: &Expr) -> Operand {
+        // Which left operand settles the answer, what the answer is then, and
+        // what to call the blocks: `&&` stops at a false operand and is worth
+        // 0, `||` stops at a true one and is worth 1.
+        let (settles, settled_value, prefix) = match operator {
+            BinaryOp::LogicalAnd => (Opcode::BranchIfNot, 0, "and"),
+            BinaryOp::LogicalOr => (Opcode::BranchIf, 1, "or"),
+            other => panic!("Compiler Bug: {:?} does not short-circuit", other),
+        };
+
+        let rhs_label = self.create_block(&format!("{prefix}_rhs"));
+        let end_label = self.create_block(&format!("{prefix}_end"));
+
+        let left_width = self.width_of_expr(lhs);
+        let left = self.lower_expression(lhs);
+
+        // The value the operator has when the left operand settles it, written
+        // before the branch so that the path skipping the right operand
+        // carries an answer. The result of a logical operator is an `int`.
+        let result = self.fresh_temp();
+        self.emit(TACInstruction::new(
+            Opcode::Mov,
+            Width::Bits32,
+            Some(result.clone()),
+            Some(Operand::ImmInt(settled_value)),
+            None,
+        ));
+
+        // Lowering the left operand may itself have branched, so the block the
+        // test belongs to is the one it left off in rather than the one it
+        // started in.
+        let tested = self.current_block.clone();
+        self.emit(TACInstruction::new(
+            settles,
+            left_width,
+            None,
+            Some(left),
+            Some(Operand::Label(end_label.clone())),
+        ));
+        self.add_edge(&tested, &end_label);
+
+        self.emit(TACInstruction::transfer(
+            Opcode::Jump,
+            None,
+            Some(Operand::Label(rhs_label.clone())),
+            None,
+        ));
+        self.add_edge(&tested, &rhs_label);
+
+        // Otherwise the answer is whether the right operand is non-zero,
+        // which an operand that already answers 0 or 1 says by itself.
+        self.set_current_block(rhs_label);
+        let (opcode, width, zero) = match answers_zero_or_one(rhs) {
+            true => (Opcode::Mov, Width::Bits32, None),
+            false => (
+                Opcode::Neq,
+                self.width_of_expr(rhs),
+                Some(Operand::ImmInt(0)),
+            ),
+        };
+        let right = self.lower_expression(rhs);
+        self.emit(TACInstruction::new(
+            opcode,
+            width,
+            Some(result.clone()),
+            Some(right),
+            zero,
+        ));
+
+        let rhs_end = self.current_block.clone();
+        self.emit(TACInstruction::transfer(
+            Opcode::Jump,
+            None,
+            Some(Operand::Label(end_label.clone())),
+            None,
+        ));
+        self.add_edge(&rhs_end, &end_label);
+
+        self.set_current_block(end_label);
+        result
+    }
+
     /// Lower a subscript, which addresses memory and is therefore needed at
     /// full width however narrow the index expression's own type is.
     fn lower_index(&mut self, index: &Expr) -> Operand {
@@ -838,6 +994,44 @@ impl<'a> LoweringContext<'a> {
             ExprKind::Identifier(_) => expr.id,
             _ => panic!("Expected assignable identifier lvalue, got {:?}", expr.kind),
         }
+    }
+}
+
+/// Whether `expr` already evaluates to the 0 or 1 a logical operator answers
+/// with, so that comparing it against zero would say nothing new.
+///
+/// Only the operators that C defines to yield 0 or 1 qualify. Anything else
+/// answers conservatively: a `false` here costs one comparison, where a
+/// wrongly optimistic `true` would let `a && 2` be 2.
+///
+/// # Examples
+///
+/// ```text
+/// b < c   ->  true, so `a && b < c` is the comparison itself
+/// f()     ->  false, so `a && f()` compares the returned value against zero
+/// ```
+fn answers_zero_or_one(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Binary(operator, _, _) => matches!(
+            operator,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Lte
+                | BinaryOp::Gt
+                | BinaryOp::Gte
+                | BinaryOp::LogicalAnd
+                | BinaryOp::LogicalOr
+        ),
+        ExprKind::Unary(operator, _) => *operator == UnaryOp::Not,
+        // Everything else may evaluate to any value at all.
+        ExprKind::Literal(_)
+        | ExprKind::Identifier(_)
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::MemberAccess { .. }
+        | ExprKind::Cast(_, _)
+        | ExprKind::SizeOf(_) => false,
     }
 }
 
