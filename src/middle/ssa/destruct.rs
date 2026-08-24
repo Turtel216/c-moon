@@ -173,8 +173,16 @@ impl Lowering<'_> {
                 None,
             )),
 
-            Op::Convert { to, value } => out.push(TACInstruction::new(
-                Opcode::Convert,
+            Op::Convert {
+                from,
+                sign,
+                to,
+                value,
+            } => out.push(TACInstruction::new(
+                Opcode::Convert {
+                    from: *from,
+                    sign: *sign,
+                },
                 *to,
                 dest,
                 Some(self.operand(*value)),
@@ -518,13 +526,13 @@ fn binary_opcode(operator: BinOp) -> Opcode {
         BinOp::Add => Opcode::Add,
         BinOp::Sub => Opcode::Sub,
         BinOp::Mul => Opcode::Mul,
-        BinOp::Div => Opcode::Div,
+        BinOp::Div(sign) => Opcode::Div(sign),
         BinOp::Eq => Opcode::Eq,
         BinOp::Neq => Opcode::Neq,
-        BinOp::Lt => Opcode::Lt,
-        BinOp::Lte => Opcode::Lte,
-        BinOp::Gt => Opcode::Gt,
-        BinOp::Gte => Opcode::Gte,
+        BinOp::Lt(sign) => Opcode::Lt(sign),
+        BinOp::Lte(sign) => Opcode::Lte(sign),
+        BinOp::Gt(sign) => Opcode::Gt(sign),
+        BinOp::Gte(sign) => Opcode::Gte(sign),
     }
 }
 

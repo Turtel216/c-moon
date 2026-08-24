@@ -1,0 +1,7 @@
+error[E0102]: expected `char`, `int` or `long`, found `float`
+ --> $DIR/unsigned-non-integer.c:4:14
+  |
+4 |     unsigned float ratio;
+  |              ^^^^^ expected `char`, `int` or `long`
+
+error: aborting due to 1 previous error

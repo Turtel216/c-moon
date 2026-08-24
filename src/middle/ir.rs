@@ -8,14 +8,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use crate::frontend::ast::Sign;
+
 // ### TAC IR ###
 
 /// How many bits of a value an operation is defined on.
 ///
-/// C's integer types are not all the machine word: an `int` is 32 bits wide
-/// and a `long int` is 64, so `a + b` wraps at a different place depending on
-/// which one it adds. The IR therefore records the width every operation
-/// computes at, and the backend selects the instruction that matches.
+/// C's integer types are not all the machine word: a `char` is 8 bits wide,
+/// an `int` 32 and a `long int` 64, so `a + b` wraps at a different place
+/// depending on which one it adds. The IR therefore records the width every
+/// operation computes at, and the backend selects the instruction that
+/// matches.
 ///
 /// Only the low `bits` of a value are ever meaningful. Anything above them is
 /// whatever the last instruction to write the register happened to leave
@@ -23,6 +26,8 @@ use std::fmt;
 /// is exactly what carrying the width on the instruction guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Width {
+    /// 8 bits: the width of `char`.
+    Bits8,
     /// 32 bits: the width of `int`.
     Bits32,
     /// 64 bits: the width of `long int`, of every pointer, and of an address.
@@ -33,6 +38,7 @@ impl Width {
     /// How many bytes a value of this width occupies.
     pub const fn bytes(self) -> i32 {
         match self {
+            Width::Bits8 => 1,
             Width::Bits32 => 4,
             Width::Bits64 => 8,
         }
@@ -45,16 +51,63 @@ impl Width {
     /// the same value, which is what lets a fold at one width be compared
     /// against a constant of the other without further conversion.
     ///
+    /// Sign-extended, and not zero-extended, because every integer type this
+    /// compiler has is signed -- plain `char` included, as the System V
+    /// x86-64 ABI defines it.
+    ///
     /// # Examples
     ///
     /// ```
     /// assert_eq!(Width::Bits32.narrow(i64::from(i32::MAX) + 1), i64::from(i32::MIN));
+    /// assert_eq!(Width::Bits8.narrow(321), 65);
     /// assert_eq!(Width::Bits64.narrow(i64::MAX), i64::MAX);
     /// ```
     pub const fn narrow(self, constant: i64) -> i64 {
         match self {
+            Width::Bits8 => constant as i8 as i64,
             Width::Bits32 => constant as i32 as i64,
             Width::Bits64 => constant,
+        }
+    }
+
+    /// The low bits of `constant` read as an unsigned number.
+    ///
+    /// Constants are stored the way [`Width::narrow`] leaves them -- the low
+    /// bits, sign-extended -- because that is one representation for one bit
+    /// pattern. An unsigned operation reads the same pattern differently, and
+    /// this is that reading: the `-1` an `unsigned int` is stored as is the
+    /// 4294967295 an unsigned comparison or division has to see.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(Width::Bits8.unsigned(-1), 255);
+    /// assert_eq!(Width::Bits32.unsigned(-1), 4294967295);
+    /// ```
+    pub const fn unsigned(self, constant: i64) -> u64 {
+        match self {
+            Width::Bits8 => constant as u8 as u64,
+            Width::Bits32 => constant as u32 as u64,
+            Width::Bits64 => constant as u64,
+        }
+    }
+
+    /// The value of the low bits of `constant` when read with `sign`.
+    ///
+    /// This is what a widening conversion of a constant computes: the source's
+    /// signedness decides whether the bits above it are copies of its top one
+    /// or zeroes, exactly as `movsx` and `movzx` decide it at run time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(Width::Bits8.read(Sign::Signed, 255), -1);
+    /// assert_eq!(Width::Bits8.read(Sign::Unsigned, 255), 255);
+    /// ```
+    pub const fn read(self, sign: Sign, constant: i64) -> i64 {
+        match sign {
+            Sign::Signed => self.narrow(constant),
+            Sign::Unsigned => self.unsigned(constant) as i64,
         }
     }
 }
@@ -63,6 +116,7 @@ impl fmt::Display for Width {
     /// Writes the width in bits, e.g. the `32` of `add.32`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Width::Bits8 => write!(f, "8"),
             Width::Bits32 => write!(f, "32"),
             Width::Bits64 => write!(f, "64"),
         }
@@ -83,7 +137,7 @@ pub enum Operand {
 }
 
 /// TAC Opcode
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
     // Arithmetic
     /// TAC Addition e.g. %r1 + %r2
@@ -93,7 +147,11 @@ pub enum Opcode {
     /// TAC Multiplication e.g. %r1 * %r2
     Mul,
     /// TAC Divition e.g. %r1 / %r2
-    Div,
+    ///
+    /// The one arithmetic operation whose answer depends on how its operands
+    /// read: `-2 / 1` is -2 signed and a very large number unsigned, where an
+    /// addition of the same bits gives the same bits either way.
+    Div(Sign),
 
     // Relational / equality (result is 0/1)
     /// TAC Equalality e.g. %r1 == %r2
@@ -101,13 +159,13 @@ pub enum Opcode {
     /// TAC e.g. %r1 != %r2
     Neq,
     /// TAC Less then operator e.g. %r1 < %r2
-    Lt,
+    Lt(Sign),
     /// TAC Lees then or equal operator e.g. %r1 <= %r2
-    Lte,
+    Lte(Sign),
     /// TAC Greater then operator e.g. %r1 > %r2
-    Gt,
+    Gt(Sign),
     /// TAC Greater then or equal operator e.g. %r1 >= %r2
-    Gte,
+    Gte(Sign),
 
     // Data movement
     /// TAC Move operator e.g. dest = arg1
@@ -156,10 +214,13 @@ pub enum Opcode {
 
     /// Convert a value to another integer width: dest = (width) arg1.
     ///
-    /// The instruction's width is the width of the *result*; the operand is
-    /// the other one, there being only two. Widening sign-extends, because
-    /// both `int` and `long int` are signed; narrowing keeps the low bits.
-    Convert,
+    /// The instruction's width is the width of the *result*, and `from` is
+    /// the width the operand is read at -- both are needed, there being three
+    /// integer widths and no way to infer one from the other. `sign` is the
+    /// operand's, which decides what a widening puts above it: copies of its
+    /// top bit for a signed operand, zeroes for an unsigned one. Narrowing
+    /// keeps the low bits and asks nothing.
+    Convert { from: Width, sign: Sign },
 }
 
 impl Opcode {
@@ -171,7 +232,12 @@ impl Opcode {
     pub const fn is_relational(&self) -> bool {
         matches!(
             self,
-            Opcode::Eq | Opcode::Neq | Opcode::Lt | Opcode::Lte | Opcode::Gt | Opcode::Gte
+            Opcode::Eq
+                | Opcode::Neq
+                | Opcode::Lt(_)
+                | Opcode::Lte(_)
+                | Opcode::Gt(_)
+                | Opcode::Gte(_)
         )
     }
 
@@ -329,6 +395,10 @@ mod tests {
         );
         // A value that differs from 2 only above bit 32 arrives as 2.
         assert_eq!(Width::Bits32.narrow(4294967298), 2);
+        // `(char)321` keeps the low eight bits, which say 65.
+        assert_eq!(Width::Bits8.narrow(321), 65);
+        // A plain `char` is signed, so the top bit of the byte is the sign.
+        assert_eq!(Width::Bits8.narrow(255), -1);
     }
 
     #[test]
@@ -350,14 +420,32 @@ mod tests {
     fn a_comparison_answers_with_an_int_however_wide_its_operands_are() {
         // Arrange / Act / Assert: `a < b` on two `long int`s is still an
         // `int`, while the arithmetic keeps the width it computed at.
-        assert_eq!(Opcode::Lt.result_width(Width::Bits64), Width::Bits32);
+        assert_eq!(
+            Opcode::Lt(Sign::Signed).result_width(Width::Bits64),
+            Width::Bits32
+        );
         assert_eq!(Opcode::Add.result_width(Width::Bits64), Width::Bits64);
         assert_eq!(Opcode::Add.result_width(Width::Bits32), Width::Bits32);
     }
 
     #[test]
+    fn one_bit_pattern_reads_two_ways() {
+        // Arrange / Act / Assert: the byte an `unsigned char` holds 255 in is
+        // the byte a plain `char` holds -1 in.
+        assert_eq!(Width::Bits8.narrow(255), -1);
+        assert_eq!(Width::Bits8.unsigned(255), 255);
+        assert_eq!(Width::Bits8.read(Sign::Signed, 255), -1);
+        assert_eq!(Width::Bits8.read(Sign::Unsigned, 255), 255);
+        // A 64-bit value has nowhere wider to be read into, so both readings
+        // are the same bits.
+        assert_eq!(Width::Bits64.read(Sign::Unsigned, -1), -1);
+        assert_eq!(Width::Bits32.unsigned(-1), 4294967295);
+    }
+
+    #[test]
     fn a_width_is_as_many_bytes_as_the_type_it_stands_for() {
         // Arrange / Act / Assert
+        assert_eq!(Width::Bits8.bytes(), 1);
         assert_eq!(Width::Bits32.bytes(), 4);
         assert_eq!(Width::Bits64.bytes(), 8);
     }

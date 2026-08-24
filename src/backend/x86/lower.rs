@@ -15,11 +15,11 @@
 //! # Widths
 //!
 //! A value is only as wide as its C type: an `int` occupies the low 32 bits of
-//! wherever it lives and nothing is promised about the rest.  Every
-//! instruction that computes or touches memory therefore takes its width from
-//! the TAC instruction being lowered, which is what makes `int` arithmetic
-//! wrap at 32 bits the way the language says and keeps a four-byte object from
-//! being written eight bytes at a time.
+//! wherever it lives, a `char` the low 8, and nothing is promised about the
+//! rest.  Every instruction that computes or touches memory therefore takes
+//! its width from the TAC instruction being lowered, which is what makes `int`
+//! arithmetic wrap at 32 bits the way the language says and keeps a one-byte
+//! object from being written four bytes at a time.
 //!
 //! Where a value is only being carried from one home to another and the TAC
 //! says nothing about how wide it is -- shuffling arguments into their ABI
@@ -33,13 +33,13 @@ use std::collections::HashSet;
 use crate::backend::frame::{FrameLayout, Home};
 use crate::backend::linear::LinearizedCfg;
 use crate::backend::x86::abi::{
-    self, ARGUMENT_REGISTERS, FRAME_POINTER, RETURN_VALUE, SCRATCH, SCRATCH2, STACK_POINTER,
-    WORD_SIZE,
+    self, ARGUMENT_REGISTERS, DIVIDEND_HIGH, FRAME_POINTER, RETURN_VALUE, SCRATCH, SCRATCH2,
+    STACK_POINTER, WORD_SIZE,
 };
 use crate::backend::x86::isa::{
     ConditionCode, RegisterWidth, X86Function, X86Instruction, X86Operand, X86Register,
 };
-use crate::middle::ir::{Opcode, Operand, TACInstruction, Width};
+use crate::middle::ir::{Opcode, Operand, Sign, TACInstruction, Width};
 
 /// The width a plain move between homes is done at.
 ///
@@ -50,6 +50,7 @@ const TRANSFER: RegisterWidth = RegisterWidth::Quad;
 /// The x86 view of an IR width.
 const fn view(width: Width) -> RegisterWidth {
     match width {
+        Width::Bits8 => RegisterWidth::Byte,
         Width::Bits32 => RegisterWidth::Double,
         Width::Bits64 => RegisterWidth::Quad,
     }
@@ -130,17 +131,27 @@ impl<'a> FunctionLowering<'a> {
             Opcode::Add => self.lower_binary(instr, X86Instruction::Add),
             Opcode::Sub => self.lower_binary(instr, X86Instruction::Sub),
             Opcode::Mul => self.lower_binary(instr, X86Instruction::Imul),
-            Opcode::Div => self.lower_division(instr),
+            Opcode::Div(sign) => self.lower_division(instr, sign),
 
+            // An equality reads no more than whether two bit patterns are the
+            // same; an ordering has a condition code per signedness.
             Opcode::Eq => self.lower_comparison(instr, ConditionCode::E),
             Opcode::Neq => self.lower_comparison(instr, ConditionCode::Ne),
-            Opcode::Lt => self.lower_comparison(instr, ConditionCode::L),
-            Opcode::Lte => self.lower_comparison(instr, ConditionCode::Le),
-            Opcode::Gt => self.lower_comparison(instr, ConditionCode::G),
-            Opcode::Gte => self.lower_comparison(instr, ConditionCode::Ge),
+            Opcode::Lt(sign) => {
+                self.lower_comparison(instr, ordering(sign, ConditionCode::L, ConditionCode::B))
+            }
+            Opcode::Lte(sign) => {
+                self.lower_comparison(instr, ordering(sign, ConditionCode::Le, ConditionCode::Be))
+            }
+            Opcode::Gt(sign) => {
+                self.lower_comparison(instr, ordering(sign, ConditionCode::G, ConditionCode::A))
+            }
+            Opcode::Gte(sign) => {
+                self.lower_comparison(instr, ordering(sign, ConditionCode::Ge, ConditionCode::Ae))
+            }
 
             Opcode::Mov => self.lower_move(instr),
-            Opcode::Convert => self.lower_convert(instr),
+            Opcode::Convert { from, sign } => self.lower_convert(instr, from, sign),
             Opcode::Jump => {
                 let target = branch_target(instr.arg1.as_ref());
                 self.emit(X86Instruction::Jmp(target));
@@ -255,22 +266,42 @@ impl<'a> FunctionLowering<'a> {
 
     /// Lower `dest = lhs / rhs`.
     ///
-    /// `idiv` is fixed to RDX:RAX, so the dividend is moved into RAX and
-    /// sign-extended before the divide, and the quotient copied out of RAX
-    /// afterwards.
-    fn lower_division(&mut self, instr: &TACInstruction) {
+    /// Both divides are fixed to RDX:RAX, so the dividend is moved into RAX
+    /// and the high half of the pair filled in before the divide, and the
+    /// quotient copied out of RAX afterwards. Filling the high half is where
+    /// the two differ: a signed divide extends the dividend's sign into it,
+    /// an unsigned one clears it.
+    ///
+    /// # Arguments
+    ///
+    /// * `instr` - the division
+    /// * `sign` - how the operands read, which picks the instruction
+    fn lower_division(&mut self, instr: &TACInstruction, sign: Sign) {
         let (dest, lhs, rhs) = three_operands(instr);
         let width = view(instr.width);
 
         self.move_into(lhs, RETURN_VALUE, width);
-        self.emit(X86Instruction::SignExtendAccumulator(width));
+        match sign {
+            Sign::Signed => self.emit(X86Instruction::SignExtendAccumulator(width)),
+            // Writing the low 32 bits of a register clears the rest of it, so
+            // one instruction clears the high half at either width.
+            Sign::Unsigned => self.emit(X86Instruction::Mov(
+                RegisterWidth::Double,
+                reg(DIVIDEND_HIGH),
+                X86Operand::Imm(0),
+            )),
+        }
 
-        // `idiv` divides by a register or memory operand, never an immediate.
+        // A divide divides by a register or memory operand, never an
+        // immediate.
         let divisor = match self.in_place(rhs) {
             immediate @ X86Operand::Imm(_) => reg(self.ensure_register(immediate, SCRATCH2)),
             other => other,
         };
-        self.emit(X86Instruction::Idiv(width, divisor));
+        self.emit(match sign {
+            Sign::Signed => X86Instruction::Idiv(width, divisor),
+            Sign::Unsigned => X86Instruction::Div(width, divisor),
+        });
 
         self.define(dest, width, |lowering, result| {
             lowering.copy(RETURN_VALUE, result)
@@ -294,7 +325,12 @@ impl<'a> FunctionLowering<'a> {
             // `setcc` writes one byte and leaves the rest of the register
             // untouched, so `movzx` from that byte supplies the zeroes.
             lowering.emit(X86Instruction::SetCC(condition, RETURN_VALUE));
-            lowering.emit(X86Instruction::Movzx(result, RETURN_VALUE));
+            lowering.emit(X86Instruction::Movzx {
+                to: RegisterWidth::Double,
+                from: RegisterWidth::Byte,
+                destination: result,
+                source: reg(RETURN_VALUE),
+            });
         });
     }
 
@@ -319,30 +355,61 @@ impl<'a> FunctionLowering<'a> {
         });
     }
 
-    /// Lower `dest = (width) source`, the conversion between `int` and
-    /// `long int`.
+    /// Lower `dest = (width) source`, the conversion between two integer
+    /// widths.
     ///
-    /// Widening has to sign-extend, because both types are signed and only the
-    /// low 32 bits of the source say anything.  Narrowing is a 32-bit move:
-    /// writing a register's low half is exactly what dropping the high half
-    /// means here, since nothing may read an `int` any wider than that.
-    fn lower_convert(&mut self, instr: &TACInstruction) {
+    /// Widening has to manufacture the bits above the source, since only its
+    /// low `from` bits say anything: copies of its top bit when it is signed
+    /// -- a plain `char` included, as the System V ABI defines it -- and
+    /// zeroes when it is not.  Narrowing is a move at the narrower width:
+    /// writing a register's low half, or its low byte, is exactly what
+    /// dropping what sits above it means, since nothing may read the result
+    /// any wider than that.
+    ///
+    /// # Arguments
+    ///
+    /// * `instr` - the conversion, whose width is the one converted *to*
+    /// * `from` - the width the source is read at
+    /// * `sign` - how the source reads, which decides what a widening adds
+    fn lower_convert(&mut self, instr: &TACInstruction, from: Width, sign: Sign) {
         let (dest, source) = two_operands(instr);
         let to = view(instr.width);
+        let widening = instr.width.bytes() > from.bytes();
 
         self.define(dest, to, |lowering, result| {
             match lowering.in_place(source) {
-                // A literal is already held sign-extended, so converting one
-                // is a matter of writing down the value it takes at the new
-                // width -- and `movsx` could not have read it anyway.
+                // A literal is a bit pattern the compiler can read for itself,
+                // so converting one is a matter of writing down the value it
+                // takes at the new width -- and no extending move could have
+                // read it anyway.
                 X86Operand::Imm(constant) => {
-                    let converted = X86Operand::Imm(instr.width.narrow(constant));
+                    let converted = X86Operand::Imm(instr.width.narrow(from.read(sign, constant)));
                     lowering.emit(X86Instruction::Mov(to, reg(result), converted));
                 }
-                value => match to {
-                    RegisterWidth::Quad => lowering.emit(X86Instruction::Movsx(result, value)),
-                    narrower => lowering.emit(X86Instruction::Mov(narrower, reg(result), value)),
-                },
+                value if !widening => {
+                    lowering.emit(X86Instruction::Mov(to, reg(result), value));
+                }
+                value => {
+                    match sign {
+                        Sign::Signed => lowering.emit(X86Instruction::Movsx {
+                            to,
+                            from: view(from),
+                            destination: result,
+                            source: value,
+                        }),
+                        // Writing 32 bits of a register clears the other 32, so a
+                        // 32-bit move is already the zero-extending one.
+                        Sign::Unsigned if from == Width::Bits32 => lowering.emit(
+                            X86Instruction::Mov(RegisterWidth::Double, reg(result), value),
+                        ),
+                        Sign::Unsigned => lowering.emit(X86Instruction::Movzx {
+                            to,
+                            from: view(from),
+                            destination: result,
+                            source: value,
+                        }),
+                    }
+                }
             }
         });
     }
@@ -786,6 +853,24 @@ impl<'a> FunctionLowering<'a> {
 }
 
 // ### Free helpers ###
+
+/// The condition code an ordering is answered by.
+///
+/// x86 has one for each way the operands can read -- `setl` against `setb`,
+/// `jge` against `jae` -- because a signed ordering is decided by the sign and
+/// overflow flags and an unsigned one by the carry flag.
+///
+/// # Arguments
+///
+/// * `sign` - how the operands read
+/// * `signed` - the condition to use when they are signed, e.g. `L`
+/// * `unsigned` - the condition to use when they are not, e.g. `B`
+const fn ordering(sign: Sign, signed: ConditionCode, unsigned: ConditionCode) -> ConditionCode {
+    match sign {
+        Sign::Signed => signed,
+        Sign::Unsigned => unsigned,
+    }
+}
 
 /// A register as an operand.
 const fn reg(register: X86Register) -> X86Operand {

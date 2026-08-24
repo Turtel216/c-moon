@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use crate::frontend::ast::Sign;
 use crate::frontend::ast::{
     BinaryOp, BlockItem, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, Stmt, StmtKind, UnaryOp,
 };
@@ -23,8 +24,8 @@ pub struct ProgramIr {
     /// Used by the backend to allocate stack space.
     ///
     /// Bytes rather than elements because the element type decides how many
-    /// each one takes: `int a[3]` is twelve bytes and `long int a[3]` is
-    /// twenty-four.
+    /// each one takes: `char a[3]` is three bytes, `int a[3]` twelve and
+    /// `long int a[3]` twenty-four.
     pub array_sizes: HashMap<usize, usize>,
     /// Maps variable id → the name it was declared with, for IR dumps.
     pub var_names: HashMap<usize, String>,
@@ -481,6 +482,11 @@ impl<'a> LoweringContext<'a> {
         width_of(self.types.expr(expr.id))
     }
 
+    /// How the bits of the value `expr` produces read.
+    fn sign_of_expr(&self, expr: &Expr) -> Sign {
+        sign_of(self.types.expr(expr.id))
+    }
+
     /// Lower a controlling expression.
     ///
     /// # Returns
@@ -495,29 +501,36 @@ impl<'a> LoweringContext<'a> {
     /// Lower `expr` and convert its value to `target`, as C converts it when
     /// it is assigned, passed or returned somewhere of that width.
     fn lower_converted(&mut self, expr: &Expr, target: Width) -> Operand {
-        let from = self.width_of_expr(expr);
+        let (from, sign) = (self.width_of_expr(expr), self.sign_of_expr(expr));
         let value = self.lower_expression(expr);
-        self.convert(value, from, target)
+        self.convert(value, from, sign, target)
     }
 
     /// Emit the conversion of `value` from one integer width to another.
     ///
     /// Converting a value to the width it already has is what most of the
     /// program does, so that case emits nothing at all.
-    fn convert(&mut self, value: Operand, from: Width, to: Width) -> Operand {
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - what to convert
+    /// * `from` - the width it is held at
+    /// * `sign` - how its bits read, which is what a widening puts above them
+    /// * `to` - the width to produce
+    fn convert(&mut self, value: Operand, from: Width, sign: Sign, to: Width) -> Operand {
         if from == to {
             return value;
         }
-        // A literal travels through the IR sign-extended, so its conversion is
-        // a matter of writing it down differently rather than of running an
-        // instruction.
+        // A literal is a bit pattern the compiler can read for itself, so its
+        // conversion is a matter of writing it down differently rather than of
+        // running an instruction.
         if let Operand::ImmInt(constant) = value {
-            return Operand::ImmInt(to.narrow(constant));
+            return Operand::ImmInt(to.narrow(from.read(sign, constant)));
         }
 
         let dest = self.fresh_temp();
         self.emit(TACInstruction::new(
-            Opcode::Convert,
+            Opcode::Convert { from, sign },
             to,
             Some(dest.clone()),
             Some(value),
@@ -528,7 +541,15 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_expression(&mut self, expr: &Expr) -> Operand {
         match &expr.kind {
-            ExprKind::Literal(Literal::Int(v)) => Operand::ImmInt(*v),
+            // Constants travel through the IR as the bit pattern they name,
+            // which is what a literal too large for an `i64` -- and so of
+            // type `unsigned long int` -- is held as.
+            ExprKind::Literal(Literal::Int(v)) => Operand::ImmInt(*v as i64),
+
+            // A character constant is an `int` whose value is the character's
+            // (see `SemanticAnalyzer::literal_type`), sign-extended because a
+            // plain `char` is signed: `'\xff'` is -1, as it is to GCC.
+            ExprKind::Literal(Literal::Char(c)) => Operand::ImmInt(i64::from(*c as i8)),
 
             ExprKind::Identifier(_) => {
                 let idf_id = self
@@ -634,22 +655,26 @@ impl<'a> LoweringContext<'a> {
                 // -- its result is the 0 or 1 of an `int` -- which is why the
                 // width recorded here is the one the operands are compared at.
                 let types = self.types;
-                let width = width_of(&Type::common(types.expr(lhs.id), types.expr(rhs.id)));
+                let common = Type::common(types.expr(lhs.id), types.expr(rhs.id));
+                let (width, sign) = (width_of(&common), sign_of(&common));
                 let l = self.lower_converted(lhs, width);
                 let r = self.lower_converted(rhs, width);
                 let t = self.fresh_temp();
 
+                // The operations that read the operands' bits rather than just
+                // moving them carry the signedness of the type both were
+                // converted to; the rest give the same answer either way.
                 let opcode = match op {
                     BinaryOp::Add => Opcode::Add,
                     BinaryOp::Sub => Opcode::Sub,
                     BinaryOp::Mul => Opcode::Mul,
-                    BinaryOp::Div => Opcode::Div,
+                    BinaryOp::Div => Opcode::Div(sign),
                     BinaryOp::Eq => Opcode::Eq,
                     BinaryOp::Neq => Opcode::Neq,
-                    BinaryOp::Lt => Opcode::Lt,
-                    BinaryOp::Lte => Opcode::Lte,
-                    BinaryOp::Gt => Opcode::Gt,
-                    BinaryOp::Gte => Opcode::Gte,
+                    BinaryOp::Lt => Opcode::Lt(sign),
+                    BinaryOp::Lte => Opcode::Lte(sign),
+                    BinaryOp::Gt => Opcode::Gt(sign),
+                    BinaryOp::Gte => Opcode::Gte(sign),
                     _ => panic!("Binary op {:?} not supported in this lowering phase", op),
                 };
 
@@ -1037,14 +1062,67 @@ fn answers_zero_or_one(expr: &Expr) -> bool {
 
 /// The machine width a value of type `ty` is held at.
 ///
-/// An `int` is the one narrow type there is; everything else the compiler can
+/// `char` and `int` are the narrow types; everything else the compiler can
 /// lower -- `long int`, a pointer, the address an array name decays to -- is a
 /// full machine word. `void` never holds anything, and is given the width a
 /// plain copy uses so that a call to a void function still has a destination
 /// the backend can name.
 pub fn width_of(ty: &Type) -> Width {
     match ty {
-        Type::Int => Width::Bits32,
-        Type::Long | Type::Pointer(_) | Type::Array(_, _) | Type::Void => Width::Bits64,
+        Type::Char(_) => Width::Bits8,
+        Type::Int(_) => Width::Bits32,
+        Type::Long(_) | Type::Pointer(_) | Type::Array(_, _) | Type::Void => Width::Bits64,
+    }
+}
+
+/// How the bits of a value of type `ty` read.
+///
+/// This is what decides between the two instructions wherever the machine has
+/// one of each: a widening that sign-extends or one that fills with zeroes, a
+/// signed or an unsigned division, a signed or an unsigned comparison.
+///
+/// An address is unsigned -- there is no such thing as a negative one -- and
+/// so are the array and pointer types that produce one. `void` holds nothing
+/// to read either way.
+pub fn sign_of(ty: &Type) -> Sign {
+    match ty {
+        Type::Char(sign) | Type::Int(sign) | Type::Long(sign) => *sign,
+        Type::Pointer(_) | Type::Array(_, _) | Type::Void => Sign::Unsigned,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_type_is_held_at_the_width_its_size_calls_for() {
+        // Arrange / Act / Assert: `sizeof(char)` is 1 and `sizeof(int)` is 4,
+        // which is what makes a `char` array pack one element per byte. An
+        // `unsigned` type is exactly as wide as its signed counterpart.
+        assert_eq!(width_of(&Type::Char(Sign::Signed)).bytes(), 1);
+        assert_eq!(width_of(&Type::Char(Sign::Unsigned)).bytes(), 1);
+        assert_eq!(width_of(&Type::INT).bytes(), 4);
+        assert_eq!(width_of(&Type::Int(Sign::Unsigned)).bytes(), 4);
+        assert_eq!(width_of(&Type::Long(Sign::Signed)).bytes(), 8);
+        assert_eq!(width_of(&Type::Long(Sign::Unsigned)).bytes(), 8);
+        // A pointer and the address an array name decays to are full words
+        // however narrow the object at the other end is.
+        assert_eq!(width_of(&Type::Pointer(Box::new(Type::INT))).bytes(), 8);
+        assert_eq!(
+            width_of(&Type::Array(Box::new(Type::Char(Sign::Signed)), 3)).bytes(),
+            8
+        );
+    }
+
+    #[test]
+    fn only_the_integer_types_carry_a_signedness_of_their_own() {
+        // Arrange / Act / Assert
+        assert_eq!(sign_of(&Type::Char(Sign::Unsigned)), Sign::Unsigned);
+        assert_eq!(sign_of(&Type::INT), Sign::Signed);
+        assert_eq!(sign_of(&Type::Long(Sign::Unsigned)), Sign::Unsigned);
+        // An address is never negative, so the types that produce one read
+        // unsigned.
+        assert_eq!(sign_of(&Type::Pointer(Box::new(Type::INT))), Sign::Unsigned);
     }
 }

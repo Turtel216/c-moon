@@ -39,7 +39,8 @@ pub enum RegisterWidth {
     /// The low 32 bits, e.g. `eax`; writing it zero-extends into the full
     /// register, which is how `movzx` reaches 64 bits without a REX prefix.
     Double,
-    /// The low 8 bits, e.g. `al`, which `setcc` writes.
+    /// The low 8 bits, e.g. `al`: the width of a `char`, and what `setcc`
+    /// writes.
     Byte,
 }
 
@@ -48,6 +49,13 @@ impl X86Register {
     ///
     /// One table for all three widths keeps the names of a register together,
     /// so adding a width or a register is a single edit.
+    ///
+    /// The byte names are the ones a REX prefix gives -- `sil`, `dil`, `bpl`,
+    /// `spl` and `r8b`-`r15b` -- and never `ah`, `bh`, `ch` or `dh`: the
+    /// legacy high-byte registers cannot be encoded in an instruction that
+    /// carries a REX prefix, which every instruction naming `sil` or an
+    /// extended register does. Naming the low byte of RSI `ah` would also be
+    /// a different register entirely.
     pub fn name(self, width: RegisterWidth) -> &'static str {
         let [quad, double, byte] = match self {
             Self::Rax => ["rax", "eax", "al"],
@@ -77,6 +85,11 @@ impl X86Register {
 }
 
 /// A condition code, used by `jcc` and `setcc`.
+///
+/// Ordering comes in two families, because the flags an ordering has to read
+/// depend on how the operands read: a signed comparison looks at the sign and
+/// overflow flags, an unsigned one at the carry flag. Equality is one code for
+/// both -- two bit patterns are equal or they are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionCode {
     /// Equal (ZF=1).
@@ -91,6 +104,14 @@ pub enum ConditionCode {
     G,
     /// Signed greater than or equal (SF=OF).
     Ge,
+    /// Unsigned less than, "below" (CF=1).
+    B,
+    /// Unsigned less than or equal, "below or equal" (CF=1 or ZF=1).
+    Be,
+    /// Unsigned greater than, "above" (CF=0 and ZF=0).
+    A,
+    /// Unsigned greater than or equal, "above or equal" (CF=0).
+    Ae,
 }
 
 impl ConditionCode {
@@ -103,6 +124,10 @@ impl ConditionCode {
             Self::Le => "le",
             Self::G => "g",
             Self::Ge => "ge",
+            Self::B => "b",
+            Self::Be => "be",
+            Self::A => "a",
+            Self::Ae => "ae",
         }
     }
 }
@@ -187,17 +212,41 @@ pub enum X86Instruction {
     SignExtendAccumulator(RegisterWidth),
     /// `idiv src` -- signed divide the accumulator pair, quotient in RAX.
     Idiv(RegisterWidth, X86Operand),
+    /// `div src` -- unsigned divide the accumulator pair, quotient in RAX.
+    ///
+    /// A separate instruction from `idiv` rather than a flag on it, because
+    /// the two are separate instructions: they read the same bits and give
+    /// different answers.
+    Div(RegisterWidth, X86Operand),
     /// `cmp lhs, rhs` -- flags from `lhs - rhs`.
     Cmp(RegisterWidth, X86Operand, X86Operand),
     /// `test lhs, rhs` -- flags from `lhs & rhs`.
     Test(RegisterWidth, X86Operand, X86Operand),
     /// `setcc dst` -- set the low byte of `dst` from the condition.
     SetCC(ConditionCode, X86Register),
-    /// `movzx dst, src` -- zero-extend `src`'s low byte into `dst`.
-    Movzx(X86Register, X86Register),
-    /// `movsx dst, src` -- sign-extend `src`'s low 32 bits into the whole of
-    /// `dst`, which is how an `int` becomes a `long int`.
-    Movsx(X86Register, X86Operand),
+    /// `movzx dst, src` -- zero-extend `src`, read at `from`, into `dst` at
+    /// the wider `to`: how an `unsigned char` becomes an `int`, and how the
+    /// byte `setcc` writes becomes the 0 or 1 of one.
+    ///
+    /// There is no 32-to-64 case, and no instruction for one: writing a
+    /// 32-bit register already clears the whole of the 64-bit one, so a plain
+    /// `mov` zero-extends for free.
+    Movzx {
+        to: RegisterWidth,
+        from: RegisterWidth,
+        destination: X86Register,
+        source: X86Operand,
+    },
+    /// `movsx dst, src` -- sign-extend `src`, read at `from`, into `dst` at
+    /// the wider `to`: how a `char` becomes an `int` and an `int` a `long
+    /// int`.  Both widths are carried because the mnemonic the assembler
+    /// picks (`movsbl`, `movsbq`, `movslq`) follows from the pair.
+    Movsx {
+        to: RegisterWidth,
+        from: RegisterWidth,
+        destination: X86Register,
+        source: X86Operand,
+    },
     /// `push src`
     Push(X86Operand),
     /// `pop dst`

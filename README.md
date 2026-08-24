@@ -26,18 +26,19 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 ## Supported Language Subset
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
-* **Data Types:** `int` (32-bit), `long int` (64-bit), arrays of either, pointers.
+* **Data Types:** `char` (8-bit), `int` (32-bit) and `long int` (64-bit), each in a signed and an `unsigned` form, arrays of any of them, pointers.
 * **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
   and Logical (`&&`, `||`, `!`), the first two of which short-circuit.
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
-* **Integer conversions:** the usual arithmetic conversions, the implicit conversion an assignment, argument or `return` performs, and casts between the two integer types.
+* **Integer conversions:** the integer promotions -- a `char` operand becomes an `int` before any operator sees it -- the usual arithmetic conversions, including the rule that an `int` and an `unsigned int` meet as `unsigned int`, the implicit conversion an assignment, argument or `return` performs, and casts between the integer types. Widening sign-extends a signed value and zero-extends an unsigned one; division and ordering select the instruction that matches.
 
 ### Roadmap
 
-* [ ] Additional data types (`char`, `float`, `double`, `struct` are parsed but rejected by semantic analysis today).
+* [ ] Additional data types (`float`, `double`, `struct` are parsed but rejected by semantic analysis today).
+* [ ] Integer literal suffixes (`u`, `L`); a decimal literal too large for a `long int` is already an `unsigned long int`, as GCC makes it.
 * [ ] Pointer arithmetic.
 * [ ] Global variables.
 * [ ] `extern` keyword and linking against GCC-compiled C programs and the standard library.

@@ -78,21 +78,27 @@ impl fmt::Display for X86Instruction {
             Self::Test(width, left, right) => binary(f, "test", *width, left, right),
 
             Self::Idiv(width, source) => unary(f, "idiv", *width, source),
+            Self::Div(width, source) => unary(f, "div", *width, source),
             Self::Push(source) => unary(f, "push", RegisterWidth::Quad, source),
             Self::Pop(destination) => unary(f, "pop", RegisterWidth::Quad, destination),
 
             // One mnemonic per width: `cdq` fills EDX from EAX, `cqo` fills
-            // RDX from RAX.
+            // RDX from RAX.  There is no byte case: C promotes both operands
+            // of a division to at least an `int`, so nothing divides at eight
+            // bits.
             Self::SignExtendAccumulator(RegisterWidth::Quad) => write!(f, "{}cqo", INDENT),
-            Self::SignExtendAccumulator(_) => write!(f, "{}cdq", INDENT),
+            Self::SignExtendAccumulator(RegisterWidth::Double) => write!(f, "{}cdq", INDENT),
+            Self::SignExtendAccumulator(RegisterWidth::Byte) => {
+                panic!("Compiler Bug: nothing divides at byte width")
+            }
             Self::Ret => write!(f, "{}ret", INDENT),
 
             Self::Jmp(label) => write!(f, "{}jmp {}", INDENT, label),
             Self::Call(label) => write!(f, "{}call {}", INDENT, label),
             Self::Jcc(condition, label) => write!(f, "{}j{} {}", INDENT, condition, label),
 
-            // `setcc` writes a byte; `movzx` reads one and writes a dword,
-            // which zero-extends to the full register for free.
+            // `setcc` writes a byte, which `movzx` is then what turns into
+            // the 0 or 1 of an `int`.
             Self::SetCC(condition, destination) => write!(
                 f,
                 "{}set{} {}",
@@ -100,19 +106,29 @@ impl fmt::Display for X86Instruction {
                 condition,
                 destination.name(RegisterWidth::Byte)
             ),
-            Self::Movzx(destination, source) => write!(
+            Self::Movzx {
+                to,
+                from,
+                destination,
+                source,
+            } => write!(
                 f,
                 "{}movzx {}, {}",
                 INDENT,
-                destination.name(RegisterWidth::Double),
-                source.name(RegisterWidth::Byte)
+                destination.name(*to),
+                Sized(*from, source)
             ),
-            Self::Movsx(destination, source) => write!(
+            Self::Movsx {
+                to,
+                from,
+                destination,
+                source,
+            } => write!(
                 f,
                 "{}movsx {}, {}",
                 INDENT,
-                destination.name(RegisterWidth::Quad),
-                Sized(RegisterWidth::Double, source)
+                destination.name(*to),
+                Sized(*from, source)
             ),
 
             Self::Label(label) => write!(f, "{}:", label),
@@ -257,16 +273,63 @@ mod tests {
     }
 
     #[test]
-    fn widening_an_int_sign_extends_it() {
-        // Arrange / Act / Assert
+    fn widening_sign_extends_from_the_source_width_to_the_destination_one() {
+        // Arrange / Act / Assert: an `int` becoming a `long int` ...
         assert_eq!(
-            X86Instruction::Movsx(X86Register::Rax, X86Operand::Reg(X86Register::Rcx)).to_string(),
+            X86Instruction::Movsx {
+                to: RegisterWidth::Quad,
+                from: RegisterWidth::Double,
+                destination: X86Register::Rax,
+                source: X86Operand::Reg(X86Register::Rcx),
+            }
+            .to_string(),
             "    movsx rax, ecx"
         );
         assert_eq!(
-            X86Instruction::Movsx(X86Register::Rax, X86Operand::mem(X86Register::Rbp, -4))
-                .to_string(),
+            X86Instruction::Movsx {
+                to: RegisterWidth::Quad,
+                from: RegisterWidth::Double,
+                destination: X86Register::Rax,
+                source: X86Operand::mem(X86Register::Rbp, -4),
+            }
+            .to_string(),
             "    movsx rax, DWORD PTR [rbp - 4]"
+        );
+        // ... and a `char` becoming an `int`, which is `movsbl`.
+        assert_eq!(
+            X86Instruction::Movsx {
+                to: RegisterWidth::Double,
+                from: RegisterWidth::Byte,
+                destination: X86Register::Rax,
+                source: X86Operand::mem(X86Register::Rbp, -1),
+            }
+            .to_string(),
+            "    movsx eax, BYTE PTR [rbp - 1]"
+        );
+    }
+
+    #[test]
+    fn a_byte_register_is_named_the_way_a_rex_prefix_requires() {
+        // Arrange / Act / Assert: the low byte of RSI is `sil`, never `ah`;
+        // the two cannot appear in one instruction, and only `sil` can be
+        // encoded alongside the extended registers this backend uses.
+        assert_eq!(
+            X86Instruction::Mov(
+                RegisterWidth::Byte,
+                X86Operand::Reg(X86Register::Rsi),
+                X86Operand::Reg(X86Register::R12)
+            )
+            .to_string(),
+            "    mov sil, r12b"
+        );
+        assert_eq!(
+            X86Instruction::Mov(
+                RegisterWidth::Byte,
+                X86Operand::mem(X86Register::Rbp, -1),
+                X86Operand::Imm(65)
+            )
+            .to_string(),
+            "    mov BYTE PTR [rbp - 1], 65"
         );
     }
 
@@ -278,8 +341,71 @@ mod tests {
             "    setle al"
         );
         assert_eq!(
-            X86Instruction::Movzx(X86Register::R12, X86Register::Rax).to_string(),
+            X86Instruction::Movzx {
+                to: RegisterWidth::Double,
+                from: RegisterWidth::Byte,
+                destination: X86Register::R12,
+                source: X86Operand::Reg(X86Register::Rax),
+            }
+            .to_string(),
             "    movzx r12d, al"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_value_widens_by_filling_with_zeroes() {
+        // Arrange / Act / Assert: `movzx` where `movsx` would have copied the
+        // top bit, from a byte in memory ...
+        assert_eq!(
+            X86Instruction::Movzx {
+                to: RegisterWidth::Double,
+                from: RegisterWidth::Byte,
+                destination: X86Register::Rax,
+                source: X86Operand::mem(X86Register::Rbp, -1),
+            }
+            .to_string(),
+            "    movzx eax, BYTE PTR [rbp - 1]"
+        );
+        // ... and into the whole of a 64-bit register.
+        assert_eq!(
+            X86Instruction::Movzx {
+                to: RegisterWidth::Quad,
+                from: RegisterWidth::Byte,
+                destination: X86Register::Rax,
+                source: X86Operand::Reg(X86Register::Rsi),
+            }
+            .to_string(),
+            "    movzx rax, sil"
+        );
+    }
+
+    #[test]
+    fn the_two_divides_are_two_instructions() {
+        // Arrange / Act / Assert: same operand, different answer.
+        assert_eq!(
+            X86Instruction::Idiv(RegisterWidth::Double, X86Operand::Reg(X86Register::Rcx))
+                .to_string(),
+            "    idiv ecx"
+        );
+        assert_eq!(
+            X86Instruction::Div(RegisterWidth::Double, X86Operand::Reg(X86Register::Rcx))
+                .to_string(),
+            "    div ecx"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_comparison_uses_the_carry_flag_conditions() {
+        // Arrange / Act / Assert: `below` and `above`, not `less` and
+        // `greater` -- the flags an ordering reads depend on how its operands
+        // read.
+        assert_eq!(
+            X86Instruction::SetCC(ConditionCode::B, X86Register::Rax).to_string(),
+            "    setb al"
+        );
+        assert_eq!(
+            X86Instruction::Jcc(ConditionCode::Ae, ".L1".to_string()).to_string(),
+            "    jae .L1"
         );
     }
 

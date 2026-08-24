@@ -65,7 +65,9 @@ fn simplify(op: &Op) -> Option<Op> {
             _ => None,
         },
 
-        BinOp::Div => match (lhs, rhs) {
+        // Dividing by one, or by itself, gives the same answer whichever
+        // way the operands read.
+        BinOp::Div(_) => match (lhs, rhs) {
             (_, Operand::Imm(1)) => Some(Op::Copy(lhs)),
             // Not for `0 / x`: the divisor may be zero, and the result of that
             // is the program's business rather than the compiler's.
@@ -74,8 +76,8 @@ fn simplify(op: &Op) -> Option<Op> {
         },
 
         // A value equals itself, is not less than itself, and so on.
-        BinOp::Eq | BinOp::Lte | BinOp::Gte if same => Some(Op::Copy(Operand::Imm(1))),
-        BinOp::Neq | BinOp::Lt | BinOp::Gt if same => Some(Op::Copy(Operand::Imm(0))),
+        BinOp::Eq | BinOp::Lte(_) | BinOp::Gte(_) if same => Some(Op::Copy(Operand::Imm(1))),
+        BinOp::Neq | BinOp::Lt(_) | BinOp::Gt(_) if same => Some(Op::Copy(Operand::Imm(0))),
         _ => None,
     }
 }
@@ -84,7 +86,7 @@ fn simplify(op: &Op) -> Option<Op> {
 mod tests {
     use super::*;
 
-    use crate::middle::ir::Width;
+    use crate::middle::ir::{Sign, Width};
 
     use crate::middle::ssa::Terminator;
     use crate::middle::ssa::verify::verify_ssa;
@@ -139,7 +141,7 @@ mod tests {
         let (op, opaque) = simplified(BinOp::Mul, |x| (Operand::Imm(1), x));
         assert_eq!(op, Op::Copy(opaque));
 
-        let (op, opaque) = simplified(BinOp::Div, |x| (x, Operand::Imm(1)));
+        let (op, opaque) = simplified(BinOp::Div(Sign::Signed), |x| (x, Operand::Imm(1)));
         assert_eq!(op, Op::Copy(opaque));
     }
 
@@ -162,13 +164,13 @@ mod tests {
     fn an_operation_on_one_value_twice_is_decided_without_knowing_it() {
         for (operator, expected) in [
             (BinOp::Sub, 0),
-            (BinOp::Div, 1),
+            (BinOp::Div(Sign::Signed), 1),
             (BinOp::Eq, 1),
-            (BinOp::Lte, 1),
-            (BinOp::Gte, 1),
+            (BinOp::Lte(Sign::Signed), 1),
+            (BinOp::Gte(Sign::Signed), 1),
             (BinOp::Neq, 0),
-            (BinOp::Lt, 0),
-            (BinOp::Gt, 0),
+            (BinOp::Lt(Sign::Signed), 0),
+            (BinOp::Gt(Sign::Signed), 0),
         ] {
             let (op, _) = simplified(operator, |x| (x, x));
             assert_eq!(op, Op::Copy(Operand::Imm(expected)), "{operator:?}");
@@ -179,10 +181,15 @@ mod tests {
     fn dividing_zero_by_something_unknown_is_left_alone() {
         // The divisor may be zero, and what that produces is not the
         // compiler's to decide.
-        let (op, opaque) = simplified(BinOp::Div, |x| (Operand::Imm(0), x));
+        let (op, opaque) = simplified(BinOp::Div(Sign::Signed), |x| (Operand::Imm(0), x));
         assert_eq!(
             op,
-            Op::Binary(BinOp::Div, Width::Bits64, Operand::Imm(0), opaque)
+            Op::Binary(
+                BinOp::Div(Sign::Signed),
+                Width::Bits64,
+                Operand::Imm(0),
+                opaque
+            )
         );
     }
 

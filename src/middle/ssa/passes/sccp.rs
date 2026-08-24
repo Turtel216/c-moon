@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::middle::ir::Width;
+use crate::middle::ir::{Sign, Width};
 use crate::middle::ssa::defuse::{DefUse, Use, UsePosition};
 use crate::middle::ssa::{BinOp, BlockId, Function, InstId, Op, Operand, Terminator, ValueId};
 
@@ -211,9 +211,17 @@ impl<'a> Solver<'a> {
             Op::Copy(source) => self.operand(*source),
 
             // A conversion of a known value is known: the constant is held
-            // sign-extended, so narrowing it is all there is to do.
-            Op::Convert { to, value } => match self.operand(*value) {
-                Known::Constant(constant) => Known::Constant(to.narrow(constant)),
+            // sign-extended, so narrowing it is all there is to do. It is
+            // narrowed to the source width first, so that a widening
+            // conversion sign-extends from the bit the source ends at rather
+            // than from wherever the constant happens to.
+            Op::Convert {
+                from,
+                sign,
+                to,
+                value,
+            } => match self.operand(*value) {
+                Known::Constant(constant) => Known::Constant(to.narrow(from.read(*sign, constant))),
                 other => other,
             },
 
@@ -351,22 +359,39 @@ fn fold(operator: BinOp, width: Width, lhs: i64, rhs: i64) -> Option<i64> {
     // the width the instruction computes at is what makes a folded `int`
     // overflow come out as the machine's 32-bit answer rather than the one an
     // `i64` would have given.
+    //
+    // An unsigned operation reads the same two bit patterns as unsigned
+    // numbers, which is what `Width::unsigned` hands it; the answer is stored
+    // back the one way constants are stored.
     Some(match operator {
         BinOp::Add => width.narrow(lhs.wrapping_add(rhs)),
         BinOp::Sub => width.narrow(lhs.wrapping_sub(rhs)),
         BinOp::Mul => width.narrow(lhs.wrapping_mul(rhs)),
-        BinOp::Div => {
+        BinOp::Div(Sign::Signed) => {
             if rhs == 0 {
                 return None;
             }
             width.narrow(lhs.wrapping_div(rhs))
         }
+        BinOp::Div(Sign::Unsigned) => {
+            let divisor = width.unsigned(rhs);
+            if divisor == 0 {
+                return None;
+            }
+            width.narrow((width.unsigned(lhs) / divisor) as i64)
+        }
+        // Equality asks whether the bits are the same, which they either are
+        // or are not however they read.
         BinOp::Eq => i64::from(lhs == rhs),
         BinOp::Neq => i64::from(lhs != rhs),
-        BinOp::Lt => i64::from(lhs < rhs),
-        BinOp::Lte => i64::from(lhs <= rhs),
-        BinOp::Gt => i64::from(lhs > rhs),
-        BinOp::Gte => i64::from(lhs >= rhs),
+        BinOp::Lt(Sign::Signed) => i64::from(lhs < rhs),
+        BinOp::Lte(Sign::Signed) => i64::from(lhs <= rhs),
+        BinOp::Gt(Sign::Signed) => i64::from(lhs > rhs),
+        BinOp::Gte(Sign::Signed) => i64::from(lhs >= rhs),
+        BinOp::Lt(Sign::Unsigned) => i64::from(width.unsigned(lhs) < width.unsigned(rhs)),
+        BinOp::Lte(Sign::Unsigned) => i64::from(width.unsigned(lhs) <= width.unsigned(rhs)),
+        BinOp::Gt(Sign::Unsigned) => i64::from(width.unsigned(lhs) > width.unsigned(rhs)),
+        BinOp::Gte(Sign::Unsigned) => i64::from(width.unsigned(lhs) >= width.unsigned(rhs)),
     })
 }
 
@@ -386,6 +411,36 @@ mod tests {
         function
             .block_ids()
             .find(|&block| function.block(block).label == label)
+    }
+
+    #[test]
+    fn folding_reads_the_operands_the_way_the_operation_does() {
+        // Arrange: the bits an `int` holds -1 in are the bits an `unsigned
+        // int` holds its largest value in.
+        let all_ones = -1;
+
+        // Act / Assert: one pair of constants, two answers per operation.
+        assert_eq!(
+            fold(BinOp::Div(Sign::Signed), Width::Bits32, all_ones, 2),
+            Some(0)
+        );
+        assert_eq!(
+            fold(BinOp::Div(Sign::Unsigned), Width::Bits32, all_ones, 2),
+            Some(2147483647)
+        );
+        assert_eq!(
+            fold(BinOp::Lt(Sign::Signed), Width::Bits32, all_ones, 2),
+            Some(1)
+        );
+        assert_eq!(
+            fold(BinOp::Lt(Sign::Unsigned), Width::Bits32, all_ones, 2),
+            Some(0)
+        );
+        // An equality asks only whether the bits are the same, so it is one
+        // operation rather than two.
+        assert_eq!(fold(BinOp::Eq, Width::Bits32, all_ones, all_ones), Some(1));
+        // Dividing by zero is the program's business either way.
+        assert_eq!(fold(BinOp::Div(Sign::Unsigned), Width::Bits32, 1, 0), None);
     }
 
     #[test]
@@ -531,7 +586,7 @@ mod tests {
             .emit(
                 header,
                 Op::Binary(
-                    BinOp::Lt,
+                    BinOp::Lt(Sign::Signed),
                     Width::Bits64,
                     Operand::Value(counter),
                     Operand::Imm(10),
@@ -573,7 +628,12 @@ mod tests {
         let quotient = function
             .emit(
                 entry,
-                Op::Binary(BinOp::Div, Width::Bits64, Operand::Imm(1), Operand::Imm(0)),
+                Op::Binary(
+                    BinOp::Div(Sign::Signed),
+                    Width::Bits64,
+                    Operand::Imm(1),
+                    Operand::Imm(0),
+                ),
             )
             .expect("a division defines a value");
         function.set_terminator(entry, Terminator::Return(Some(Operand::Value(quotient))));

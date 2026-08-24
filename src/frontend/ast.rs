@@ -135,15 +135,42 @@ pub struct ParamDecl {
     pub span: Span,
 }
 
+/// Whether an integer type's top bit is a sign or just another digit.
+///
+/// Every integer type comes in both forms, so it is a property of the type
+/// rather than a type of its own: `unsigned char` and `char` are the same
+/// eight bits read two different ways. Which way decides how a value widens,
+/// how two of them compare, and how one divides another -- and nothing else,
+/// which is why the same addition serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sign {
+    Signed,
+    Unsigned,
+}
+
+impl Sign {
+    /// The specifier written in front of a type of this signedness.
+    ///
+    /// Empty for a signed type: C spells `int` rather than `signed int`, and
+    /// a diagnostic should quote the type the way the reader would write it.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Sign::Signed => "",
+            Sign::Unsigned => "unsigned ",
+        }
+    }
+}
+
 /// Representation of C Types
 #[derive(Debug, Clone, PartialEq)]
 pub enum CType {
     Void,
-    /// `int`, a 32-bit signed integer.
-    Int,
-    /// `long int`, a 64-bit signed integer. `long` on its own means the same.
-    Long,
-    Char,
+    /// `char`, an 8-bit integer.
+    Char(Sign),
+    /// `int`, a 32-bit integer.
+    Int(Sign),
+    /// `long int`, a 64-bit integer. `long` on its own means the same.
+    Long(Sign),
     Float,
     Double,
     Pointer(Box<CType>),
@@ -157,9 +184,9 @@ impl fmt::Display for CType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CType::Void => write!(f, "void"),
-            CType::Int => write!(f, "int"),
-            CType::Long => write!(f, "long int"),
-            CType::Char => write!(f, "char"),
+            CType::Char(sign) => write!(f, "{}char", sign.prefix()),
+            CType::Int(sign) => write!(f, "{}int", sign.prefix()),
+            CType::Long(sign) => write!(f, "{}long int", sign.prefix()),
             CType::Float => write!(f, "float"),
             CType::Double => write!(f, "double"),
             CType::Pointer(inner) => write!(f, "{inner}*"),
@@ -172,7 +199,13 @@ impl fmt::Display for CType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i64),
+    /// The magnitude of an integer constant, e.g. the `42` of `42`.
+    ///
+    /// Unsigned because a constant has no sign of its own: C has no negative
+    /// literal, only unary minus applied to a positive one. Holding the
+    /// magnitude is also what lets a constant too large for a `long int` --
+    /// and so an `unsigned long int` -- be written at all.
+    Int(u64),
     Float(f64),
     Char(u8),
     String(String),
@@ -220,14 +253,14 @@ mod tests {
 
     #[test]
     fn displays_derived_types_in_c_syntax() {
-        let pointer_to_int = CType::Pointer(Box::new(CType::Int));
+        let pointer_to_int = CType::Pointer(Box::new(CType::Int(Sign::Signed)));
         assert_eq!(pointer_to_int.to_string(), "int*");
 
         let array_of_pointers = CType::Array(Box::new(pointer_to_int), Some(10));
         assert_eq!(array_of_pointers.to_string(), "int*[10]");
 
         assert_eq!(
-            CType::Array(Box::new(CType::Char), None).to_string(),
+            CType::Array(Box::new(CType::Char(Sign::Signed)), None).to_string(),
             "char[]"
         );
         assert_eq!(
@@ -235,8 +268,18 @@ mod tests {
             "struct Point"
         );
         assert_eq!(
-            CType::Pointer(Box::new(CType::Long)).to_string(),
+            CType::Pointer(Box::new(CType::Long(Sign::Signed))).to_string(),
             "long int*"
         );
+    }
+
+    #[test]
+    fn displays_an_unsigned_type_with_the_specifier_that_names_it() {
+        // Arrange / Act / Assert: the signed types are written without a
+        // specifier, the way C spells them.
+        assert_eq!(CType::Char(Sign::Unsigned).to_string(), "unsigned char");
+        assert_eq!(CType::Int(Sign::Unsigned).to_string(), "unsigned int");
+        assert_eq!(CType::Long(Sign::Unsigned).to_string(), "unsigned long int");
+        assert_eq!(CType::Int(Sign::Signed).to_string(), "int");
     }
 }

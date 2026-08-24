@@ -7,7 +7,7 @@
 use crate::frontend::span::Span;
 
 use super::macros::MacroDef;
-use super::token::{LexError, Token, TokenKind};
+use super::token::{LexError, Token, TokenKind, char_literal_value};
 
 /// A preprocessor directive recognised at the start of a line.
 pub enum Directive<'a> {
@@ -64,7 +64,7 @@ impl<'a> Scanner<'a> {
 
             // Literals delimited by a quote character
             b'"' => self.scan_quoted(b'"', TokenKind::StringLiteral, LexError::UnterminatedString),
-            b'\'' => self.scan_quoted(b'\'', TokenKind::CharLiteral, LexError::UnterminatedChar),
+            b'\'' => self.scan_char(start.pos),
 
             // Operators, longest match first (maximal munch)
             b'+' => self.munch(
@@ -311,6 +311,27 @@ impl<'a> Scanner<'a> {
             }
         }
         TokenKind::Error(unterminated)
+    }
+
+    /// Scans a character literal, with the opening `'` consumed.
+    ///
+    /// The literal is delimited first and only then decoded, so that a
+    /// malformed one is reported as what it is -- `''` as an empty literal,
+    /// `'ab'` as a multi-character one, `'\\q'` as an unknown escape -- rather
+    /// than as a token whose value the parser would have to invent.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - byte position of the opening quote, so the literal can be
+    ///   re-read once its extent is known
+    fn scan_char(&mut self, start: usize) -> TokenKind {
+        match self.scan_quoted(b'\'', TokenKind::CharLiteral, LexError::UnterminatedChar) {
+            TokenKind::CharLiteral => match char_literal_value(&self.input[start..self.pos]) {
+                Ok(_) => TokenKind::CharLiteral,
+                Err(error) => TokenKind::Error(error),
+            },
+            unterminated => unterminated,
+        }
     }
 
     /// Consumes one follower byte when it matches, implementing maximal munch.

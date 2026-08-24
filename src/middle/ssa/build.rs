@@ -209,30 +209,27 @@ impl Builder {
             Opcode::Add
             | Opcode::Sub
             | Opcode::Mul
-            | Opcode::Div
+            | Opcode::Div(_)
             | Opcode::Eq
             | Opcode::Neq
-            | Opcode::Lt
-            | Opcode::Lte
-            | Opcode::Gt
-            | Opcode::Gte => {
+            | Opcode::Lt(_)
+            | Opcode::Lte(_)
+            | Opcode::Gt(_)
+            | Opcode::Gte(_) => {
                 let operator = binary_operator(&instr.opcode);
                 let lhs = self.operand(block, arg(instr, &instr.arg1), instr.width);
                 let rhs = self.operand(block, arg(instr, &instr.arg2), instr.width);
                 self.define(block, instr, Op::Binary(operator, instr.width, lhs, rhs));
             }
 
-            Opcode::Convert => {
-                // The operand is the other width, there being only two.
-                let from = match instr.width {
-                    Width::Bits32 => Width::Bits64,
-                    Width::Bits64 => Width::Bits32,
-                };
+            Opcode::Convert { from, sign } => {
                 let value = self.operand(block, arg(instr, &instr.arg1), from);
                 self.define(
                     block,
                     instr,
                     Op::Convert {
+                        from,
+                        sign,
                         to: instr.width,
                         value,
                     },
@@ -512,17 +509,17 @@ fn is_transfer(opcode: &Opcode) -> bool {
 
 /// The SSA operator a two-operand TAC opcode stands for.
 fn binary_operator(opcode: &Opcode) -> BinOp {
-    match opcode {
+    match *opcode {
         Opcode::Add => BinOp::Add,
         Opcode::Sub => BinOp::Sub,
         Opcode::Mul => BinOp::Mul,
-        Opcode::Div => BinOp::Div,
+        Opcode::Div(sign) => BinOp::Div(sign),
         Opcode::Eq => BinOp::Eq,
         Opcode::Neq => BinOp::Neq,
-        Opcode::Lt => BinOp::Lt,
-        Opcode::Lte => BinOp::Lte,
-        Opcode::Gt => BinOp::Gt,
-        Opcode::Gte => BinOp::Gte,
+        Opcode::Lt(sign) => BinOp::Lt(sign),
+        Opcode::Lte(sign) => BinOp::Lte(sign),
+        Opcode::Gt(sign) => BinOp::Gt(sign),
+        Opcode::Gte(sign) => BinOp::Gte(sign),
         other => panic!("Compiler Bug: {:?} is not a binary operation", other),
     }
 }
@@ -533,7 +530,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use crate::middle::ir::{BasicBlock, Operand as TacOperand};
+    use crate::middle::ir::{BasicBlock, Operand as TacOperand, Sign};
     use crate::middle::ssa::destruct::to_cfg;
     use crate::middle::ssa::mem2reg::promote_slots;
     use crate::middle::ssa::promote::promotable;
@@ -779,7 +776,7 @@ function f {
         let opcodes: Vec<Opcode> = rebuilt.blocks["entry"]
             .instructions
             .iter()
-            .map(|instr| instr.opcode.clone())
+            .map(|instr| instr.opcode)
             .collect();
         assert_eq!(
             opcodes,
@@ -840,7 +837,7 @@ function f {
         let opcodes: Vec<Opcode> = rebuilt.blocks["entry"]
             .instructions
             .iter()
-            .map(|instr| instr.opcode.clone())
+            .map(|instr| instr.opcode)
             .collect();
         assert_eq!(opcodes[..2], [Opcode::GetParam, Opcode::GetParam]);
     }
@@ -1181,7 +1178,7 @@ function f {
                 "cond",
                 vec![
                     instr(
-                        Opcode::Lt,
+                        Opcode::Lt(Sign::Signed),
                         Some(temp("t1")),
                         Some(var(0)),
                         Some(TacOperand::ImmInt(5)),

@@ -36,7 +36,7 @@ pub mod verify;
 use std::collections::HashMap;
 
 use crate::frontend::renamer::VarId;
-use crate::middle::ir::Width;
+use crate::middle::ir::{Sign, Width};
 
 /// Identifies one basic block within a function.
 ///
@@ -199,18 +199,25 @@ impl Operand {
 ///
 /// The set matches the TAC opcodes it is built from; relational operations
 /// produce 0 or 1.
+///
+/// The operations whose answer depends on how the operands' bits read carry
+/// the [`Sign`] that says: an ordering and a division do, while an addition,
+/// a subtraction, a multiplication and an equality give the same bits either
+/// way and so are one operation rather than two. That also keeps them
+/// congruent for [`gvn`](passes::gvn), which would otherwise see the same sum
+/// twice and call it two expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
-    Div,
+    Div(Sign),
     Eq,
     Neq,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
+    Lt(Sign),
+    Lte(Sign),
+    Gt(Sign),
+    Gte(Sign),
 }
 
 /// What an instruction does.
@@ -225,9 +232,16 @@ pub enum Op {
     Binary(BinOp, Width, Operand, Operand),
     /// `dest = source`
     Copy(Operand),
-    /// `dest = ` `value` converted to the width `to`, sign-extending or
-    /// truncating as the two widths require.
-    Convert { to: Width, value: Operand },
+    /// `dest = ` `value`, read at the width `from` with the signedness
+    /// `sign`, converted to the width `to`: extending when `to` is the wider
+    /// of the two -- with copies of the top bit or with zeroes, as `sign` says
+    /// -- and truncating when it is the narrower.
+    Convert {
+        from: Width,
+        sign: Sign,
+        to: Width,
+        value: Operand,
+    },
     /// `dest = callee(args...)`
     Call { callee: String, args: Vec<Operand> },
     /// `dest = ` the incoming argument at this position.

@@ -21,7 +21,7 @@ mod macros;
 mod scanner;
 mod token;
 
-pub use token::{LexError, Token, TokenKind};
+pub use token::{LexError, Token, TokenKind, char_literal_value};
 
 use std::collections::{HashMap, VecDeque};
 
@@ -337,6 +337,24 @@ mod tests {
 
         let tokens = lex("'a");
         assert_eq!(tokens[0].kind, TokenKind::Error(LexError::UnterminatedChar));
+    }
+
+    #[test]
+    fn a_character_literal_is_decoded_as_it_is_scanned() {
+        // Arrange / Act / Assert: the scanner accepts a literal only if it
+        // names exactly one character, so the parser never has to guess.
+        assert_eq!(lex(r"'\n'")[0].kind, TokenKind::CharLiteral);
+        assert_eq!(lex("''")[0].kind, TokenKind::Error(LexError::EmptyChar));
+        assert_eq!(
+            lex("'ab'")[0].kind,
+            TokenKind::Error(LexError::MultiCharacterChar)
+        );
+        assert_eq!(
+            lex(r"'\q'")[0].kind,
+            TokenKind::Error(LexError::UnknownEscape)
+        );
+        // An escaped quote does not end the literal early.
+        assert_eq!(lex(r"'\''")[0].lexeme, r"'\''");
     }
 
     #[test]

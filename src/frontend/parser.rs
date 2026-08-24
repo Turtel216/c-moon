@@ -10,10 +10,10 @@
 
 use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
-    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Stmt,
-    StmtKind, UnaryOp,
+    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Sign,
+    Stmt, StmtKind, UnaryOp,
 };
-use crate::frontend::lexer::{LexError, Lexer, Token, TokenKind};
+use crate::frontend::lexer::{LexError, Lexer, Token, TokenKind, char_literal_value};
 use crate::frontend::span::Span;
 
 /// A syntax error, tied to the source text that could not be accepted.
@@ -347,17 +347,71 @@ impl<'a> Parser<'a> {
 
     /// Parses the base type of a declaration, e.g. the `int` of `int *p[4]`.
     ///
-    /// `long` is the one specifier written as more than one word: `long` and
-    /// `long int` name the same type, so the optional `int` is consumed here.
+    /// Most specifiers are a single word, but an integer type may be written
+    /// as up to three: a `signed` or `unsigned` in front, and a redundant
+    /// `int` after a `long`. They are read in that order, which is the order C
+    /// programs are written in even though the standard allows any other --
+    /// `long unsigned int` is not accepted.
+    ///
+    /// [`Self::specifier_length`] says how many tokens the same grammar
+    /// spans, which is what the cast lookahead needs; the two are changed
+    /// together.
     fn parse_type_specifier(&mut self) -> PResult<CType> {
+        // `signed` and `unsigned` qualify an integer type, and may also stand
+        // on their own, where they mean the `int` of that signedness.
+        let sign = match self.current().kind {
+            TokenKind::Signed => Sign::Signed,
+            TokenKind::Unsigned => Sign::Unsigned,
+            _ => {
+                return match self.parse_integer_specifier(Sign::Signed) {
+                    Some(ty) => Ok(ty),
+                    None => self.parse_other_specifier(),
+                };
+            }
+        };
+        self.advance();
+
+        if let Some(ty) = self.parse_integer_specifier(sign) {
+            return Ok(ty);
+        }
+        match Self::starts_type(self.current().kind) {
+            // There is no `unsigned float`: a signedness only qualifies the
+            // types that have one.
+            true => self.err_here("`char`, `int` or `long`"),
+            false => Ok(CType::Int(sign)),
+        }
+    }
+
+    /// Parses `char`, `int` or `long [int]`, giving it the signedness that a
+    /// specifier in front of it fixed.
+    ///
+    /// # Arguments
+    ///
+    /// * `sign` - the signedness to give the type
+    ///
+    /// # Returns
+    ///
+    /// `None`, with the cursor untouched, when it is not on one of the three.
+    fn parse_integer_specifier(&mut self, sign: Sign) -> Option<CType> {
         let ty = match self.current().kind {
-            TokenKind::Int => CType::Int,
+            TokenKind::Char => CType::Char(sign),
+            TokenKind::Int => CType::Int(sign),
             TokenKind::Long => {
                 self.advance();
+                // `long` and `long int` name the same type.
                 self.match_kind(TokenKind::Int);
-                return Ok(CType::Long);
+                return Some(CType::Long(sign));
             }
-            TokenKind::Char => CType::Char,
+            _ => return None,
+        };
+        self.advance();
+        Some(ty)
+    }
+
+    /// Parses a specifier that has no signedness to read: `void`, a floating
+    /// type, or a struct.
+    fn parse_other_specifier(&mut self) -> PResult<CType> {
+        let ty = match self.current().kind {
             TokenKind::Float => CType::Float,
             TokenKind::Double => CType::Double,
             TokenKind::Void => CType::Void,
@@ -728,10 +782,10 @@ impl<'a> Parser<'a> {
 
         let kind = match self.current().kind {
             TokenKind::Identifier => ExprKind::Identifier(self.advance().lexeme.to_string()),
-            // A literal that does not fit its type is clamped to zero for now;
-            // the lexer has already accepted its shape.
+            // A literal too large for even an `unsigned long int` is clamped
+            // to zero for now; the lexer has already accepted its shape.
             TokenKind::IntegerLiteral => {
-                let value = self.advance().lexeme.parse::<i64>().unwrap_or(0);
+                let value = self.advance().lexeme.parse::<u64>().unwrap_or(0);
                 ExprKind::Literal(Literal::Int(value))
             }
             TokenKind::FloatLiteral => {
@@ -743,9 +797,10 @@ impl<'a> Parser<'a> {
                 ExprKind::Literal(Literal::String(text))
             }
             TokenKind::CharLiteral => {
-                // The lexeme still carries its quotes: `'c'`.
-                let lexeme = self.advance().lexeme.as_bytes();
-                let value = if lexeme.len() >= 3 { lexeme[1] } else { 0 };
+                // The scanner decoded this literal already, to decide whether
+                // to accept it at all; a literal it accepted cannot fail here.
+                let value = char_literal_value(&self.advance().lexeme)
+                    .expect("Compiler Bug: the scanner accepted a malformed character literal");
                 ExprKind::Literal(Literal::Char(value))
             }
             TokenKind::LParen => {
@@ -802,6 +857,8 @@ impl<'a> Parser<'a> {
             TokenKind::Int
                 | TokenKind::Long
                 | TokenKind::Char
+                | TokenKind::Signed
+                | TokenKind::Unsigned
                 | TokenKind::Float
                 | TokenKind::Double
                 | TokenKind::Void
@@ -819,20 +876,52 @@ impl<'a> Parser<'a> {
     ///
     /// A few tokens of lookahead are enough for the supported type syntax: `(`
     /// followed by a type specifier, followed by either `)` or the start of the
-    /// declarator being cast to. Every specifier is one token except `long
-    /// int`, which is two.
+    /// declarator being cast to.
     fn at_cast(&self) -> bool {
-        if !self.check(TokenKind::LParen) || !self.peek_kind(1).is_some_and(Self::starts_type) {
+        if !self.check(TokenKind::LParen) {
             return false;
         }
-        let after_specifier = match (self.peek_kind(1), self.peek_kind(2)) {
-            (Some(TokenKind::Long), Some(TokenKind::Int)) => self.peek_kind(3),
-            _ => self.peek_kind(2),
+        let Some(length) = self.specifier_length(1) else {
+            return false;
         };
         matches!(
-            after_specifier,
+            self.peek_kind(1 + length),
             Some(TokenKind::RParen | TokenKind::Identifier)
         )
+    }
+
+    /// How many tokens the type specifier `offset` tokens ahead spans.
+    ///
+    /// This is the same grammar [`Self::parse_type_specifier`] reads, counted
+    /// rather than interpreted: the cast lookahead has to know where a
+    /// specifier ends before committing to parsing one.
+    ///
+    /// # Returns
+    ///
+    /// `None` when no specifier starts there.
+    fn specifier_length(&self, offset: usize) -> Option<usize> {
+        let kind = self.peek_kind(offset)?;
+        if !Self::starts_type(kind) {
+            return None;
+        }
+        Some(match kind {
+            // `struct Point`: the tag is part of the specifier.
+            TokenKind::Struct => 2,
+            // `unsigned`, `unsigned char`, `unsigned long`, `unsigned long int`.
+            TokenKind::Signed | TokenKind::Unsigned => match self.peek_kind(offset + 1) {
+                Some(TokenKind::Char | TokenKind::Int) => 2,
+                Some(TokenKind::Long) => {
+                    2 + usize::from(self.peek_kind(offset + 2) == Some(TokenKind::Int))
+                }
+                // Anything else is not a type a signedness can qualify, so the
+                // specifier is one word: `unsigned` on its own is `unsigned
+                // int`.
+                _ => 1,
+            },
+            // `long` and `long int` name the same type.
+            TokenKind::Long if self.peek_kind(offset + 1) == Some(TokenKind::Int) => 2,
+            _ => 1,
+        })
     }
 
     // ### Token stream helpers ###
@@ -1051,7 +1140,7 @@ mod tests {
                 name,
                 initializer,
             } => {
-                assert_eq!(*ty, CType::Int);
+                assert_eq!(*ty, CType::Int(Sign::Signed));
                 assert_eq!(name, "x");
                 assert!(initializer.is_none());
             }
@@ -1068,7 +1157,7 @@ mod tests {
                 name,
                 initializer,
             } => {
-                assert_eq!(*ty, CType::Int);
+                assert_eq!(*ty, CType::Int(Sign::Signed));
                 assert_eq!(name, "x");
                 let init = initializer.as_ref().expect("missing initializer");
                 assert!(matches!(init.kind, ExprKind::Literal(Literal::Int(42))));
@@ -1085,7 +1174,10 @@ mod tests {
                 assert_eq!(name, "p");
                 assert_eq!(
                     *ty,
-                    CType::Array(Box::new(CType::Pointer(Box::new(CType::Int))), Some(10))
+                    CType::Array(
+                        Box::new(CType::Pointer(Box::new(CType::Int(Sign::Signed)))),
+                        Some(10)
+                    )
                 );
             }
             _ => panic!("expected variable declaration"),
@@ -1102,13 +1194,13 @@ mod tests {
                 params,
                 body,
             } => {
-                assert_eq!(*return_ty, CType::Int);
+                assert_eq!(*return_ty, CType::Int(Sign::Signed));
                 assert_eq!(name, "add");
                 assert_eq!(params.len(), 2);
                 assert!(body.is_none());
-                assert_eq!(params[0].ty, CType::Int);
+                assert_eq!(params[0].ty, CType::Int(Sign::Signed));
                 assert_eq!(params[0].name.as_deref(), Some("a"));
-                assert_eq!(params[1].ty, CType::Int);
+                assert_eq!(params[1].ty, CType::Int(Sign::Signed));
                 assert_eq!(params[1].name.as_deref(), Some("b"));
             }
             _ => panic!("expected function declaration"),
@@ -1121,7 +1213,7 @@ mod tests {
         match &tu[0].kind {
             DeclKind::Function { params, .. } => {
                 assert_eq!(params.len(), 1);
-                assert_eq!(params[0].ty, CType::Int);
+                assert_eq!(params[0].ty, CType::Int(Sign::Signed));
                 assert!(params[0].name.is_none());
             }
             _ => panic!("expected function declaration"),
@@ -1139,6 +1231,81 @@ mod tests {
                 ..
             }) => assert!(matches!(expr.kind, ExprKind::Binary(BinaryOp::Add, _, _))),
             other => panic!("unexpected block item: {other:?}"),
+        }
+    }
+
+    /// The declared type of `src`, which must be one variable declaration.
+    fn declared_type(src: &str) -> CType {
+        let tu = parse_ok(src);
+        match &tu[0].kind {
+            DeclKind::Variable { ty, .. } => ty.clone(),
+            other => panic!("expected a variable declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_every_spelling_of_the_integer_types() {
+        // Arrange / Act / Assert: `signed` and `unsigned` may stand alone or
+        // qualify a type, and the `int` after a `long` is redundant either
+        // way.
+        assert_eq!(declared_type("unsigned x;"), CType::Int(Sign::Unsigned));
+        assert_eq!(declared_type("signed x;"), CType::Int(Sign::Signed));
+        assert_eq!(declared_type("unsigned int x;"), CType::Int(Sign::Unsigned));
+        assert_eq!(
+            declared_type("unsigned char x;"),
+            CType::Char(Sign::Unsigned)
+        );
+        assert_eq!(
+            declared_type("unsigned long x;"),
+            CType::Long(Sign::Unsigned)
+        );
+        assert_eq!(
+            declared_type("unsigned long int x;"),
+            CType::Long(Sign::Unsigned)
+        );
+        assert_eq!(declared_type("signed char x;"), CType::Char(Sign::Signed));
+        assert_eq!(declared_type("long x;"), CType::Long(Sign::Signed));
+    }
+
+    #[test]
+    fn a_signedness_only_qualifies_the_types_that_have_one() {
+        // Arrange / Act: `unsigned float` is not a type.
+        let (_, errors) = parse("int main() { unsigned float f; return 0; }");
+
+        // Assert
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(
+            errors[0].message.contains("`char`, `int` or `long`"),
+            "unexpected message: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn recognises_a_cast_however_many_words_its_type_takes() {
+        // Arrange / Act / Assert: the lookahead has to reach past the whole
+        // specifier to the `)` before it can tell a cast from a
+        // parenthesised expression.
+        for source in [
+            "int f(int x){ return (unsigned) x; }",
+            "int f(int x){ return (unsigned int) x; }",
+            "int f(int x){ return (unsigned char) x; }",
+            "int f(int x){ return (unsigned long) x; }",
+            "int f(int x){ return (unsigned long int) x; }",
+            "int f(int x){ return (long int) x; }",
+        ] {
+            let items = parse_function_body(source);
+            match &items[0] {
+                BlockItem::Stmt(Stmt {
+                    kind: StmtKind::Return(Some(expr)),
+                    ..
+                }) => assert!(
+                    matches!(expr.kind, ExprKind::Cast(_, _)),
+                    "`{source}` should parse as a cast, got {:?}",
+                    expr.kind
+                ),
+                other => panic!("unexpected block item: {other:?}"),
+            }
         }
     }
 

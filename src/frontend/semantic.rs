@@ -5,13 +5,14 @@
 //! top-level declaration rather than aborting the pass, so one run reports the
 //! problems in several functions.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
-    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Stmt,
-    StmtKind, UnaryOp,
+    BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Sign,
+    Stmt, StmtKind, UnaryOp,
 };
 use crate::frontend::scope::ScopeStack;
 use crate::frontend::span::Span;
@@ -246,10 +247,18 @@ fn arguments(count: usize) -> String {
 /// crashing a later phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
-    /// `int`: a 32-bit signed integer, as on every ABI this compiler targets.
-    Int,
-    /// `long int`: a 64-bit signed integer.
-    Long,
+    /// `char`: an 8-bit integer.
+    ///
+    /// Plain `char` is *signed* here, which is what the System V x86-64 ABI
+    /// says it is. That is a per-ABI choice rather than a rule of the
+    /// language, and it is the reason widening a plain `char` sign-extends
+    /// where widening an `unsigned char` fills with zeroes: see
+    /// [`Type::promoted`] and the `Convert` lowering in the backend.
+    Char(Sign),
+    /// `int`: a 32-bit integer, as on every ABI this compiler targets.
+    Int(Sign),
+    /// `long int`: a 64-bit integer.
+    Long(Sign),
     Void,
     /// A fixed-size array of a primitive type, e.g. `int arr[3]` -> `Array(Int, 3)`.
     Array(Box<Type>, usize),
@@ -260,8 +269,9 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Int => write!(f, "int"),
-            Type::Long => write!(f, "long int"),
+            Type::Char(sign) => write!(f, "{}char", sign.prefix()),
+            Type::Int(sign) => write!(f, "{}int", sign.prefix()),
+            Type::Long(sign) => write!(f, "{}long int", sign.prefix()),
             Type::Void => write!(f, "void"),
             Type::Array(elem, size) => write!(f, "{elem}[{size}]"),
             Type::Pointer(inner) => write!(f, "{inner}*"),
@@ -281,12 +291,12 @@ impl Type {
     /// # Errors
     ///
     /// Returns [`SemanticError::Unsupported`] for types the compiler cannot
-    /// lower yet: `char`, `float`, `double`, structs, and arrays of unknown
-    /// size.
+    /// lower yet: `float`, `double`, structs, and arrays of unknown size.
     fn from_ctype(ty: &CType, span: Span, context: &'static str) -> SemanticResult<Self> {
         match ty {
-            CType::Int => Ok(Type::Int),
-            CType::Long => Ok(Type::Long),
+            CType::Char(sign) => Ok(Type::Char(*sign)),
+            CType::Int(sign) => Ok(Type::Int(*sign)),
+            CType::Long(sign) => Ok(Type::Long(*sign)),
             CType::Void => Ok(Type::Void),
             CType::Array(elem, Some(size)) => Ok(Type::Array(
                 Box::new(Type::from_ctype(elem, span, context)?),
@@ -295,43 +305,103 @@ impl Type {
             CType::Pointer(inner) => Ok(Type::Pointer(Box::new(Type::from_ctype(
                 inner, span, context,
             )?))),
-            CType::Char
-            | CType::Float
-            | CType::Double
-            | CType::Struct(_)
-            | CType::Array(_, None) => Err(SemanticError::Unsupported {
-                feature: format!("the type `{ty}`"),
-                span,
-                context,
-            }),
+            CType::Float | CType::Double | CType::Struct(_) | CType::Array(_, None) => {
+                Err(SemanticError::Unsupported {
+                    feature: format!("the type `{ty}`"),
+                    span,
+                    context,
+                })
+            }
+        }
+    }
+
+    /// The plain signed `int`.
+    ///
+    /// It is what every promotion lands on, what a comparison answers with,
+    /// and what a diagnostic names when what it really wants is "an integer",
+    /// so it is worth a name of its own.
+    pub const INT: Type = Type::Int(Sign::Signed);
+
+    /// How many bytes an integer type occupies and how its top bit reads.
+    ///
+    /// # Returns
+    ///
+    /// `None` for everything that is not an integer type, which is what
+    /// [`Type::is_integer`] asks.
+    fn integer(&self) -> Option<(u8, Sign)> {
+        Some(match *self {
+            Type::Char(sign) => (1, sign),
+            Type::Int(sign) => (4, sign),
+            Type::Long(sign) => (8, sign),
+            Type::Void | Type::Array(_, _) | Type::Pointer(_) => return None,
+        })
+    }
+
+    /// The integer type that is `bytes` wide and reads as `sign`.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `bytes` is the size of one of the integer types. Callers
+    /// take it from [`Type::integer`], so anything else is a compiler bug.
+    fn integer_of(bytes: u8, sign: Sign) -> Type {
+        match bytes {
+            1 => Type::Char(sign),
+            4 => Type::Int(sign),
+            8 => Type::Long(sign),
+            other => panic!("Compiler Bug: no integer type is {other} bytes wide"),
         }
     }
 
     /// Whether this is one of the integer types, which are the only ones
     /// arithmetic, comparisons and conditions accept.
     pub fn is_integer(&self) -> bool {
-        matches!(self, Type::Int | Type::Long)
+        self.integer().is_some()
+    }
+
+    /// This type after the integer promotions.
+    ///
+    /// C promotes anything narrower than an `int` to an `int` before an
+    /// operator ever sees it, so `c1 + c2` adds two `int`s and has type `int`
+    /// even though neither operand was one. The promotion is to the *signed*
+    /// `int` even from an `unsigned char`, because an `int` can represent
+    /// every value eight bits can hold whichever way they read. Nothing else
+    /// is affected: the types that are already at least as wide as an `int`
+    /// promote to themselves.
+    pub fn promoted(&self) -> Type {
+        match self {
+            Type::Char(_) => Type::Int(Sign::Signed),
+            other => other.clone(),
+        }
     }
 
     /// The type both operands of an arithmetic or relational operator are
     /// converted to before it is applied.
     ///
-    /// C calls this the usual arithmetic conversions. With two integer types
-    /// they come down to one rule: if either side is the wider one, both sides
-    /// are widened to it.
+    /// C calls this the usual arithmetic conversions: the operands are
+    /// promoted first, and then the wider type wins -- and where they are
+    /// equally wide, the unsigned one does. That is the standard's rule
+    /// spelled out for the types here. A `long int` can represent every value
+    /// an `unsigned int` has, so the wider signed type is enough for that
+    /// pair; `int` and `unsigned int` have no such type between them, and meet
+    /// as `unsigned int`.
     ///
     /// # Panics
     ///
     /// Panics unless both types are integers, which the caller checks first.
     pub fn common(lhs: &Type, rhs: &Type) -> Type {
-        assert!(
-            lhs.is_integer() && rhs.is_integer(),
-            "Compiler Bug: the usual arithmetic conversions apply to integers only"
-        );
-        match (lhs, rhs) {
-            (Type::Long, _) | (_, Type::Long) => Type::Long,
-            _ => Type::Int,
-        }
+        let (lhs, rhs) = (lhs.promoted(), rhs.promoted());
+        let ((lhs_bytes, lhs_sign), (rhs_bytes, rhs_sign)) = match (lhs.integer(), rhs.integer()) {
+            (Some(left), Some(right)) => (left, right),
+            _ => panic!("Compiler Bug: the usual arithmetic conversions apply to integers only"),
+        };
+
+        let sign = match lhs_bytes.cmp(&rhs_bytes) {
+            Ordering::Greater => lhs_sign,
+            Ordering::Less => rhs_sign,
+            Ordering::Equal if lhs_sign == rhs_sign => lhs_sign,
+            Ordering::Equal => Sign::Unsigned,
+        };
+        Type::integer_of(lhs_bytes.max(rhs_bytes), sign)
     }
 }
 
@@ -536,7 +606,7 @@ impl SemanticAnalyzer {
         let var_ty = Type::from_ctype(ty, decl.span, "in this declaration")?;
         if var_ty == Type::Void {
             return Err(SemanticError::TypeError {
-                expected: Type::Int,
+                expected: Type::INT,
                 found: Type::Void,
                 span: decl.span,
                 origin: None,
@@ -817,15 +887,22 @@ impl SemanticAnalyzer {
     ///
     /// C gives an unsuffixed integer literal the first type of `int`, `long
     /// int`, ... that can represent it, so a literal too large for 32 bits is
-    /// already a `long int` where it is written.
+    /// already a `long int` where it is written. One too large for a signed
+    /// 64-bit type has only `unsigned long int` left, which is the type GCC
+    /// gives it too.
+    ///
+    /// A character constant is an integer literal too: `'a'` has type `int` in
+    /// C and not `char`, which is why `sizeof('a')` is 4 rather than 1. Only
+    /// the *value* comes from the character.
     fn literal_type(literal: &Literal, span: Span) -> SemanticResult<Type> {
         match literal {
-            Literal::Int(value) => match i32::try_from(*value) {
-                Ok(_) => Ok(Type::Int),
-                Err(_) => Ok(Type::Long),
-            },
+            Literal::Int(value) => Ok(match value {
+                _ if i32::try_from(*value).is_ok() => Type::INT,
+                _ if i64::try_from(*value).is_ok() => Type::Long(Sign::Signed),
+                _ => Type::Long(Sign::Unsigned),
+            }),
+            Literal::Char(_) => Ok(Type::INT),
             Literal::Float(_) => Err(SemanticError::unsupported_literal("floating-point", span)),
-            Literal::Char(_) => Err(SemanticError::unsupported_literal("character", span)),
             Literal::String(_) => Err(SemanticError::unsupported_literal("string", span)),
         }
     }
@@ -926,7 +1003,7 @@ impl SemanticAnalyzer {
             | BinaryOp::Gt
             | BinaryOp::Gte
             | BinaryOp::LogicalAnd
-            | BinaryOp::LogicalOr => Type::Int,
+            | BinaryOp::LogicalOr => Type::INT,
             _ => Type::common(&lhs_ty, &rhs_ty),
         })
     }
@@ -943,11 +1020,15 @@ impl SemanticAnalyzer {
             | UnaryOp::PostInc
             | UnaryOp::PostDec => {
                 Self::expect_integer(&operand_ty, operand.span, OPERANDS_MUST_BE_INTEGERS)?;
-                // `!x` answers a question and so is an `int`; the rest keep
-                // the width they were given.
+                // `!x` answers a question and so is an `int`; `++x` and `x--`
+                // read and write one object and keep its type; the arithmetic
+                // ones promote their operand, so `-c` on a `char` is an `int`.
                 match op {
-                    UnaryOp::Not => Ok(Type::Int),
-                    _ => Ok(operand_ty),
+                    UnaryOp::Not => Ok(Type::INT),
+                    UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec => {
+                        Ok(operand_ty)
+                    }
+                    _ => Ok(operand_ty.promoted()),
                 }
             }
             UnaryOp::AddressOf => {
@@ -994,7 +1075,7 @@ impl SemanticAnalyzer {
         match found.is_integer() {
             true => Ok(()),
             false => Err(SemanticError::TypeError {
-                expected: Type::Int,
+                expected: Type::INT,
                 found: found.clone(),
                 span,
                 origin: None,
@@ -1196,6 +1277,97 @@ mod tests {
         analyze_ok("int main() { long int a = 1; long int b = 2; int less = a < b; return less; }");
     }
 
+    /// The signed and unsigned forms of the type `bytes` bytes wide.
+    fn pair(bytes: u8) -> (Type, Type) {
+        (
+            Type::integer_of(bytes, Sign::Signed),
+            Type::integer_of(bytes, Sign::Unsigned),
+        )
+    }
+
+    #[test]
+    fn a_char_promotes_to_an_int_before_any_operator_sees_it() {
+        // Arrange
+        let (char_, uchar) = pair(1);
+        let (int, uint) = pair(4);
+        let (long, ulong) = pair(8);
+
+        // Act / Assert: the integer promotions, which are why `c1 + c2` has
+        // type `int` rather than `char`. Both eight-bit types promote to the
+        // *signed* `int`, which can represent every value either of them has.
+        assert_eq!(char_.promoted(), int);
+        assert_eq!(uchar.promoted(), int);
+        assert_eq!(int.promoted(), int);
+        assert_eq!(uint.promoted(), uint);
+        assert_eq!(long.promoted(), long);
+        assert_eq!(ulong.promoted(), ulong);
+
+        assert_eq!(Type::common(&char_, &uchar), int);
+        assert_eq!(Type::common(&char_, &int), int);
+        assert_eq!(Type::common(&char_, &long), long);
+    }
+
+    #[test]
+    fn the_usual_arithmetic_conversions_favour_width_then_unsignedness() {
+        // Arrange
+        let (int, uint) = pair(4);
+        let (long, ulong) = pair(8);
+
+        // Act / Assert: equally wide, the unsigned type wins, because no type
+        // here can represent every value of both ...
+        assert_eq!(Type::common(&int, &uint), uint);
+        assert_eq!(Type::common(&uint, &int), uint);
+        assert_eq!(Type::common(&long, &ulong), ulong);
+
+        // ... but a wider signed type can represent every value of a narrower
+        // unsigned one, so width decides first.
+        assert_eq!(Type::common(&uint, &long), long);
+        assert_eq!(Type::common(&long, &uint), long);
+        assert_eq!(Type::common(&int, &ulong), ulong);
+    }
+
+    #[test]
+    fn accepts_the_unsigned_types_and_the_conversions_between_them() {
+        analyze_ok(
+            "unsigned int scale(unsigned char c) { return c * 2; } \
+             int main() { unsigned int u = 4294967295; unsigned long int w = u; \
+             unsigned char b = u; int i = u; u = i; return scale(b) + w + u; }",
+        );
+    }
+
+    #[test]
+    fn unsigned_is_a_type_specifier_on_its_own() {
+        // `unsigned` with nothing after it means `unsigned int`.
+        analyze_ok("int main() { unsigned u = 1; unsigned int v = u; return v; }");
+    }
+
+    #[test]
+    fn a_character_constant_has_type_int() {
+        // Arrange / Act / Assert: `'a'` is an `int` in C, which is why
+        // `sizeof('a')` is 4 and not 1.
+        let span = Span::new(1, 1, 0, 3);
+        assert_eq!(
+            SemanticAnalyzer::literal_type(&Literal::Char(b'a'), span),
+            Ok(Type::INT)
+        );
+    }
+
+    #[test]
+    fn accepts_char_declarations_and_the_conversions_around_them() {
+        analyze_ok(
+            "char twice(char c) { return c + c; } \
+             int main() { char c = 'A'; int wide = c; c = wide; return twice((char) wide); }",
+        );
+    }
+
+    #[test]
+    fn accepts_a_char_wherever_an_integer_is_required() {
+        analyze_ok(
+            "int main() { char c = 'a'; char a[2]; a[c - 'a'] = c; \
+             if (c) { while (c > 'A') { c = c - 1; } } return !c; }",
+        );
+    }
+
     #[test]
     fn rejects_a_pointer_where_an_integer_is_required() {
         // The two integer types convert to each other, but a pointer is not
@@ -1205,8 +1377,8 @@ mod tests {
             SemanticError::TypeError {
                 expected, found, ..
             } => {
-                assert_eq!(expected, Type::Long);
-                assert_eq!(found, Type::Pointer(Box::new(Type::Int)));
+                assert_eq!(expected, Type::Long(Sign::Signed));
+                assert_eq!(found, Type::Pointer(Box::new(Type::INT)));
             }
             other => panic!("expected TypeError, got: {other:?}"),
         }
@@ -1218,11 +1390,11 @@ mod tests {
         let span = Span::new(1, 1, 0, 1);
         assert_eq!(
             SemanticAnalyzer::literal_type(&Literal::Int(2147483647), span),
-            Ok(Type::Int)
+            Ok(Type::INT)
         );
         assert_eq!(
             SemanticAnalyzer::literal_type(&Literal::Int(2147483648), span),
-            Ok(Type::Long)
+            Ok(Type::Long(Sign::Signed))
         );
     }
 

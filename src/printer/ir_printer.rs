@@ -36,13 +36,28 @@ impl fmt::Display for Opcode {
             Opcode::Add => "+",
             Opcode::Sub => "-",
             Opcode::Mul => "*",
-            Opcode::Div => "/",
+            Opcode::Div(sign) => match sign {
+                Sign::Signed => "/",
+                Sign::Unsigned => "/u",
+            },
             Opcode::Eq => "==",
             Opcode::Neq => "!=",
-            Opcode::Lt => "<",
-            Opcode::Lte => "<=",
-            Opcode::Gt => ">",
-            Opcode::Gte => ">=",
+            Opcode::Lt(sign) => match sign {
+                Sign::Signed => "<",
+                Sign::Unsigned => "<u",
+            },
+            Opcode::Lte(sign) => match sign {
+                Sign::Signed => "<=",
+                Sign::Unsigned => "<=u",
+            },
+            Opcode::Gt(sign) => match sign {
+                Sign::Signed => ">",
+                Sign::Unsigned => ">u",
+            },
+            Opcode::Gte(sign) => match sign {
+                Sign::Signed => ">=",
+                Sign::Unsigned => ">=u",
+            },
             Opcode::Mov => "=",
             Opcode::Jump => "jmp",
             Opcode::BranchIf => "br_if",
@@ -57,7 +72,7 @@ impl fmt::Display for Opcode {
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::AddrOf => "addr_of",
-            Opcode::Convert => "convert",
+            Opcode::Convert { .. } => "convert",
         };
         write!(f, "{}", op_str)
     }
@@ -81,14 +96,14 @@ impl fmt::Display for TACInstruction {
             Opcode::Add
             | Opcode::Sub
             | Opcode::Mul
-            | Opcode::Div
+            | Opcode::Div(_)
             | Opcode::Eq
             | Opcode::Neq
-            | Opcode::Lt
-            | Opcode::Lte
-            | Opcode::Gt
+            | Opcode::Lt(_)
+            | Opcode::Lte(_)
+            | Opcode::Gt(_)
             | Opcode::Call
-            | Opcode::Gte => {
+            | Opcode::Gte(_) => {
                 write!(
                     f,
                     "{} = {} {}.{} {}",
@@ -109,11 +124,17 @@ impl fmt::Display for TACInstruction {
                     format_op(&self.arg1)
                 )
             }
-            Opcode::Convert => {
+            // Both widths are printed, since a conversion is exactly the
+            // step from one to the other, and the source's signedness with
+            // them: `t1 = convert.u8to32 t2` fills with zeroes where
+            // `convert.8to32` copies a sign bit.
+            Opcode::Convert { from, sign } => {
                 write!(
                     f,
-                    "{} = convert.{} {}",
+                    "{} = convert.{}{}to{} {}",
                     format_op(&self.dest),
+                    unsigned_mark(sign),
+                    from,
                     width,
                     format_op(&self.arg1)
                 )
@@ -352,7 +373,19 @@ impl fmt::Display for InstText<'_> {
                 operand(*rhs)
             ),
             ssa::Op::Copy(source) => write!(f, "{}", operand(*source)),
-            ssa::Op::Convert { to, value } => write!(f, "convert.{} {}", to, operand(*value)),
+            ssa::Op::Convert {
+                from,
+                sign,
+                to,
+                value,
+            } => write!(
+                f,
+                "convert.{}{}to{} {}",
+                unsigned_mark(*sign),
+                from,
+                to,
+                operand(*value)
+            ),
             ssa::Op::Call { callee, args } => {
                 write!(f, "call {}(", callee)?;
                 for (position, argument) in args.iter().enumerate() {
@@ -529,12 +562,28 @@ fn binary_symbol(operator: ssa::BinOp) -> &'static str {
         ssa::BinOp::Add => "+",
         ssa::BinOp::Sub => "-",
         ssa::BinOp::Mul => "*",
-        ssa::BinOp::Div => "/",
         ssa::BinOp::Eq => "==",
         ssa::BinOp::Neq => "!=",
-        ssa::BinOp::Lt => "<",
-        ssa::BinOp::Lte => "<=",
-        ssa::BinOp::Gt => ">",
-        ssa::BinOp::Gte => ">=",
+        // The operations that read their operands' bits say how, so that two
+        // instructions which are not the same operation do not print alike.
+        ssa::BinOp::Div(Sign::Signed) => "/",
+        ssa::BinOp::Div(Sign::Unsigned) => "/u",
+        ssa::BinOp::Lt(Sign::Signed) => "<",
+        ssa::BinOp::Lt(Sign::Unsigned) => "<u",
+        ssa::BinOp::Lte(Sign::Signed) => "<=",
+        ssa::BinOp::Lte(Sign::Unsigned) => "<=u",
+        ssa::BinOp::Gt(Sign::Signed) => ">",
+        ssa::BinOp::Gt(Sign::Unsigned) => ">u",
+        ssa::BinOp::Gte(Sign::Signed) => ">=",
+        ssa::BinOp::Gte(Sign::Unsigned) => ">=u",
+    }
+}
+
+/// The `u` an unsigned operation is marked with in a dump, e.g. the one in
+/// `convert.u8to32`.
+fn unsigned_mark(sign: Sign) -> &'static str {
+    match sign {
+        Sign::Signed => "",
+        Sign::Unsigned => "u",
     }
 }

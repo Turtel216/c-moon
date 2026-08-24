@@ -134,16 +134,16 @@ fn data_flow(opcode: &Opcode) -> DataFlow {
         Opcode::Add
         | Opcode::Sub
         | Opcode::Mul
-        | Opcode::Div
+        | Opcode::Div(_)
         | Opcode::Eq
         | Opcode::Neq
-        | Opcode::Lt
-        | Opcode::Lte
-        | Opcode::Gt
-        | Opcode::Gte => flow(BOTH_ARGS, true),
+        | Opcode::Lt(_)
+        | Opcode::Lte(_)
+        | Opcode::Gt(_)
+        | Opcode::Gte(_) => flow(BOTH_ARGS, true),
 
         // `dest = arg1`, `dest = *arg1`, and `dest = (width) arg1`.
-        Opcode::Mov | Opcode::Load | Opcode::Convert => flow(ARG1, true),
+        Opcode::Mov | Opcode::Load | Opcode::Convert { .. } => flow(ARG1, true),
 
         // `dest = arg1[arg2]` and `dest = &arg1[arg2]`.
         Opcode::ArrayLoad | Opcode::ArrayAddr => flow(BOTH_ARGS, true),

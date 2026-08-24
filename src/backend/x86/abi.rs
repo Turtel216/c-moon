@@ -25,6 +25,10 @@ pub const ARGUMENT_REGISTERS: &[X86Register] = &[
 /// The register a function returns its value in.
 pub const RETURN_VALUE: X86Register = X86Register::Rax;
 
+/// The high half of the dividend an `idiv` or a `div` reads, and where the
+/// remainder is left.  Reserved for exactly that reason.
+pub const DIVIDEND_HIGH: X86Register = X86Register::Rdx;
+
 /// The frame pointer.  Every frame slot is addressed relative to it.
 pub const FRAME_POINTER: X86Register = X86Register::Rbp;
 
@@ -122,7 +126,7 @@ mod tests {
         // The code generator assumes it can always clobber these.
         for reserved in [
             RETURN_VALUE,
-            X86Register::Rdx,
+            DIVIDEND_HIGH,
             SCRATCH,
             SCRATCH2,
             FRAME_POINTER,
