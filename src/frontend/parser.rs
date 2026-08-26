@@ -308,11 +308,13 @@ impl<'a> Parser<'a> {
             (None, start)
         };
 
-        // A forward declaration names the tag but declares no members.
+        // A forward declaration names the tag but says nothing about what it
+        // holds, which is not the same as a definition that happens to be
+        // empty -- only the latter gives the type a layout.
         let members = if self.match_kind(TokenKind::LBrace) {
-            self.parse_struct_members()?
+            Some(self.parse_struct_members()?)
         } else {
-            Vec::new()
+            None
         };
         self.expect(TokenKind::Semicolon, "after struct declaration")?;
 
@@ -1438,7 +1440,7 @@ mod tests {
         match &tu[0].kind {
             DeclKind::Struct { name, members } => {
                 assert_eq!(name.as_deref(), Some("Point"));
-                assert_eq!(members.len(), 2);
+                assert_eq!(members.as_deref().map(<[_]>::len), Some(2));
             }
             _ => panic!("expected struct declaration"),
         }
@@ -1450,7 +1452,8 @@ mod tests {
         match &tu[0].kind {
             DeclKind::Struct { name, members } => {
                 assert_eq!(name.as_deref(), Some("Point"));
-                assert!(members.is_empty());
+                // No body, as opposed to a definition with an empty one.
+                assert_eq!(*members, None);
             }
             other => panic!("expected struct declaration, got {other:?}"),
         }

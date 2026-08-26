@@ -4,6 +4,11 @@
 //! variable types and a table of function signatures. Errors are collected per
 //! top-level declaration rather than aborting the pass, so one run reports the
 //! problems in several functions.
+//!
+//! Struct definitions are laid out as they are met, which is what C requires
+//! anyway: a struct must be defined before an object of it can exist. The
+//! resulting [`StructTable`] travels to the middle-end inside the [`TypeMap`],
+//! where a member's byte offset becomes the address a load reads from.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -14,6 +19,7 @@ use crate::frontend::ast::{
     BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Sign,
     Stmt, StmtKind, UnaryOp,
 };
+use crate::frontend::layout::StructTable;
 use crate::frontend::scope::ScopeStack;
 use crate::frontend::span::Span;
 use crate::frontend::suggest;
@@ -47,6 +53,13 @@ pub enum SemanticError {
     RedeclaredFunction {
         name: String,
         span: Span,
+        previous: Span,
+    },
+    /// A struct tag defined twice.
+    RedeclaredStruct {
+        name: String,
+        span: Span,
+        /// Where the tag was defined the first time.
         previous: Span,
     },
     ArgumentCountMismatch {
@@ -88,6 +101,35 @@ pub enum SemanticError {
         /// Where it was attempted, e.g. `in this variable declaration`.
         context: &'static str,
     },
+    /// An object of a type whose size is not known: a `struct` tag that was
+    /// declared but never defined, or an array of one.
+    IncompleteType {
+        ty: Type,
+        span: Span,
+        /// What the size was needed for, e.g. `in this declaration`.
+        context: &'static str,
+        /// A defined tag the undefined one is probably a typo of.
+        suggestion: Option<String>,
+    },
+    /// `.` or `->` applied to something with no members to read.
+    NotAStruct {
+        found: Type,
+        span: Span,
+        /// Whether it was written `->` rather than `.`, which is what decides
+        /// the operator the help line proposes instead.
+        is_arrow: bool,
+    },
+    /// A member the struct does not have.
+    NoSuchMember {
+        /// The struct the member was looked for in.
+        struct_ty: Type,
+        member: String,
+        span: Span,
+        /// A member of that struct the name is probably a typo of.
+        suggestion: Option<String>,
+        /// Where the struct was defined, so the reader can see what it holds.
+        declared: Span,
+    },
 }
 
 impl fmt::Display for SemanticError {
@@ -118,6 +160,9 @@ impl fmt::Display for SemanticError {
                     _ => format!("{found} arguments were"),
                 }
             ),
+            SemanticError::RedeclaredStruct { name, .. } => {
+                write!(f, "the struct `{name}` is defined multiple times")
+            }
             SemanticError::TypeError { .. } => write!(f, "mismatched types"),
             SemanticError::NotIndexable { found, .. } => {
                 write!(f, "cannot index into a value of type `{found}`")
@@ -131,6 +176,20 @@ impl fmt::Display for SemanticError {
             SemanticError::Unsupported { feature, .. } => {
                 write!(f, "{feature} is not supported yet")
             }
+            SemanticError::IncompleteType { ty, .. } => {
+                write!(f, "the type `{ty}` is incomplete")
+            }
+            SemanticError::NotAStruct {
+                found,
+                is_arrow: true,
+                ..
+            } => write!(f, "type `{found}` is not a pointer to a struct"),
+            SemanticError::NotAStruct { found, .. } => {
+                write!(f, "type `{found}` is not a struct")
+            }
+            SemanticError::NoSuchMember {
+                struct_ty, member, ..
+            } => write!(f, "no member named `{member}` on type `{struct_ty}`"),
         }
     }
 }
@@ -181,6 +240,18 @@ impl CompilerError for SemanticError {
                 .with_secondary(previous, format!("previous definition of `{name}` here"))
                 .with_note(format!("`{name}` must be defined only once")),
 
+            SemanticError::RedeclaredStruct {
+                name,
+                span,
+                previous,
+            } => Diagnostic::error(codes::DUPLICATE_DEFINITION, message, span)
+                .with_label(format!("`{name}` redefined here"))
+                .with_secondary(
+                    previous,
+                    format!("previous definition of `struct {name}` here"),
+                )
+                .with_note(format!("`struct {name}` must be defined only once")),
+
             SemanticError::ArgumentCountMismatch {
                 name,
                 expected,
@@ -228,6 +299,56 @@ impl CompilerError for SemanticError {
                     .with_label(context)
                     .with_note("this compiler implements the subset of C listed in its README")
             }
+
+            SemanticError::IncompleteType {
+                ty,
+                span,
+                context,
+                suggestion,
+            } => Diagnostic::error(codes::INCOMPLETE_TYPE, message, span)
+                .with_label(context)
+                .with_note(format!(
+                    "`{ty}` is not defined at this point, so neither its size nor its members \
+                     are known"
+                ))
+                .with_optional_help(
+                    suggestion.map(|tag| format!("a struct with a similar name exists: `{tag}`")),
+                ),
+
+            SemanticError::NotAStruct {
+                found,
+                span,
+                is_arrow,
+            } => {
+                // Reaching for the wrong one of the pair is the usual mistake,
+                // so the help says which one this operand wants.
+                let help = match (is_arrow, &found) {
+                    (true, Type::Struct(_)) => Some("`.` reads a member of a struct value"),
+                    (false, Type::Pointer(pointee)) if pointee.is_struct() => {
+                        Some("`->` reads a member through a pointer to a struct")
+                    }
+                    _ => None,
+                };
+                Diagnostic::error(codes::MISMATCHED_TYPES, message, span)
+                    .with_label(match is_arrow {
+                        true => "not a pointer to a struct",
+                        false => "not a struct",
+                    })
+                    .with_optional_help(help.map(str::to_owned))
+            }
+
+            SemanticError::NoSuchMember {
+                span,
+                suggestion,
+                declared,
+                struct_ty,
+                ..
+            } => Diagnostic::error(codes::UNKNOWN_MEMBER, message, span)
+                .with_label("unknown member")
+                .with_secondary(declared, format!("`{struct_ty}` defined here"))
+                .with_optional_help(
+                    suggestion.map(|name| format!("a member with a similar name exists: `{name}`")),
+                ),
         }
     }
 }
@@ -264,6 +385,15 @@ pub enum Type {
     Array(Box<Type>, usize),
     /// A pointer to another type, e.g. `int *p` -> `Pointer(Int)`.
     Pointer(Box<Type>),
+    /// `struct Tag`.
+    ///
+    /// The tag is the whole type: two struct types are the same type exactly
+    /// when they name the same tag, and what the tag *holds* is recorded once
+    /// in the program's [`StructTable`] rather than in every copy of the type.
+    /// A tag with no entry there is an incomplete type -- named, but not yet
+    /// defined -- which is why the table is consulted before any object of a
+    /// struct type is created.
+    Struct(String),
 }
 
 impl fmt::Display for Type {
@@ -275,6 +405,7 @@ impl fmt::Display for Type {
             Type::Void => write!(f, "void"),
             Type::Array(elem, size) => write!(f, "{elem}[{size}]"),
             Type::Pointer(inner) => write!(f, "{inner}*"),
+            Type::Struct(tag) => write!(f, "struct {tag}"),
         }
     }
 }
@@ -291,7 +422,7 @@ impl Type {
     /// # Errors
     ///
     /// Returns [`SemanticError::Unsupported`] for types the compiler cannot
-    /// lower yet: `float`, `double`, structs, and arrays of unknown size.
+    /// lower yet: `float`, `double`, and arrays of unknown size.
     fn from_ctype(ty: &CType, span: Span, context: &'static str) -> SemanticResult<Self> {
         match ty {
             CType::Char(sign) => Ok(Type::Char(*sign)),
@@ -305,7 +436,13 @@ impl Type {
             CType::Pointer(inner) => Ok(Type::Pointer(Box::new(Type::from_ctype(
                 inner, span, context,
             )?))),
-            CType::Float | CType::Double | CType::Struct(_) | CType::Array(_, None) => {
+            // Whether the tag has been defined is not asked here: a pointer to
+            // an undefined struct is a perfectly good type, and it is what
+            // lets `struct Node *next;` appear inside `struct Node`. The
+            // question is asked where an *object* is created instead, by
+            // `SemanticAnalyzer::expect_complete`.
+            CType::Struct(tag) => Ok(Type::Struct(tag.clone())),
+            CType::Float | CType::Double | CType::Array(_, None) => {
                 Err(SemanticError::Unsupported {
                     feature: format!("the type `{ty}`"),
                     span,
@@ -333,7 +470,7 @@ impl Type {
             Type::Char(sign) => (1, sign),
             Type::Int(sign) => (4, sign),
             Type::Long(sign) => (8, sign),
-            Type::Void | Type::Array(_, _) | Type::Pointer(_) => return None,
+            Type::Void | Type::Array(_, _) | Type::Pointer(_) | Type::Struct(_) => return None,
         })
     }
 
@@ -356,6 +493,22 @@ impl Type {
     /// arithmetic, comparisons and conditions accept.
     pub fn is_integer(&self) -> bool {
         self.integer().is_some()
+    }
+
+    /// Whether this is a struct type.
+    pub fn is_struct(&self) -> bool {
+        matches!(self, Type::Struct(_))
+    }
+
+    /// Whether a value of this type lives in memory rather than in a register.
+    ///
+    /// An array and a struct are aggregates: several values behind one name,
+    /// which no single register can hold. That is what gives them storage of
+    /// their own in the frame, keeps them out of SSA form -- see
+    /// [`promote`](crate::middle::ssa::promote) -- and makes every read of one
+    /// of their parts a memory access.
+    pub fn is_aggregate(&self) -> bool {
+        matches!(self, Type::Array(_, _) | Type::Struct(_))
     }
 
     /// This type after the integer promotions.
@@ -446,6 +599,9 @@ pub struct TypeMap {
     decls: HashMap<NodeId, Type>,
     /// Every function's signature, by name.
     functions: HashMap<String, FunctionSig>,
+    /// Where the members of every defined struct sit, which is what turns
+    /// `s.x` into a load at a known offset.
+    structs: StructTable,
 }
 
 impl TypeMap {
@@ -481,6 +637,15 @@ impl TypeMap {
         self.functions
             .get(name)
             .expect("Compiler Bug: call to a function that was never declared")
+    }
+
+    /// The layout of every struct the translation unit defines.
+    ///
+    /// The middle-end lowers a member access with it: a member's offset is
+    /// what the address of `s.x` is formed from, and a type's size is what
+    /// reserves the frame storage the object needs.
+    pub fn structs(&self) -> &StructTable {
+        &self.structs
     }
 }
 
@@ -541,8 +706,11 @@ impl SemanticAnalyzer {
                 continue;
             };
 
+            let return_ty = Type::from_ctype(return_ty, decl.span, "in this return type")?;
+            Self::expect_passable(&return_ty, decl.span, "returning", "in this return type")?;
+
             let sig = FunctionSig {
-                return_ty: Type::from_ctype(return_ty, decl.span, "in this return type")?,
+                return_ty,
                 params: self.param_signatures(params)?,
                 span: decl.span,
             };
@@ -566,6 +734,7 @@ impl SemanticAnalyzer {
             .iter()
             .map(|param| {
                 let ty = Type::from_ctype(&param.ty, param.span, "in this parameter")?;
+                Self::expect_passable(&ty, param.span, "passing", "in this parameter")?;
                 self.types.decls.insert(param.id, ty.clone());
                 Ok(ParamSig {
                     ty,
@@ -590,9 +759,83 @@ impl SemanticAnalyzer {
                 ..
             } => self.analyze_function_decl(decl, return_ty, params, body.as_ref()),
 
-            // Struct definitions declare no runtime storage, and struct types
-            // are rejected by `Type::from_ctype` wherever they are used.
-            DeclKind::Struct { .. } => Ok(()),
+            DeclKind::Struct { name, members } => {
+                self.analyze_struct_decl(decl, name.as_deref(), members.as_deref())
+            }
+        }
+    }
+
+    /// Checks a struct declaration and, if it is a definition, lays it out.
+    ///
+    /// A definition is what gives the tag a layout, so it is also what makes
+    /// objects of that type possible. Members are laid out in the order they
+    /// are written; see [`StructTable::lay_out`].
+    ///
+    /// # Arguments
+    ///
+    /// * `decl` - the declaration, whose `name_span` is what a later
+    ///   diagnostic quotes as "defined here"
+    /// * `name` - the tag, absent for an anonymous `struct { ... };`
+    /// * `members` - the body, absent for the forward declaration `struct P;`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::RedeclaredStruct`] for a tag defined twice,
+    /// [`SemanticError::RedeclaredVariable`] for a member name used twice, and
+    /// [`SemanticError::IncompleteType`] for a member whose size is unknown --
+    /// which is what rejects a struct that contains itself.
+    fn analyze_struct_decl(
+        &mut self,
+        decl: &Decl,
+        name: Option<&str>,
+        members: Option<&[Decl]>,
+    ) -> SemanticResult<()> {
+        // A forward declaration says only that the tag exists. An anonymous
+        // definition names no type that anything could be declared with, so
+        // neither one has a layout to record.
+        let (Some(members), Some(tag)) = (members, name) else {
+            return Ok(());
+        };
+
+        let mut laid_out = Vec::with_capacity(members.len());
+        // Where each member name was first written, so the second use of one
+        // can point at it.
+        let mut declared: HashMap<&str, Span> = HashMap::with_capacity(members.len());
+
+        for member in members {
+            let DeclKind::Variable {
+                ty,
+                name: member_name,
+                ..
+            } = &member.kind
+            else {
+                panic!("Compiler Bug: a struct member is always a variable declaration");
+            };
+
+            if let Some(&previous) = declared.get(member_name.as_str()) {
+                return Err(SemanticError::RedeclaredVariable {
+                    name: member_name.clone(),
+                    span: member.name_span,
+                    previous,
+                });
+            }
+            declared.insert(member_name, member.name_span);
+
+            let member_ty = Type::from_ctype(ty, member.span, "in this member")?;
+            // The member needs a size, which is what rejects `struct S { struct
+            // S inner; };`: `S` is not defined until this loop has finished.
+            self.expect_complete(&member_ty, member.span, "in this member")?;
+            laid_out.push((member_name.clone(), member_ty, member.name_span));
+        }
+
+        let layout = self.types.structs.lay_out(laid_out, decl.name_span);
+        match self.types.structs.define(tag.to_owned(), layout) {
+            Some(previous) => Err(SemanticError::RedeclaredStruct {
+                name: tag.to_owned(),
+                span: decl.name_span,
+                previous: previous.span(),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -614,6 +857,7 @@ impl SemanticAnalyzer {
             });
         }
 
+        self.expect_complete(&var_ty, decl.span, "in this declaration")?;
         self.types.decls.insert(decl.id, var_ty.clone());
 
         let info = VarInfo {
@@ -860,21 +1104,33 @@ impl SemanticAnalyzer {
 
             ExprKind::Cast(to_ty, operand) => {
                 self.analyze_expr(operand)?;
-                Type::from_ctype(to_ty, expr.span, "in this cast")
+                let target = Type::from_ctype(to_ty, expr.span, "in this cast")?;
+                // A cast converts one value into another, and an aggregate is
+                // not one value: C has no cast to a struct or an array type.
+                match target.is_aggregate() {
+                    false => Ok(target),
+                    true => Err(SemanticError::TypeError {
+                        expected: Type::INT,
+                        found: target,
+                        span: expr.span,
+                        origin: None,
+                        context: "a cast converts to an integer or a pointer type",
+                    }),
+                }
             }
 
             ExprKind::Call { callee, args } => self.analyze_call(callee, args, expr.span),
 
             ExprKind::Index { array, index } => self.analyze_index(array, index),
 
-            // Out of current language scope: reject with clear unsupported
-            // diagnostics rather than crashing a later phase.
-            ExprKind::MemberAccess { .. } => Err(SemanticError::Unsupported {
-                feature: String::from("struct member access"),
-                span: expr.span,
-                context: "in this expression",
-            }),
+            ExprKind::MemberAccess {
+                base,
+                member,
+                is_arrow,
+            } => self.analyze_member_access(base, member, *is_arrow, expr.span),
 
+            // Out of current language scope: reject with a clear unsupported
+            // diagnostic rather than crashing a later phase.
             ExprKind::SizeOf(_) => Err(SemanticError::Unsupported {
                 feature: String::from("`sizeof`"),
                 span: expr.span,
@@ -920,6 +1176,68 @@ impl SemanticAnalyzer {
         let index_ty = self.analyze_expr(index)?;
         Self::expect_integer(&index_ty, index.span, "an array index must be an integer")?;
         Ok(*elem_ty)
+    }
+
+    /// Checks `base.member` or `base->member`.
+    ///
+    /// The two differ only in what they read the member out of: `.` reads it
+    /// from a struct, `->` from a pointer to one. Everything after that -- the
+    /// tag must be defined, and it must have such a member -- is the same.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - what the member is read from
+    /// * `member` - the name written after the operator
+    /// * `is_arrow` - whether it was written `->` rather than `.`
+    /// * `span` - the whole access, which is what a bad member is blamed on
+    ///
+    /// # Returns
+    ///
+    /// The member's declared type.
+    fn analyze_member_access(
+        &mut self,
+        base: &Expr,
+        member: &str,
+        is_arrow: bool,
+        span: Span,
+    ) -> SemanticResult<Type> {
+        let base_ty = self.analyze_expr(base)?;
+
+        let struct_ty = match (is_arrow, &base_ty) {
+            (false, Type::Struct(_)) => base_ty.clone(),
+            (true, Type::Pointer(pointee)) if pointee.is_struct() => (**pointee).clone(),
+            _ => {
+                return Err(SemanticError::NotAStruct {
+                    found: base_ty,
+                    span: base.span,
+                    is_arrow,
+                });
+            }
+        };
+
+        // A tag that was only forward-declared has no members to read: the
+        // pointer to it is fine, following it is not.
+        self.expect_complete(&struct_ty, base.span, "in this member access")?;
+
+        let Type::Struct(tag) = &struct_ty else {
+            unreachable!("the match above accepted only a struct type");
+        };
+        let layout = self
+            .types
+            .structs
+            .layout(tag)
+            .expect("`expect_complete` accepted the tag, so it is defined");
+
+        match layout.member(member) {
+            Some(found) => Ok(found.ty.clone()),
+            None => Err(SemanticError::NoSuchMember {
+                struct_ty: struct_ty.clone(),
+                member: member.to_owned(),
+                span,
+                suggestion: suggest::nearest(member, layout.member_names()).map(str::to_owned),
+                declared: layout.span(),
+            }),
+        }
     }
 
     fn analyze_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> SemanticResult<Type> {
@@ -1053,10 +1371,96 @@ impl SemanticAnalyzer {
     /// Whether an expression denotes an object: something that can be assigned
     /// to and whose address can be taken.
     fn is_lvalue(expr: &Expr) -> bool {
-        matches!(
-            expr.kind,
-            ExprKind::Identifier(_) | ExprKind::Index { .. } | ExprKind::Unary(UnaryOp::Deref, _)
-        )
+        match &expr.kind {
+            ExprKind::Identifier(_)
+            | ExprKind::Index { .. }
+            | ExprKind::Unary(UnaryOp::Deref, _) => true,
+            // `p->m` names an object wherever `p` points; `s.m` names one only
+            // if `s` itself does.
+            ExprKind::MemberAccess { base, is_arrow, .. } => *is_arrow || Self::is_lvalue(base),
+            _ => false,
+        }
+    }
+
+    /// Checks that a value of type `ty` can cross a call boundary.
+    ///
+    /// Neither aggregate can. A struct passed or returned by value is split
+    /// across argument registers or copied into the caller's frame according
+    /// to the System V classification rules; an array parameter is converted
+    /// to a pointer to its first element. Neither conversion is implemented,
+    /// so both travel through a pointer written out by hand.
+    ///
+    /// # Arguments
+    ///
+    /// * `ty` - the declared parameter or return type
+    /// * `span` - what to blame
+    /// * `action` - `passing` or `returning`, which the headline reads with
+    /// * `context` - `in this parameter` or `in this return type`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::Unsupported`] for an array or a struct type.
+    fn expect_passable(
+        ty: &Type,
+        span: Span,
+        action: &'static str,
+        context: &'static str,
+    ) -> SemanticResult<()> {
+        if !ty.is_aggregate() {
+            return Ok(());
+        }
+        // "By value" is what distinguishes the unsupported struct case from
+        // the supported one; an array has no by-value form to contrast with.
+        let feature = match ty {
+            Type::Array(_, _) => format!("{action} a value of type `{ty}`"),
+            _ => format!("{action} `{ty}` by value"),
+        };
+        Err(SemanticError::Unsupported {
+            feature,
+            span,
+            context,
+        })
+    }
+
+    /// Checks that an object of type `ty` can exist here.
+    ///
+    /// It cannot when the size is unknown, which for this language means a
+    /// struct tag that was declared but never defined, or an array of one.
+    ///
+    /// # Arguments
+    ///
+    /// * `ty` - the type an object is about to be given
+    /// * `span` - what to blame
+    /// * `context` - where the size was needed, e.g. `in this declaration`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::IncompleteType`], offering the closest defined
+    /// tag when the undefined one looks like a typo of it.
+    fn expect_complete(&self, ty: &Type, span: Span, context: &'static str) -> SemanticResult<()> {
+        if self.types.structs.is_complete(ty) {
+            return Ok(());
+        }
+
+        // An array is incomplete exactly when its element type is, so the tag
+        // worth suggesting a spelling for is the one at the bottom of it.
+        let mut element = ty;
+        while let Type::Array(inner, _) = element {
+            element = inner;
+        }
+        let suggestion = match element {
+            Type::Struct(tag) => {
+                suggest::nearest(tag, self.types.structs.tags()).map(str::to_owned)
+            }
+            _ => None,
+        };
+
+        Err(SemanticError::IncompleteType {
+            ty: ty.clone(),
+            span,
+            context,
+            suggestion,
+        })
     }
 
     /// Checks that `found` is one of the integer types.
@@ -1177,6 +1581,216 @@ mod tests {
             "expected exactly one error, got {errors:?}"
         );
         errors.remove(0)
+    }
+
+    /// Analyzes `src`, asserting that it is accepted, and returns the types.
+    fn types_of(src: &str) -> TypeMap {
+        let mut parser = Parser::from_lexer(Lexer::new(src)).expect("lexing should succeed");
+        let (decls, parse_errors) = parser.parse_translation_unit();
+        assert!(
+            parse_errors.is_empty(),
+            "unexpected parse errors: {parse_errors:?}"
+        );
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let errors = analyzer.analyze_program(&decls);
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        analyzer.into_types()
+    }
+
+    #[test]
+    fn accepts_a_struct_and_records_where_its_members_sit() {
+        // Arrange / Act
+        let types = types_of(
+            "struct Point { char tag; int x; int y; };
+             int main() { struct Point p; p.x = 1; return p.y; }",
+        );
+
+        // Assert: the layout travels to the middle-end inside the type map,
+        // with the padding C's alignment rules put in.
+        let layout = types
+            .structs()
+            .layout("Point")
+            .expect("`Point` was defined");
+        assert_eq!(layout.member("tag").expect("declared").offset, 0);
+        assert_eq!(layout.member("x").expect("declared").offset, 4);
+        assert_eq!(layout.member("y").expect("declared").offset, 8);
+        assert_eq!(layout.size(), 12);
+    }
+
+    #[test]
+    fn a_member_has_the_type_it_was_declared_with() {
+        analyze_ok(
+            "struct Point { long int x; };
+             int main() { struct Point p; long int n = p.x; return (int)n; }",
+        );
+    }
+
+    #[test]
+    fn reads_a_member_through_a_pointer_with_arrow() {
+        analyze_ok(
+            "struct Point { int x; };
+             int get(struct Point *p) { return p->x; }
+             int main() { struct Point p; p.x = 1; return get(&p); }",
+        );
+    }
+
+    #[test]
+    fn a_struct_may_hold_a_pointer_to_itself() {
+        // A pointer is a machine word whatever it points at, so it needs no
+        // layout for the tag -- which is what makes a linked list expressible.
+        analyze_ok("struct Node { int value; struct Node *next; };");
+    }
+
+    #[test]
+    fn fails_on_a_struct_that_contains_itself() {
+        // The tag has no layout until its own definition is finished, so a
+        // member of that type has no size.
+        match analyze_err("struct Node { struct Node inner; };") {
+            SemanticError::IncompleteType { ty, .. } => {
+                assert_eq!(ty, Type::Struct("Node".to_string()));
+            }
+            other => panic!("expected IncompleteType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_an_object_of_a_forward_declared_struct() {
+        match analyze_err("struct Point; int main() { struct Point p; return 0; }") {
+            SemanticError::IncompleteType { context, .. } => {
+                assert_eq!(context, "in this declaration");
+            }
+            other => panic!("expected IncompleteType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_a_member_the_struct_does_not_have() {
+        match analyze_err(
+            "struct Point { int counter; };
+             int main() { struct Point p; return p.countr; }",
+        ) {
+            SemanticError::NoSuchMember {
+                member, suggestion, ..
+            } => {
+                assert_eq!(member, "countr");
+                assert_eq!(suggestion.as_deref(), Some("counter"));
+            }
+            other => panic!("expected NoSuchMember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_the_wrong_member_operator() {
+        // `.` on a pointer and `->` on a value are each other's mistake.
+        match analyze_err(
+            "struct Point { int x; };
+             int main() { struct Point p; struct Point *q = &p; return q.x; }",
+        ) {
+            SemanticError::NotAStruct { is_arrow, .. } => assert!(!is_arrow),
+            other => panic!("expected NotAStruct, got {other:?}"),
+        }
+        match analyze_err(
+            "struct Point { int x; };
+             int main() { struct Point p; return p->x; }",
+        ) {
+            SemanticError::NotAStruct { is_arrow, .. } => assert!(is_arrow),
+            other => panic!("expected NotAStruct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_a_member_read_from_a_non_struct() {
+        match analyze_err("int main() { int n = 1; return n.x; }") {
+            SemanticError::NotAStruct { found, .. } => assert_eq!(found, Type::INT),
+            other => panic!("expected NotAStruct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_a_struct_defined_twice() {
+        match analyze_err("struct Point { int x; }; struct Point { int y; };") {
+            SemanticError::RedeclaredStruct { name, .. } => assert_eq!(name, "Point"),
+            other => panic!("expected RedeclaredStruct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_a_member_name_used_twice() {
+        match analyze_err("struct Point { int x; int x; };") {
+            SemanticError::RedeclaredVariable { name, .. } => assert_eq!(name, "x"),
+            other => panic!("expected RedeclaredVariable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_struct_only_crosses_a_call_boundary_through_a_pointer() {
+        // Splitting a struct across argument registers is the System V
+        // classification, which this compiler does not implement.
+        analyze_ok(
+            "struct Point { int x; };
+             int take(struct Point *p) { return p->x; }
+             int main() { struct Point p; p.x = 1; return take(&p); }",
+        );
+        assert!(matches!(
+            analyze_err("struct Point { int x; }; int take(struct Point p) { return p.x; }"),
+            SemanticError::Unsupported { .. }
+        ));
+        assert!(matches!(
+            analyze_err(
+                "struct Point { int x; }; struct Point make() { struct Point p; return p; }"
+            ),
+            SemanticError::Unsupported { .. }
+        ));
+        // An array parameter is C's other aggregate at a call boundary, and
+        // needs the same decay this compiler does not do yet.
+        assert!(matches!(
+            analyze_err("int first(int a[3]) { return a[0]; }"),
+            SemanticError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn assigns_only_between_the_same_struct_type() {
+        analyze_ok(
+            "struct Point { int x; };
+             int main() { struct Point a; struct Point b; a = b; return a.x; }",
+        );
+        assert!(matches!(
+            analyze_err(
+                "struct A { int x; }; struct B { int x; };
+                 int main() { struct A a; struct B b; a = b; return 0; }"
+            ),
+            SemanticError::TypeError { .. }
+        ));
+    }
+
+    #[test]
+    fn a_member_is_an_object_that_can_be_assigned_and_addressed() {
+        analyze_ok(
+            "struct Point { int x; };
+             int main() { struct Point p; p.x = 1; int *q = &p.x; return *q; }",
+        );
+    }
+
+    #[test]
+    fn fails_on_a_struct_used_as_a_number() {
+        match analyze_err("struct A { int x; }; int main() { struct A a; return a + 1; }") {
+            SemanticError::TypeError { found, .. } => {
+                assert_eq!(found, Type::Struct("A".to_string()));
+            }
+            other => panic!("expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fails_on_a_cast_to_a_struct() {
+        // There is no such cast in C: a cast converts one value, and a struct
+        // is not one value.
+        assert!(matches!(
+            analyze_err("struct A { int x; }; int main() { int n = 1; return ((struct A)n).x; }"),
+            SemanticError::TypeError { .. }
+        ));
     }
 
     #[test]

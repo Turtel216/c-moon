@@ -120,8 +120,12 @@ pub enum DeclKind {
     },
     /// e.g., `struct Point { int x; int y; };`
     Struct {
+        /// The tag, absent for an anonymous `struct { ... };`.
         name: Option<String>,
-        members: Vec<Decl>, // Simplified for illustration
+        /// The members as written, or `None` for the forward declaration
+        /// `struct Point;`, which names a tag without saying what it holds.
+        /// The distinction matters: only a definition gives the type a layout.
+        members: Option<Vec<Decl>>,
     },
 }
 

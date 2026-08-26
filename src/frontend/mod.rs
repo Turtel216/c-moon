@@ -9,9 +9,11 @@
 //!
 //! [`span`] and [`scope`] hold the vocabulary the phases share: source
 //! locations, and the lexically scoped name table used by both resolution
-//! passes; [`suggest`] turns an unresolved name into a "did you mean".
+//! passes; [`suggest`] turns an unresolved name into a "did you mean";
+//! [`layout`] says where the members of a struct sit.
 
 pub mod ast;
+pub mod layout;
 pub mod lexer;
 pub mod parser;
 pub mod renamer;
