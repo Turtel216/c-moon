@@ -1,9 +1,10 @@
 //! Stack-frame layout.
 //!
 //! Three kinds of value need space in a function's frame: spilled virtual
-//! registers, local arrays, and variables whose address is taken.  All three
-//! are laid out here, by the same slot arithmetic, so that the offset of
-//! anything in the frame is computed in exactly one place.
+//! registers, local aggregates -- arrays and structs -- and variables whose
+//! address is taken.  All three are laid out here, by the same slot
+//! arithmetic, so that the offset of anything in the frame is computed in
+//! exactly one place.
 //!
 //! Nothing in this module is target-specific beyond the two numbers in
 //! [`FrameParams`], so a new target reuses it by naming its word size and
@@ -43,7 +44,7 @@ pub enum Home<R> {
 ///   [fp]                          saved frame pointer
 ///   [fp - 1*word .. ]             saved callee-saved registers
 ///   [ .. ]                        spill slots       (slot 1, 2, ...)
-///   [ .. ]                        local arrays
+///   [ .. ]                        local arrays and structs
 ///   [ .. ]                        address-taken variables
 /// ```
 ///
@@ -57,8 +58,8 @@ pub struct FrameLayout<R> {
     saved_bytes: i32,
     /// Total slots reserved below the saved registers.
     slots: usize,
-    /// Array variable id to the frame offset of its element 0.
-    arrays: HashMap<usize, i32>,
+    /// Aggregate variable id to the frame offset of its first byte.
+    objects: HashMap<usize, i32>,
     /// Address-taken variable id to its pinned frame offset.
     addr_taken: HashMap<usize, i32>,
 }
@@ -70,7 +71,7 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
     ///
     /// * `params` - the target's word size and stack alignment
     /// * `allocation` - the register allocation, whose spill slots come first
-    /// * `arrays` - bytes of storage per local array variable
+    /// * `objects` - bytes of storage per local array or struct variable
     /// * `addr_taken` - variables that `AddrOf` takes the address of
     ///
     /// Both collections are ordered, so a given function always produces the
@@ -78,7 +79,7 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
     pub fn plan(
         params: FrameParams,
         allocation: Allocation<R>,
-        arrays: &BTreeMap<usize, usize>,
+        objects: &BTreeMap<usize, usize>,
         addr_taken: &BTreeSet<usize>,
     ) -> Self {
         let saved_bytes = allocation.callee_saved().len() as i32 * params.word_size;
@@ -91,21 +92,25 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
             params,
             saved_bytes,
             slots,
-            arrays: HashMap::with_capacity(arrays.len()),
+            objects: HashMap::with_capacity(objects.len()),
             addr_taken: HashMap::with_capacity(addr_taken.len()),
         };
 
-        // An array occupies as many whole slots as its elements need: they sit
-        // packed at their own size -- four bytes for `int`, eight for `long
-        // int` -- and the array as a whole is rounded up to a slot so that
-        // everything after it stays word-aligned.  Element 0 goes at the
-        // lowest address, i.e. in the last slot reserved, so that element `i`
-        // is at `element0 + i * size` and indexing can be folded into a single
-        // scaled-index memory operand.
-        for (&variable, &bytes) in arrays {
+        // An aggregate occupies as many whole slots as its contents need: an
+        // array's elements sit packed at their own size -- four bytes for
+        // `int`, eight for `long int` -- a struct's members at the offsets its
+        // layout gave them, and the object as a whole is rounded up to a slot
+        // so that everything after it stays word-aligned.  Byte 0 goes at the
+        // lowest address, i.e. in the last slot reserved, so that byte `n` is
+        // at `first + n` and reaching into the object can be folded into a
+        // single memory operand.
+        //
+        // Rounding up to a whole slot also keeps every object eight-byte
+        // aligned, which is at least the alignment any type here asks for.
+        for (&variable, &bytes) in objects {
             slots += bytes.div_ceil(params.word_size as usize);
-            let element_zero = layout.offset_of(slots);
-            layout.arrays.insert(variable, element_zero);
+            let first_byte = layout.offset_of(slots);
+            layout.objects.insert(variable, first_byte);
         }
 
         for &variable in addr_taken {
@@ -188,23 +193,23 @@ impl<R: Copy + Eq + Hash> FrameLayout<R> {
         }
     }
 
-    /// The frame offset of element 0 of the array variable `operand` names.
+    /// The frame offset of the first byte of the aggregate `operand` names.
     ///
     /// # Panics
     ///
-    /// Panics if `operand` is not a variable with reserved array storage,
-    /// which means the IR indexed something the frame planner never saw.
-    pub fn array_base(&self, operand: &Operand) -> i32 {
+    /// Panics if `operand` is not a variable with reserved object storage,
+    /// which means the IR reached into something the frame planner never saw.
+    pub fn object_base(&self, operand: &Operand) -> i32 {
         let Operand::Var(id) = operand else {
             panic!(
-                "Compiler Bug: an array base must be a variable, got {:?}",
+                "Compiler Bug: an object base must be a variable, got {:?}",
                 operand
             );
         };
         *self
-            .arrays
+            .objects
             .get(id)
-            .expect("Compiler Bug: array variable has no reserved frame storage")
+            .expect("Compiler Bug: aggregate variable has no reserved frame storage")
     }
 
     /// The pinned frame offset of an address-taken variable.
@@ -262,7 +267,7 @@ mod tests {
     /// arrays and pinned variables the caller asks for.
     fn layout(
         spilled: usize,
-        arrays: &BTreeMap<usize, usize>,
+        objects: &BTreeMap<usize, usize>,
         addr_taken: &BTreeSet<usize>,
     ) -> FrameLayout<X86Register> {
         // Long overlapping intervals exhaust the register file, so the excess
@@ -279,7 +284,7 @@ mod tests {
         let allocation = linear_scan::<SystemV>(&intervals, &[]);
         assert_eq!(allocation.spill_slots(), spilled);
 
-        FrameLayout::plan(PARAMS, allocation, arrays, addr_taken)
+        FrameLayout::plan(PARAMS, allocation, objects, addr_taken)
     }
 
     #[test]
@@ -294,15 +299,15 @@ mod tests {
     #[test]
     fn array_elements_run_upward_from_the_lowest_slot() {
         // Arrange: `long int a[3]`, twenty-four bytes, and no spills.
-        let arrays = BTreeMap::from([(7, 3 * 8)]);
+        let objects = BTreeMap::from([(7, 3 * 8)]);
 
         // Act
-        let layout = layout(0, &arrays, &BTreeSet::new());
+        let layout = layout(0, &objects, &BTreeSet::new());
 
         // Assert: element 0 is in the last of the three slots, so element `i`
         // is `i * 8` bytes above it and the scale can be positive.
         assert_eq!(
-            layout.array_base(&Operand::Var(7)),
+            layout.object_base(&Operand::Var(7)),
             -(layout.saved_bytes() + 3 * 8)
         );
     }
@@ -310,15 +315,15 @@ mod tests {
     #[test]
     fn an_array_of_ints_packs_two_elements_into_each_slot() {
         // Arrange: `int a[3]`, twelve bytes, which is two whole slots.
-        let arrays = BTreeMap::from([(7, 3 * 4)]);
+        let objects = BTreeMap::from([(7, 3 * 4)]);
 
         // Act
-        let layout = layout(0, &arrays, &BTreeSet::new());
+        let layout = layout(0, &objects, &BTreeSet::new());
 
         // Assert: the array is rounded up to a slot boundary, so whatever is
         // laid out after it stays word-aligned.
         assert_eq!(
-            layout.array_base(&Operand::Var(7)),
+            layout.object_base(&Operand::Var(7)),
             -(layout.saved_bytes() + 2 * 8)
         );
     }
@@ -326,17 +331,17 @@ mod tests {
     #[test]
     fn every_kind_of_frame_value_gets_its_own_space() {
         // Arrange: one spill, one array of two words, one pinned variable.
-        let arrays = BTreeMap::from([(1, 2 * 8)]);
+        let objects = BTreeMap::from([(1, 2 * 8)]);
         let pinned = BTreeSet::from([2]);
 
         // Act
-        let layout = layout(1, &arrays, &pinned);
+        let layout = layout(1, &objects, &pinned);
 
         // Assert: spill slot 1, array slots 2-3, pinned slot 4 -- nothing
         // overlaps and nothing is left over.
         let saved = layout.saved_bytes();
         assert_eq!(layout.offset_of(1), -(saved + 8));
-        assert_eq!(layout.array_base(&Operand::Var(1)), -(saved + 24));
+        assert_eq!(layout.object_base(&Operand::Var(1)), -(saved + 24));
         assert_eq!(layout.pinned(&Operand::Var(2)), -(saved + 32));
         assert_eq!(layout.stack_adjust(), align_up(saved + 32, 16) - saved);
     }

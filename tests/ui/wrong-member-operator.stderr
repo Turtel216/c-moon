@@ -1,0 +1,9 @@
+error[E0204]: type `struct Point*` is not a struct
+  --> $DIR/wrong-member-operator.c:10:12
+   |
+10 |     return q.x;
+   |            ^ not a struct
+   |
+   = help: `->` reads a member through a pointer to a struct
+
+error: aborting due to 1 previous error

@@ -1,0 +1,12 @@
+error[E0203]: the struct `Point` is defined multiple times
+ --> $DIR/redefined-struct.c:7:8
+  |
+3 | struct Point {
+  |        ----- previous definition of `struct Point` here
+...
+7 | struct Point {
+  |        ^^^^^ `Point` redefined here
+  |
+  = note: `struct Point` must be defined only once
+
+error: aborting due to 1 previous error

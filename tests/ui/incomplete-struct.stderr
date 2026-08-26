@@ -1,0 +1,9 @@
+error[E0208]: the type `struct Point` is incomplete
+ --> $DIR/incomplete-struct.c:7:5
+  |
+7 |     struct Point p;
+  |     ^^^^^^^^^^^^^^^ in this declaration
+  |
+  = note: `struct Point` is not defined at this point, so neither its size nor its members are known
+
+error: aborting due to 1 previous error

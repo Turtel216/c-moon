@@ -1,0 +1,9 @@
+error[E0208]: the type `struct Node` is incomplete
+ --> $DIR/recursive-struct.c:6:5
+  |
+6 |     struct Node inner;
+  |     ^^^^^^^^^^^^^^^^^^ in this member
+  |
+  = note: `struct Node` is not defined at this point, so neither its size nor its members are known
+
+error: aborting due to 1 previous error

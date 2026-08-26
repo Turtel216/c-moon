@@ -54,7 +54,7 @@ pub fn compile_program<T: Target>(ir: &ProgramIr) -> T::Program {
     let functions = ir
         .functions
         .iter()
-        .map(|(name, cfg)| compile_function::<T>(name, cfg, &ir.array_sizes))
+        .map(|(name, cfg)| compile_function::<T>(name, cfg, &ir.object_sizes))
         .collect();
 
     T::assemble(functions)
@@ -64,7 +64,7 @@ pub fn compile_program<T: Target>(ir: &ProgramIr) -> T::Program {
 fn compile_function<T: Target>(
     name: &str,
     cfg: &CFG,
-    array_sizes: &HashMap<usize, usize>,
+    object_sizes: &HashMap<usize, usize>,
 ) -> T::Function {
     // One total order over the instructions, which liveness and allocation
     // both measure positions in.
@@ -76,36 +76,36 @@ fn compile_function<T: Target>(
 
     let allocation = linear_scan::<T::Registers>(&intervals, &call_sites);
 
-    let (arrays, addr_taken) = frame_requirements(&body, array_sizes);
-    let layout = FrameLayout::plan(T::FRAME, allocation, &arrays, &addr_taken);
+    let (objects, addr_taken) = frame_requirements(&body, object_sizes);
+    let layout = FrameLayout::plan(T::FRAME, allocation, &objects, &addr_taken);
 
     T::lower_function(name, &body, &layout)
 }
 
 /// The frame storage this function needs beyond its spill slots.
 ///
-/// `array_sizes` covers the whole program, so it is narrowed to the arrays
+/// `object_sizes` covers the whole program, so it is narrowed to the objects
 /// this function actually mentions -- otherwise every function would reserve
-/// space for every array in the program.
+/// space for every array and struct in the program.
 ///
 /// # Returns
 ///
-/// The bytes of storage each array the function touches needs, and the
+/// The bytes of storage each aggregate the function touches needs, and the
 /// variables whose address it takes.  Both are ordered so that the layout,
 /// and with it the emitted assembly, is reproducible.
 fn frame_requirements(
     body: &LinearizedCfg,
-    array_sizes: &HashMap<usize, usize>,
+    object_sizes: &HashMap<usize, usize>,
 ) -> (BTreeMap<usize, usize>, BTreeSet<usize>) {
-    let mut arrays = BTreeMap::new();
+    let mut objects = BTreeMap::new();
     let mut addr_taken = BTreeSet::new();
 
     for instr in body.instructions() {
         for operand in instruction_operands(instr) {
             if let Operand::Var(id) = operand
-                && let Some(&bytes) = array_sizes.get(id)
+                && let Some(&bytes) = object_sizes.get(id)
             {
-                arrays.insert(*id, bytes);
+                objects.insert(*id, bytes);
             }
         }
 
@@ -118,5 +118,5 @@ fn frame_requirements(
         }
     }
 
-    (arrays, addr_taken)
+    (objects, addr_taken)
 }

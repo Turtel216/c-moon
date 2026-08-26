@@ -1,0 +1,12 @@
+error[E0209]: no member named `countr` on type `struct Point`
+  --> $DIR/unknown-struct-member.c:10:12
+   |
+ 3 | struct Point {
+   |        ----- `struct Point` defined here
+...
+10 |     return p.countr;
+   |            ^^^^^^^^ unknown member
+   |
+   = help: a member with a similar name exists: `counter`
+
+error: aborting due to 1 previous error

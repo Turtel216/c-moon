@@ -1,0 +1,9 @@
+error[E0207]: passing `struct Point` by value is not supported yet
+ --> $DIR/struct-passed-by-value.c:8:10
+  |
+8 | int take(struct Point p) {
+  |          ^^^^^^^^^^^^^^ in this parameter
+  |
+  = note: this compiler implements the subset of C listed in its README
+
+error: aborting due to 1 previous error

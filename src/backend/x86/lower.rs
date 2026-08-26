@@ -590,7 +590,7 @@ impl<'a> FunctionLowering<'a> {
     /// way.  Element 0 is at the lowest address of the array's storage, which
     /// is what lets the scale be positive.
     fn element(&mut self, base: &Operand, index: &Operand, element: Width) -> X86Operand {
-        let element_zero = self.layout.array_base(base);
+        let element_zero = self.layout.object_base(base);
         // Elements sit as close together as their type allows, so the index is
         // scaled by the element's own size rather than by a machine word.
         let size = element.bytes();
