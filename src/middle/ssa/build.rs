@@ -602,10 +602,10 @@ mod tests {
     /// to SSA values, verified.
     fn promote_verified(
         blocks: &[(&str, Vec<TACInstruction>)],
-        array_sizes: &[(usize, usize)],
+        object_sizes: &[(usize, usize)],
     ) -> Function {
         let mut function = build_verified(blocks);
-        let sizes: HashMap<usize, usize> = array_sizes.iter().copied().collect();
+        let sizes: HashMap<usize, usize> = object_sizes.iter().copied().collect();
         let eligible = promotable(&function, &sizes);
         promote_slots(&mut function, &eligible);
         verified(function)

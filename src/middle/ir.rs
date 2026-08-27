@@ -197,11 +197,15 @@ pub enum Opcode {
     /// dest = destination, arg1 = base array var, arg2 = index
     ArrayLoad,
 
-    /// Take the address of an array element: dest = &arg1[arg2].
+    /// Take the address of a place inside an object: dest = &arg1[arg2].
     ///
-    /// The width is the array's element type, which is what scales the index
-    /// into a byte offset -- exactly as it does for an element access. The
-    /// value produced is an address, and so a full word; see
+    /// The width is what scales the index into a byte offset -- for an array
+    /// element, the element type, exactly as it does for an access to one. A
+    /// width of [`Width::Bits8`] therefore makes the index a plain byte
+    /// offset, which is how a struct member is reached: `&s.y` is the address
+    /// of byte `offsetof(y)` of `s`.
+    ///
+    /// The value produced is an address, and so a full word; see
     /// [`Opcode::result_width`].
     ArrayAddr,
 

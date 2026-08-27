@@ -31,6 +31,10 @@ pub mod codes {
     pub const INVALID_ASSIGNMENT: &str = "E0206";
     /// Valid C that this compiler does not implement yet.
     pub const UNSUPPORTED: &str = "E0207";
+    /// A `struct` tag used where its layout has to be known, but never defined.
+    pub const INCOMPLETE_TYPE: &str = "E0208";
+    /// A member read from a struct that does not have one by that name.
+    pub const UNKNOWN_MEMBER: &str = "E0209";
 }
 
 /// A span with something to say about it.

@@ -275,8 +275,10 @@ pub enum Op {
         value: Operand,
         width: Width,
     },
-    /// `dest = &base[index]`, where the width is the array's element type
-    /// and so what scales the index. The address itself is a full word.
+    /// `dest = &base[index]`, where the width is what scales the index: the
+    /// element type for an array, and [`Width::Bits8`] where the index is a
+    /// plain byte offset, which is how a struct member is reached. The address
+    /// itself is a full word.
     ArrayAddr {
         base: SlotId,
         index: Operand,

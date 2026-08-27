@@ -147,7 +147,7 @@ fn optimize_through_ssa(ir: &mut ProgramIr, optimize: bool) {
     // are being replaced; borrowing `ir` whole would not allow both.
     let ProgramIr {
         functions,
-        array_sizes,
+        object_sizes,
         var_names,
     } = ir;
 
@@ -156,7 +156,7 @@ fn optimize_through_ssa(ir: &mut ProgramIr, optimize: bool) {
         function.set_variable_names(var_names.clone());
         ssa::verify::debug_assert_valid(&function, "SSA construction");
 
-        let promotable = ssa::promote::promotable(&function, array_sizes);
+        let promotable = ssa::promote::promotable(&function, object_sizes);
         ssa::mem2reg::promote_slots(&mut function, &promotable);
         ssa::verify::debug_assert_valid(&function, "promotion to SSA values");
 

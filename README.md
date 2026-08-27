@@ -26,18 +26,30 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 ## Supported Language Subset
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
-* **Data Types:** `char` (8-bit), `int` (32-bit) and `long int` (64-bit), each in a signed and an `unsigned` form, arrays of any of them, pointers.
+* **Data Types:** `char` (8-bit), `int` (32-bit) and `long int` (64-bit), each in a signed and an `unsigned` form, arrays of any of them, pointers, and `struct`.
 * **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
 * **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
   and Logical (`&&`, `||`, `!`), the first two of which short-circuit.
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
+* **Structs:** definitions and forward declarations, member access with `.` and
+  `->`, nested structs, arrays of structs and array members, pointers to
+  structs -- including a struct that points at its own type -- and whole-object
+  assignment, which copies the representation the way C defines it. Members are
+  laid out by the System V rules, so a member sits at the offset its own
+  alignment demands and the object is rounded up to its widest member's; the
+  test suite pins those offsets against GCC. A struct crosses a call boundary
+  through a pointer: passing or returning one by value needs the ABI's
+  argument-classification rules, which are not implemented.
 * **Integer conversions:** the integer promotions -- a `char` operand becomes an `int` before any operator sees it -- the usual arithmetic conversions, including the rule that an `int` and an `unsigned int` meet as `unsigned int`, the implicit conversion an assignment, argument or `return` performs, and casts between the integer types. Widening sign-extends a signed value and zero-extends an unsigned one; division and ordering select the instruction that matches.
 
 ### Roadmap
 
-* [ ] Additional data types (`float`, `double`, `struct` are parsed but rejected by semantic analysis today).
+* [ ] Additional data types (`float` and `double` are parsed but rejected by semantic analysis today).
+* [ ] Passing and returning a `struct` by value, which needs the System V
+  argument classification, and the array-to-pointer decay that would let an
+  array be a parameter.
 * [ ] Integer literal suffixes (`u`, `L`); a decimal literal too large for a `long int` is already an `unsigned long int`, as GCC makes it.
 * [ ] Pointer arithmetic.
 * [ ] Global variables.

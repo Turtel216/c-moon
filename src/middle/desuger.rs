@@ -20,13 +20,15 @@ use crate::middle::ir::*;
 pub struct ProgramIr {
     /// Program Functions
     pub functions: BTreeMap<String, CFG>,
-    /// Maps variable id → the bytes each local array occupies.
+    /// Maps variable id → the bytes each local aggregate occupies.
     /// Used by the backend to allocate stack space.
     ///
-    /// Bytes rather than elements because the element type decides how many
-    /// each one takes: `char a[3]` is three bytes, `int a[3]` twelve and
-    /// `long int a[3]` twenty-four.
-    pub array_sizes: HashMap<usize, usize>,
+    /// An array and a struct are both objects several values live inside, so
+    /// both need storage of their own rather than a register: `char a[3]` is
+    /// three bytes, `int a[3]` twelve, and `struct Point { int x; int y; }` is
+    /// eight. Being listed here is also what keeps a variable out of SSA
+    /// form -- see [`promote`](crate::middle::ssa::promote).
+    pub object_sizes: HashMap<usize, usize>,
     /// Maps variable id → the name it was declared with, for IR dumps.
     pub var_names: HashMap<usize, String>,
 }
@@ -35,8 +37,38 @@ impl ProgramIr {
     pub fn new() -> Self {
         Self {
             functions: BTreeMap::new(),
-            array_sizes: HashMap::new(),
+            object_sizes: HashMap::new(),
             var_names: HashMap::new(),
+        }
+    }
+}
+
+/// Where an object sits, before its address has been computed.
+///
+/// A chain such as `s.inner.data[2]` names one object at one fixed distance
+/// from something the compiler can already address. Walking the chain into a
+/// single offset is what lets the whole of it cost the one instruction that
+/// materialising the place emits, instead of an addition per link.
+#[derive(Debug, Clone)]
+enum Place {
+    /// `offset` bytes into the frame storage of the aggregate variable `base`.
+    Object { base: usize, offset: i64 },
+    /// `offset` bytes past the address `base` holds.
+    Pointee { base: Operand, offset: i64 },
+}
+
+impl Place {
+    /// The same object seen `bytes` further in.
+    fn offset_by(&self, bytes: i64) -> Self {
+        match self {
+            Place::Object { base, offset } => Place::Object {
+                base: *base,
+                offset: offset + bytes,
+            },
+            Place::Pointee { base, offset } => Place::Pointee {
+                base: base.clone(),
+                offset: offset + bytes,
+            },
         }
     }
 }
@@ -57,8 +89,8 @@ pub struct LoweringContext<'a> {
     current_block: String,
     temp_counter: usize,
     label_counter: usize,
-    /// Tracks local array sizes: var_id → bytes occupied.
-    array_sizes: HashMap<usize, usize>,
+    /// Tracks the storage local aggregates need: var_id → bytes occupied.
+    object_sizes: HashMap<usize, usize>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -72,7 +104,7 @@ impl<'a> LoweringContext<'a> {
             current_block: String::new(),
             temp_counter: 0,
             label_counter: 0,
-            array_sizes: HashMap::new(),
+            object_sizes: HashMap::new(),
         }
     }
 
@@ -103,7 +135,12 @@ impl<'a> LoweringContext<'a> {
 
                     self.lower_function(name, &parameters, &bod);
                 }
-                _ => {
+
+                // A struct definition declares no storage of its own: it fixes
+                // a layout, which semantic analysis already recorded.
+                DeclKind::Struct { .. } => {}
+
+                DeclKind::Variable { .. } => {
                     todo!("Global variables not implemented yet")
                 }
             }
@@ -156,9 +193,9 @@ impl<'a> LoweringContext<'a> {
                 .insert(name.to_string(), finished_cfg);
         }
 
-        // Transfer array size metadata to ProgramIr
-        for (var_id, size) in &self.array_sizes {
-            self.program.array_sizes.insert(*var_id, *size);
+        // Transfer the object storage metadata to ProgramIr
+        for (var_id, size) in &self.object_sizes {
+            self.program.object_sizes.insert(*var_id, *size);
         }
     }
 
@@ -329,39 +366,7 @@ impl<'a> LoweringContext<'a> {
                 for item in items {
                     match item {
                         BlockItem::Stmt(s) => self.lower_statement(s),
-                        BlockItem::Decl(d) => {
-                            let stmt_id = self
-                                .res_map
-                                .decl_to_var
-                                .get(&d.id)
-                                .expect("Compiler Bug: Renamer failed to map declaration");
-
-                            let stmt_id = *stmt_id;
-                            if let Type::Array(element, count) = self.types.decl(d.id) {
-                                // Record the array's storage for backend stack
-                                // allocation. No TAC instructions needed --
-                                // the array lives entirely on the stack.
-                                let bytes = count * width_of(element).bytes() as usize;
-                                self.array_sizes.insert(stmt_id, bytes);
-                            } else if let DeclKind::Variable {
-                                initializer: Some(init),
-                                ..
-                            } = &d.kind
-                            {
-                                // Scalar variable with initializer, converted
-                                // to the declared type the way C converts it.
-                                let width = width_of(self.types.decl(d.id));
-                                let rhs = self.lower_converted(init, width);
-                                self.emit(TACInstruction::new(
-                                    Opcode::Mov,
-                                    width,
-                                    Some(Operand::Var(stmt_id)),
-                                    Some(rhs),
-                                    None,
-                                ));
-                            }
-                            // Scalar variable without initializer — no code needed.
-                        }
+                        BlockItem::Decl(d) => self.lower_declaration(d),
                     }
                 }
             }
@@ -477,6 +482,331 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    /// Lower one declaration inside a block.
+    ///
+    /// An aggregate needs storage rather than code: recording its size is what
+    /// makes the backend reserve frame space for it, and what keeps it out of
+    /// SSA form. A scalar with an initializer is a single move.
+    fn lower_declaration(&mut self, decl: &Decl) {
+        // A struct definition inside a block declares no storage: the layout
+        // it fixes was recorded by semantic analysis, and there is no variable
+        // to bind.
+        let DeclKind::Variable { initializer, .. } = &decl.kind else {
+            return;
+        };
+
+        let variable = *self
+            .res_map
+            .decl_to_var
+            .get(&decl.id)
+            .expect("Compiler Bug: Renamer failed to map declaration");
+
+        // The type table is copied out of `self` so that the object table can
+        // be written while it is still being read; it outlives the borrow.
+        let types = self.types;
+        let declared = types.decl(decl.id);
+
+        if declared.is_aggregate() {
+            // The object lives entirely in the frame, so its declaration
+            // reserves space rather than emitting an instruction.
+            self.object_sizes
+                .insert(variable, types.structs().size_of(declared));
+
+            // Only a struct can be initialised as a whole; an array
+            // initializer list is rejected by semantic analysis.
+            if let Some(init) = initializer {
+                let bytes = types.structs().size_of(declared);
+                let destination = Place::Object {
+                    base: variable,
+                    offset: 0,
+                };
+                self.lower_object_copy(&destination, init, bytes);
+            }
+            return;
+        }
+
+        // A scalar without an initializer holds whatever was already there.
+        let Some(init) = initializer else {
+            return;
+        };
+
+        // With one, the value is converted to the declared type the way C
+        // converts it.
+        let width = width_of(declared);
+        let rhs = self.lower_converted(init, width);
+        self.emit(TACInstruction::new(
+            Opcode::Mov,
+            width,
+            Some(Operand::Var(variable)),
+            Some(rhs),
+            None,
+        ));
+    }
+
+    // ### Objects and their addresses ###
+
+    /// The place the lvalue `expr` names.
+    ///
+    /// # Panics
+    ///
+    /// Panics for an expression that names no object. Semantic analysis
+    /// accepts a member access, a subscript, a dereference and an identifier
+    /// as lvalues and nothing else, so anything else here is a compiler bug.
+    fn place_of(&mut self, expr: &Expr) -> Place {
+        match &expr.kind {
+            // A named aggregate is addressed through the frame storage it was
+            // given; a scalar has no address until one is taken, which pins it
+            // to a slot of its own.
+            ExprKind::Identifier(_) => {
+                let variable = self.variable_of(expr);
+                match self.types.expr(expr.id).is_aggregate() {
+                    true => Place::Object {
+                        base: variable,
+                        offset: 0,
+                    },
+                    false => Place::Pointee {
+                        base: self.address_of_variable(variable),
+                        offset: 0,
+                    },
+                }
+            }
+
+            // `*p` names whatever `p` points at.
+            ExprKind::Unary(UnaryOp::Deref, pointer) => Place::Pointee {
+                base: self.lower_expression(pointer),
+                offset: 0,
+            },
+
+            // `s.m` sits a fixed distance into `s`; `p->m` the same distance
+            // past what `p` points at.
+            ExprKind::MemberAccess {
+                base,
+                member,
+                is_arrow,
+            } => {
+                let offset = self.member_offset(base, member, *is_arrow);
+                match is_arrow {
+                    true => Place::Pointee {
+                        base: self.lower_expression(base),
+                        offset,
+                    },
+                    false => self.place_of(base).offset_by(offset),
+                }
+            }
+
+            ExprKind::Index { array, index } => self.index_place(array, index),
+
+            // An assignment is the one expression that names an object without
+            // being an lvalue, and only a struct one does: lowering it copies
+            // the object and hands back that object's address. That is what
+            // makes `(a = b).x` read the member out of `a`.
+            ExprKind::Binary(BinaryOp::Assign, _, _) if self.types.expr(expr.id).is_struct() => {
+                Place::Pointee {
+                    base: self.lower_expression(expr),
+                    offset: 0,
+                }
+            }
+
+            other => panic!("Compiler Bug: {:?} names no object", other),
+        }
+    }
+
+    /// The place `array[index]` names.
+    ///
+    /// A constant index is a constant distance and folds into the offset the
+    /// base is already reached by, so `s.items[2].x` is one address
+    /// computation however deep it goes. A computed one is scaled into bytes
+    /// and added, because an element of a struct type is not one of the sizes
+    /// the machine can scale an index by.
+    fn index_place(&mut self, array: &Expr, index: &Expr) -> Place {
+        let types = self.types;
+        let Type::Array(element, _) = types.expr(array.id) else {
+            panic!("Compiler Bug: subscripted something that is not an array");
+        };
+        let size = types.structs().size_of(element) as i64;
+
+        let base = self.place_of(array);
+        if let ExprKind::Literal(Literal::Int(constant)) = index.kind {
+            return base.offset_by(constant as i64 * size);
+        }
+
+        // The index counts elements and the address counts bytes, so one
+        // multiplication converts between them. A one-byte element needs none.
+        let counted = self.lower_index(index);
+        let scaled = match size {
+            1 => counted,
+            _ => self.emit_binary(Opcode::Mul, Width::Bits64, counted, Operand::ImmInt(size)),
+        };
+
+        let address = self.address_of(&base);
+        Place::Pointee {
+            base: self.emit_binary(Opcode::Add, Width::Bits64, address, scaled),
+            offset: 0,
+        }
+    }
+
+    /// The address of the object `place` names.
+    fn address_of(&mut self, place: &Place) -> Operand {
+        match place {
+            // Byte `n` of a named object is `n` bytes into its frame storage,
+            // which the backend addresses in a single instruction: an element
+            // address whose elements are bytes is exactly a byte offset.
+            Place::Object { base, offset } => {
+                let dest = self.fresh_temp();
+                self.emit(TACInstruction::new(
+                    Opcode::ArrayAddr,
+                    Width::Bits8,
+                    Some(dest.clone()),
+                    Some(Operand::Var(*base)),
+                    Some(Operand::ImmInt(*offset)),
+                ));
+                dest
+            }
+
+            // The object the pointer already points at needs no arithmetic.
+            Place::Pointee { base, offset: 0 } => base.clone(),
+
+            Place::Pointee { base, offset } => self.emit_binary(
+                Opcode::Add,
+                Width::Bits64,
+                base.clone(),
+                Operand::ImmInt(*offset),
+            ),
+        }
+    }
+
+    /// The address of the variable `variable`, which pins it to a frame slot.
+    fn address_of_variable(&mut self, variable: usize) -> Operand {
+        let dest = self.fresh_temp();
+        // An address is a full word whatever it points at.
+        self.emit(TACInstruction::new(
+            Opcode::AddrOf,
+            Width::Bits64,
+            Some(dest.clone()),
+            Some(Operand::Var(variable)),
+            None,
+        ));
+        dest
+    }
+
+    /// Read the `width`-wide value at `place`.
+    fn load_from(&mut self, place: &Place, width: Width) -> Operand {
+        let address = self.address_of(place);
+        let dest = self.fresh_temp();
+        self.emit(TACInstruction::new(
+            Opcode::Load,
+            width,
+            Some(dest.clone()),
+            Some(address),
+            None,
+        ));
+        dest
+    }
+
+    /// Write the `width`-wide `value` at `place`.
+    fn store_into(&mut self, place: &Place, value: Operand, width: Width) {
+        let address = self.address_of(place);
+        self.emit(TACInstruction::new(
+            Opcode::Store,
+            width,
+            None,
+            Some(address),
+            Some(value),
+        ));
+    }
+
+    /// Copy the whole of the object `source` names into `destination`.
+    ///
+    /// C defines a struct assignment as copying the object's representation,
+    /// and how much of it there is is known here, so the copy is unrolled into
+    /// the widest moves that fit rather than left to a loop. Three widths are
+    /// enough: a struct's size is a sum of its members' sizes and the padding
+    /// between them, and every one of those is a multiple of one of the three.
+    ///
+    /// # Arguments
+    ///
+    /// * `destination` - the object written
+    /// * `source` - the expression naming the object read
+    /// * `bytes` - the size of both, which are of the same type
+    fn lower_object_copy(&mut self, destination: &Place, source: &Expr, bytes: usize) {
+        let source = self.place_of(source);
+
+        let mut copied = 0;
+        while copied < bytes {
+            let width = widest_chunk(bytes - copied);
+            let value = self.load_from(&source.offset_by(copied as i64), width);
+            self.store_into(&destination.offset_by(copied as i64), value, width);
+            copied += width.bytes() as usize;
+        }
+    }
+
+    /// The byte offset of `member` within the struct `base` names.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - the struct, or the pointer to it when `is_arrow`
+    /// * `member` - the name written after the operator
+    /// * `is_arrow` - whether it was written `->` rather than `.`
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `base` has the struct type the operator requires and the
+    /// struct has such a member, both of which semantic analysis established.
+    fn member_offset(&self, base: &Expr, member: &str, is_arrow: bool) -> i64 {
+        let base_ty = self.types.expr(base.id);
+        let struct_ty = match (is_arrow, base_ty) {
+            (false, ty) => ty,
+            (true, Type::Pointer(pointee)) => pointee.as_ref(),
+            (true, other) => panic!("Compiler Bug: `->` applied to a {:?}", other),
+        };
+
+        let Type::Struct(tag) = struct_ty else {
+            panic!("Compiler Bug: a member was read from a {:?}", struct_ty);
+        };
+        self.types
+            .structs()
+            .layout(tag)
+            .expect("Compiler Bug: an object of an undefined struct type exists")
+            .member(member)
+            .expect("Compiler Bug: a member semantic analysis accepted is missing")
+            .offset as i64
+    }
+
+    /// The variable the identifier expression `expr` resolves to.
+    fn variable_of(&self, expr: &Expr) -> usize {
+        *self
+            .res_map
+            .expr_to_var
+            .get(&expr.id)
+            .expect("Compiler Bug: Renamer failed to map an identifier")
+    }
+
+    /// Whether `expr` is `a[i]` on a named array of scalars.
+    ///
+    /// That is the shape the backend reaches in a single instruction, with the
+    /// index scaled by the element's own width. Anything else -- an element of
+    /// a struct type, or an array reached through a member -- goes through an
+    /// address instead.
+    fn is_direct_element(&self, expr: &Expr) -> bool {
+        let ExprKind::Index { array, .. } = &expr.kind else {
+            return false;
+        };
+        matches!(array.kind, ExprKind::Identifier(_)) && !self.types.expr(expr.id).is_aggregate()
+    }
+
+    /// Emit `dest = lhs <op> rhs` into a fresh temporary and return it.
+    fn emit_binary(&mut self, opcode: Opcode, width: Width, lhs: Operand, rhs: Operand) -> Operand {
+        let dest = self.fresh_temp();
+        self.emit(TACInstruction::new(
+            opcode,
+            width,
+            Some(dest.clone()),
+            Some(lhs),
+            Some(rhs),
+        ));
+        dest
+    }
+
     /// The width a value of the type `expr` was given is held at.
     fn width_of_expr(&self, expr: &Expr) -> Width {
         width_of(self.types.expr(expr.id))
@@ -560,6 +890,20 @@ impl<'a> LoweringContext<'a> {
                 Operand::Var(*idf_id)
             }
 
+            // `a = b` between structs. C copies the whole representation,
+            // so the assignment is a fixed-size copy rather than a move of one
+            // value -- however the two objects are named.
+            ExprKind::Binary(BinaryOp::Assign, lhs, rhs) if self.types.expr(lhs.id).is_struct() => {
+                let types = self.types;
+                let bytes = types.structs().size_of(types.expr(lhs.id));
+                let destination = self.place_of(lhs);
+                self.lower_object_copy(&destination, rhs, bytes);
+
+                // The value of a struct assignment is the object it wrote,
+                // which the lowering passes around as that object's address.
+                self.address_of(&destination)
+            }
+
             // *ptr = rhs (assignment through pointer dereference)
             ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
                 if matches!(lhs.kind, ExprKind::Unary(UnaryOp::Deref, _)) =>
@@ -589,10 +933,8 @@ impl<'a> LoweringContext<'a> {
                 rhs_op
             }
 
-            // arr[idx] = rhs
-            ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
-                if matches!(lhs.kind, ExprKind::Index { .. }) =>
-            {
+            // arr[idx] = rhs, on a named array of scalars
+            ExprKind::Binary(BinaryOp::Assign, lhs, rhs) if self.is_direct_element(lhs) => {
                 // An element is as wide as the array's element type, which is
                 // also what scales the index into a byte offset.
                 let width = self.width_of_expr(lhs);
@@ -617,6 +959,23 @@ impl<'a> LoweringContext<'a> {
                 ));
 
                 rhs_op
+            }
+
+            // `s.m = rhs`, `p->m = rhs`, `s.items[i].m = rhs` -- a store at
+            // the member's own address.
+            ExprKind::Binary(BinaryOp::Assign, lhs, rhs)
+                if matches!(
+                    lhs.kind,
+                    ExprKind::MemberAccess { .. } | ExprKind::Index { .. }
+                ) =>
+            {
+                // The object written is as wide as its declared type, and the
+                // value is converted to it before the store.
+                let width = self.width_of_expr(lhs);
+                let value = self.lower_converted(rhs, width);
+                let place = self.place_of(lhs);
+                self.store_into(&place, value.clone(), width);
+                value
             }
 
             // x = rhs
@@ -740,8 +1099,8 @@ impl<'a> LoweringContext<'a> {
                 ret_temp
             }
 
-            // arr[idx] — rvalue array element access
-            ExprKind::Index { array, index } => {
+            // arr[idx] -- rvalue element of a named array of scalars
+            ExprKind::Index { array, index } if self.is_direct_element(expr) => {
                 let base_var = self.lower_expression(array);
                 let idx_op = self.lower_index(index);
                 let dest = self.fresh_temp();
@@ -756,6 +1115,14 @@ impl<'a> LoweringContext<'a> {
                 ));
 
                 dest
+            }
+
+            // `s.m`, `p->m`, `s.items[i]` -- a read of an object the compiler
+            // reaches through its address rather than by name.
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {
+                let width = self.width_of_expr(expr);
+                let place = self.place_of(expr);
+                self.load_from(&place, width)
             }
 
             // -x -- negation, which is what subtracting `x` from zero is.
@@ -808,9 +1175,7 @@ impl<'a> LoweringContext<'a> {
             // backend addresses an element in one instruction, so the index
             // is handed to it as it stands instead of being turned into
             // arithmetic here.
-            ExprKind::Unary(UnaryOp::AddressOf, inner)
-                if matches!(inner.kind, ExprKind::Index { .. }) =>
-            {
+            ExprKind::Unary(UnaryOp::AddressOf, inner) if self.is_direct_element(inner) => {
                 let ExprKind::Index { array, index } = &inner.kind else {
                     unreachable!("the guard above matched an index expression")
                 };
@@ -847,22 +1212,13 @@ impl<'a> LoweringContext<'a> {
                 self.lower_expression(pointer)
             }
 
-            // &x -- address-of
+            // `&x`, `&s`, `&s.m` -- the address of whatever object the
+            // operand names. A scalar is pinned to a frame slot so that it has
+            // one; an aggregate already has storage, and a member of one sits
+            // a known distance into it.
             ExprKind::Unary(UnaryOp::AddressOf, inner) => {
-                let inner_op = self.lower_expression(inner);
-                let dest = self.fresh_temp();
-
-                // AddrOf: dest = addr_of inner_op. An address is a full word
-                // whatever it points at.
-                self.emit(TACInstruction::new(
-                    Opcode::AddrOf,
-                    Width::Bits64,
-                    Some(dest.clone()),
-                    Some(inner_op),
-                    None,
-                ));
-
-                dest
+                let place = self.place_of(inner);
+                self.address_of(&place)
             }
 
             // *p -- rvalue dereference (read through pointer)
@@ -1060,6 +1416,19 @@ fn answers_zero_or_one(expr: &Expr) -> bool {
     }
 }
 
+/// The widest move that fits in `remaining` bytes.
+///
+/// Used to unroll an object copy: the copy takes machine words until fewer
+/// than eight bytes are left, then an `int` at a time, then single bytes, so it
+/// never reads or writes past the object it is copying.
+const fn widest_chunk(remaining: usize) -> Width {
+    match remaining {
+        0..=3 => Width::Bits8,
+        4..=7 => Width::Bits32,
+        _ => Width::Bits64,
+    }
+}
+
 /// The machine width a value of type `ty` is held at.
 ///
 /// `char` and `int` are the narrow types; everything else the compiler can
@@ -1072,6 +1441,10 @@ pub fn width_of(ty: &Type) -> Width {
         Type::Char(_) => Width::Bits8,
         Type::Int(_) => Width::Bits32,
         Type::Long(_) | Type::Pointer(_) | Type::Array(_, _) | Type::Void => Width::Bits64,
+        // A struct is several values at once, which no width describes. Every
+        // read of one is a read of a member, at that member's width, and a
+        // copy of a whole one is made a chunk at a time by `widest_chunk`.
+        Type::Struct(_) => panic!("Compiler Bug: a struct is not held in a register"),
     }
 }
 
@@ -1088,6 +1461,8 @@ pub fn sign_of(ty: &Type) -> Sign {
     match ty {
         Type::Char(sign) | Type::Int(sign) | Type::Long(sign) => *sign,
         Type::Pointer(_) | Type::Array(_, _) | Type::Void => Sign::Unsigned,
+        // Nothing ever reads a whole struct as a number; see `width_of`.
+        Type::Struct(_) => panic!("Compiler Bug: a struct has no bits to read"),
     }
 }
 
@@ -1113,6 +1488,19 @@ mod tests {
             width_of(&Type::Array(Box::new(Type::Char(Sign::Signed)), 3)).bytes(),
             8
         );
+    }
+
+    #[test]
+    fn an_object_copy_takes_the_widest_move_that_fits() {
+        // Arrange / Act / Assert: eight bytes at a time until fewer than eight
+        // are left, then four, then one -- so a twelve-byte struct is copied
+        // by a word and an `int`, and never a byte past its end.
+        assert_eq!(widest_chunk(12), Width::Bits64);
+        assert_eq!(widest_chunk(12 - 8), Width::Bits32);
+        assert_eq!(widest_chunk(8), Width::Bits64);
+        assert_eq!(widest_chunk(7), Width::Bits32);
+        assert_eq!(widest_chunk(3), Width::Bits8);
+        assert_eq!(widest_chunk(1), Width::Bits8);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! hold:
 //!
 //! 1. Its address is never taken.
-//! 2. It is a scalar -- not an array, and not indexed as one.
+//! 2. It is a scalar -- not an array or a struct, and not reached into as one.
 //! 3. It is not `volatile`.
 //! 4. It does not need a stable memory location for the ABI.
 //! 5. It does not cross a `setjmp` boundary.
@@ -60,13 +60,14 @@ pub const SETJMP_LIKE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjm
 ///
 /// * `function` - the function in its all-in-memory form, as construction
 ///   first builds it
-/// * `array_sizes` - storage size of every array variable in the program
+/// * `object_sizes` - bytes of storage every aggregate variable in the
+///   program occupies
 ///
 /// # Returns
 ///
 /// The eligible slots, in slot order.  Everything else stays in memory and
 /// keeps being read and written through loads and stores.
-pub fn promotable(function: &Function, array_sizes: &HashMap<VarId, usize>) -> BTreeSet<SlotId> {
+pub fn promotable(function: &Function, object_sizes: &HashMap<VarId, usize>) -> BTreeSet<SlotId> {
     // A call that could come back by way of `longjmp` disqualifies the whole
     // function, so it is worth answering first.
     if function.block_ids().any(|block| {
@@ -80,10 +81,10 @@ pub fn promotable(function: &Function, array_sizes: &HashMap<VarId, usize>) -> B
 
     let mut eligible: BTreeSet<SlotId> = function.slot_ids().collect();
 
-    // An array occupies storage the frame planner reserved, whether or not
-    // this function ever indexes it.
+    // An aggregate occupies storage the frame planner reserved, whether or not
+    // this function ever reaches into it.
     eligible.retain(|&slot| match function.slot(slot).origin {
-        SlotOrigin::Variable(id) => !array_sizes.contains_key(&id),
+        SlotOrigin::Variable(id) => !object_sizes.contains_key(&id),
         SlotOrigin::Temporary(_) => true,
     });
 
@@ -147,8 +148,8 @@ mod tests {
         function.slot_for(SlotOrigin::Variable(id))
     }
 
-    fn promoted(function: &Function, array_sizes: &[(VarId, usize)]) -> Vec<SlotId> {
-        let sizes: HashMap<VarId, usize> = array_sizes.iter().copied().collect();
+    fn promoted(function: &Function, object_sizes: &[(VarId, usize)]) -> Vec<SlotId> {
+        let sizes: HashMap<VarId, usize> = object_sizes.iter().copied().collect();
         promotable(function, &sizes).into_iter().collect()
     }
 

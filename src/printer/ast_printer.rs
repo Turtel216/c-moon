@@ -66,6 +66,10 @@ impl AstPrinter {
                 if let Some(n) = name {
                     write!(w, "{} ", n)?;
                 }
+                // A forward declaration has no body to print.
+                let Some(members) = members else {
+                    return writeln!(w, ";");
+                };
                 writeln!(w, "{{")?;
                 self.indent_level += 1;
                 for member in members {
