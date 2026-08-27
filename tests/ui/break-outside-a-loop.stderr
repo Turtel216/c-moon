@@ -1,0 +1,9 @@
+error[E0210]: `break` outside of a loop
+ --> $DIR/break-outside-a-loop.c:4:5
+  |
+4 |     break;
+  |     ^^^^^^ cannot `break` outside of a loop
+  |
+  = note: `break` acts on the innermost enclosing `while` or `for`, and there is none here
+
+error: aborting due to 1 previous error
