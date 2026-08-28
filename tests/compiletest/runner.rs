@@ -26,6 +26,10 @@ const SCRATCH_ROOT: &str = env!("CARGO_TARGET_TMPDIR");
 /// Setting this environment variable rewrites `ui` snapshots from the run.
 const BLESS_VAR: &str = "BLESS";
 
+/// Directory, beside a fixture, holding the companions it names in
+/// `aux-build`. Shared with fixture discovery, which skips it.
+pub const AUXILIARY_DIR: &str = "auxiliary";
+
 /// Placeholder substituted for the fixture's directory in snapshots.
 const DIR_PLACEHOLDER: &str = "$DIR";
 
@@ -140,13 +144,18 @@ impl TestCase {
         // alongside it.
         let stem = work_dir.join("a");
 
+        // A fixture that declares `extern` names is only half a program. Its
+        // companions are built first, by GCC, and linked into whichever build
+        // follows -- this compiler's or the reference one's.
+        let auxiliaries = self.build_auxiliaries(&work_dir)?;
+
         // The reference variant never invokes this compiler: it asks what the
         // program is supposed to do, not what this compiler does with it.
         if self.variant == Variant::Gcc {
-            return self.check_against_gcc(&stem);
+            return self.check_against_gcc(&stem, &auxiliaries);
         }
 
-        let compiled = self.compile(&stem)?;
+        let compiled = self.compile(&stem, &auxiliaries)?;
 
         match self.suite {
             Suite::RunPass => self.check_run_pass(&compiled, &stem),
@@ -166,9 +175,19 @@ impl TestCase {
     }
 
     /// Invoke the compiler on the fixture, capturing its output.
-    fn compile(&self, stem: &Path) -> Result<Output, Failed> {
+    ///
+    /// # Arguments
+    ///
+    /// * `stem` - the executable's path; the assembly listing sits beside it
+    /// * `auxiliaries` - objects built from the fixture's companions, handed
+    ///   to the compiler to link in
+    fn compile(&self, stem: &Path, auxiliaries: &[PathBuf]) -> Result<Output, Failed> {
         let mut command = Command::new(COMPILER);
         command.arg(&self.path).arg("-o").arg(stem);
+
+        for object in auxiliaries {
+            command.arg("--link").arg(object);
+        }
 
         // The codegen suite needs the assembly listing to survive the run.
         if self.suite == Suite::Codegen {
@@ -199,13 +218,14 @@ impl TestCase {
     /// exit code; this one proves the declared exit code is what the C program
     /// actually means, so an expectation cannot be wrong in the same direction
     /// as the compiler.
-    fn check_against_gcc(&self, stem: &Path) -> Result<(), Failed> {
+    fn check_against_gcc(&self, stem: &Path, auxiliaries: &[PathBuf]) -> Result<(), Failed> {
         // Warnings are silenced: this asks what the program does, and the
         // fixtures are written for a compiler that accepts a subset of C.
         let compiled = Command::new("gcc")
             .args(["-O0", "-w", "-o"])
             .arg(stem)
             .arg(&self.path)
+            .args(auxiliaries)
             .output()
             .map_err(|e| Failed::from(format!("could not run gcc: {}", e)))?;
 
@@ -218,6 +238,64 @@ impl TestCase {
         }
 
         self.expect_exit_code(stem)
+    }
+
+    /// Build every companion the fixture declares, one object each.
+    ///
+    /// They are built with GCC rather than with the compiler under test, on
+    /// purpose: an `extern` declaration is a claim about a translation unit
+    /// this compiler never sees, so linking against one a production compiler
+    /// produced is what proves the two agree about the ABI instead of only
+    /// about this compiler's own conventions.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_dir` - this trial's scratch directory, where the objects go
+    ///
+    /// # Errors
+    ///
+    /// Returns a report naming the companion GCC could not build.
+    fn build_auxiliaries(&self, work_dir: &Path) -> Result<Vec<PathBuf>, Failed> {
+        // Resolved once rather than per companion: every one of a fixture's
+        // companions sits in the same directory.
+        //
+        // A subdirectory rather than the suite directory itself, because
+        // discovery walks that one: a companion sitting next to the fixture
+        // would be picked up as a fixture of its own.
+        let sources = self
+            .path
+            .parent()
+            .expect("a fixture always sits inside its suite directory")
+            .join(AUXILIARY_DIR);
+
+        self.directives
+            .aux_builds
+            .iter()
+            .map(|name| Self::build_auxiliary(&sources.join(name), work_dir, name))
+            .collect()
+    }
+
+    /// Compile one companion to an object file, returning where it landed.
+    fn build_auxiliary(source: &Path, work_dir: &Path, name: &str) -> Result<PathBuf, Failed> {
+        let object = work_dir.join(name).with_extension("o");
+
+        let built = Command::new("gcc")
+            .args(["-c", "-O0", "-w", "-o"])
+            .arg(&object)
+            .arg(source)
+            .output()
+            .map_err(|e| Failed::from(format!("could not run gcc: {}", e)))?;
+
+        if !built.status.success() {
+            return Err(format!(
+                "gcc could not build the companion {}:\n{}",
+                source.display(),
+                indent(&String::from_utf8_lossy(&built.stderr))
+            )
+            .into());
+        }
+
+        Ok(object)
     }
 
     /// Run the built program and compare its status with the declared one.

@@ -1,0 +1,12 @@
+error[E0211]: conflicting declarations of `scale`
+ --> $DIR/conflicting-function-declarations.c:5:5
+  |
+3 | int scale(int x);
+  | ---------------- previous declaration of `scale` here
+4 | 
+5 | int scale(long x) {
+  |     ^^^^^ `scale` declared with a different type here
+  |
+  = note: every declaration of `scale` must describe the same function
+
+error: aborting due to 1 previous error

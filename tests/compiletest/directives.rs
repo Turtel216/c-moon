@@ -8,6 +8,7 @@
 //! //@ exit-code: 42
 //! //@ compile-flags: --opt
 //! //@ only: opt
+//! //@ aux-build: helper.c
 //! ```
 //!
 //! An unrecognised directive is a hard error rather than a silent no-op, so a
@@ -45,6 +46,13 @@ pub struct Directives {
     pub exit_code: Option<i32>,
     /// Extra flags passed to the compiler in every variant.
     pub compile_flags: Vec<String>,
+    /// Companion translation units to build with GCC and link in, named
+    /// relative to the fixture's `auxiliary/` directory.
+    ///
+    /// This is what gives an `extern` declaration something to resolve
+    /// against: the companion is a translation unit the compiler under test
+    /// never sees.
+    pub aux_builds: Vec<String>,
     /// Optimisation variants to generate for this fixture.
     pub variants: VariantPolicy,
     /// When set, the fixture is reported as ignored with this reason.
@@ -131,6 +139,12 @@ pub fn parse(source: &str) -> Result<Directives, DirectiveError> {
                     .compile_flags
                     .extend(argument.split_whitespace().map(String::from));
             }
+            "aux-build" => {
+                if argument.is_empty() {
+                    return Err(error(String::from("aux-build needs a file name")));
+                }
+                directives.aux_builds.push(argument.to_owned());
+            }
             "only" => {
                 directives.variants = match argument {
                     "opt" => VariantPolicy::OptOnly,
@@ -153,7 +167,7 @@ pub fn parse(source: &str) -> Result<Directives, DirectiveError> {
             other => {
                 return Err(error(format!(
                     "unknown directive '{}'; known directives are \
-                     exit-code, compile-flags, only, ignore",
+                     exit-code, compile-flags, aux-build, only, ignore",
                     other
                 )));
             }

@@ -17,9 +17,15 @@ tests/
     filecheck.rs     the `CHECK` matcher used by the codegen suite
     runner.rs        compiling, running and asserting a single fixture
   run-pass/          programs that must compile, link, run and exit correctly
+    extern/
+      auxiliary/     companion translation units, named by `aux-build`
   codegen/           programs whose emitted assembly is pinned down
   ui/                programs the compiler must reject, with `.stderr` snapshots
 ```
+
+An `auxiliary/` directory may sit beside the fixtures of any suite that links
+(`run-pass` and `codegen`). Discovery skips it: what is inside is a
+translation unit of its own, not a fixture.
 
 ## Running
 
@@ -65,6 +71,31 @@ fixture with a production compiler and checks the declared exit code against
 it, which is what makes `//@ exit-code` an assertion about what the C program
 *means* rather than about what this compiler currently does with it. Without
 it, a fixture recorded from a miscompilation would pass for ever.
+
+#### Linking against another translation unit
+
+A fixture that declares an `extern` function names a definition it does not
+contain. `//@ aux-build: helper.c` supplies it: the harness compiles
+`auxiliary/helper.c` **with GCC** and links the object into the build, this
+compiler's and the `[gcc]` reference one's alike.
+
+```c
+// A function defined in another translation unit.
+//@ aux-build: arithmetic.c
+//@ exit-code: 21
+
+extern int triple(int x);
+
+int main() {
+    return triple(7);
+}
+```
+
+The companion is deliberately built by a production compiler rather than by
+this one. That is what makes the fixture an assertion about the System V ABI
+-- argument registers, stack arguments, alignment at a `call` -- instead of an
+assertion that this compiler agrees with itself. A companion may also call
+back into the fixture, which exercises the boundary in the other direction.
 
 ### `codegen`
 
@@ -141,12 +172,14 @@ hard error, so a typo cannot quietly disable a test.
 |-----------------------|------------|----------------------------------------------------|
 | `//@ exit-code: N`    | `run-pass` | Status the program must exit with (`0..=255`, default 0). |
 | `//@ compile-flags: …`| all        | Extra flags for the compiler invocation.            |
+| `//@ aux-build: f.c`  | all but `ui` | Build `auxiliary/f.c` with GCC and link it in.    |
 | `//@ only: opt`       | `run-pass` | Run only the optimised variant.                     |
 | `//@ only: no-opt`    | `run-pass` | Run only the unoptimised variant.                   |
 | `//@ ignore: reason`  | all        | Report as ignored, with the reason shown.           |
 
-`only:` and `exit-code:` are rejected in the suites where they have no meaning,
-so a misplaced expectation cannot masquerade as a passing test.
+`only:`, `exit-code:` and `aux-build:` are rejected in the suites where they
+have no meaning, so a misplaced expectation cannot masquerade as a passing
+test.
 
 ## Adding a test
 
@@ -156,3 +189,5 @@ so a misplaced expectation cannot masquerade as a passing test.
    needs.
 3. For a `ui` fixture, record its snapshot with `BLESS=1 cargo test` and commit
    the `.stderr` alongside it.
+4. If it needs a definition from another translation unit, drop that file in an
+   `auxiliary/` directory beside it and name it with `//@ aux-build:`.

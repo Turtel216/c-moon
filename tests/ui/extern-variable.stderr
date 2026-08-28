@@ -1,0 +1,9 @@
+error[E0207]: `extern` on a variable is not supported yet
+ --> $DIR/extern-variable.c:4:1
+  |
+4 | extern int counter;
+  | ^^^^^^^^^^^^^^^^^^^ in this declaration
+  |
+  = note: this compiler implements the subset of C listed in its README
+
+error: aborting due to 1 previous error

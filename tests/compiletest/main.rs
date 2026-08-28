@@ -20,6 +20,10 @@
 //!
 //! # Usage
 //!
+//! A fixture may name companion translation units with `//@ aux-build:`;
+//! they are built with GCC from an `auxiliary/` directory beside the fixture
+//! and linked in, which is what an `extern` declaration resolves against.
+//!
 //! ```text
 //! cargo test --test compiletest                  # everything
 //! cargo test --test compiletest -- pointers      # filter by name
@@ -38,7 +42,7 @@ use std::process::ExitCode;
 use libtest_mimic::{Arguments, Trial};
 
 use crate::directives::VariantPolicy;
-use crate::runner::{Suite, TestCase, Variant};
+use crate::runner::{AUXILIARY_DIR, Suite, TestCase, Variant};
 
 /// Extension identifying a fixture.
 const FIXTURE_EXTENSION: &str = "c";
@@ -175,6 +179,15 @@ fn misused_directive(suite: Suite, directives: &directives::Directives) -> Optio
         }
     }
 
+    // A `ui` fixture is rejected before anything is linked, so a companion
+    // built for it could never resolve anything.
+    if suite == Suite::Ui && !directives.aux_builds.is_empty() {
+        return Some(String::from(
+            "'aux-build' links a companion in, which a fixture the compiler \
+             must reject never reaches",
+        ));
+    }
+
     None
 }
 
@@ -227,6 +240,12 @@ fn fixtures(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     for entry in entries {
         if entry.is_dir() {
+            // Companions named by `aux-build` are translation units of their
+            // own, not fixtures: they declare no expectations and have no
+            // `main` to run.
+            if entry.file_name().is_some_and(|name| name == AUXILIARY_DIR) {
+                continue;
+            }
             found.extend(fixtures(&entry)?);
         } else if entry
             .extension()
