@@ -11,7 +11,7 @@
 use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
     BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Sign,
-    Stmt, StmtKind, UnaryOp,
+    Stmt, StmtKind, StorageClass, UnaryOp,
 };
 use crate::frontend::lexer::{LexError, Lexer, Token, TokenKind, char_literal_value};
 use crate::frontend::span::Span;
@@ -196,7 +196,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::For
                 | TokenKind::Return
                 | TokenKind::RBrace => return,
-                kind if Self::starts_type(kind) => return,
+                kind if Self::starts_declaration(kind) => return,
                 _ => {
                     self.advance();
                 }
@@ -213,8 +213,16 @@ impl<'a> Parser<'a> {
         // start is remembered before anything is consumed.
         let start = self.current().span;
 
+        // The storage class comes before the type, so it is read before the
+        // parser knows what kind of declaration follows. Whether it is allowed
+        // on that kind is semantic analysis' question, not the grammar's.
+        let storage = match self.match_kind(TokenKind::Extern) {
+            true => StorageClass::Extern,
+            false => StorageClass::None,
+        };
+
         if self.at_struct_decl() {
-            return self.parse_struct_decl(start);
+            return self.parse_struct_decl(start, storage);
         }
 
         let base_ty = self.parse_type_specifier()?;
@@ -223,13 +231,18 @@ impl<'a> Parser<'a> {
         // Only a declarator followed by `(` at file scope is a function; inside
         // a block the variable path runs instead and rejects the `(`.
         if context == DeclContext::TopLevel && self.match_kind(TokenKind::LParen) {
-            return self.parse_function_tail(start, declarator);
+            return self.parse_function_tail(start, storage, declarator);
         }
-        self.parse_variable_tail(start, declarator)
+        self.parse_variable_tail(start, storage, declarator)
     }
 
     /// Parses a function's parameters and body, with `(` consumed.
-    fn parse_function_tail(&mut self, start: Span, declarator: Declarator) -> PResult<Decl> {
+    fn parse_function_tail(
+        &mut self,
+        start: Span,
+        storage: StorageClass,
+        declarator: Declarator,
+    ) -> PResult<Decl> {
         let params = self.parse_param_list()?;
         self.expect(TokenKind::RParen, "after parameter list")?;
 
@@ -251,6 +264,7 @@ impl<'a> Parser<'a> {
                 params,
                 body,
             },
+            storage,
             signature,
             declarator.name_span,
         ))
@@ -258,7 +272,12 @@ impl<'a> Parser<'a> {
 
     /// Parses a variable declaration's initializer and terminator, with the
     /// declarator consumed.
-    fn parse_variable_tail(&mut self, start: Span, declarator: Declarator) -> PResult<Decl> {
+    fn parse_variable_tail(
+        &mut self,
+        start: Span,
+        storage: StorageClass,
+        declarator: Declarator,
+    ) -> PResult<Decl> {
         let initializer = if self.match_kind(TokenKind::Eq) {
             Some(self.parse_expr()?)
         } else {
@@ -272,6 +291,7 @@ impl<'a> Parser<'a> {
                 name: declarator.name,
                 initializer,
             },
+            storage,
             start.to(self.prev_span()),
             declarator.name_span,
         ))
@@ -296,7 +316,7 @@ impl<'a> Parser<'a> {
 
     /// Parses `struct [Tag] { members };` or `struct Tag;`, with the cursor on
     /// `struct`.
-    fn parse_struct_decl(&mut self, start: Span) -> PResult<Decl> {
+    fn parse_struct_decl(&mut self, start: Span, storage: StorageClass) -> PResult<Decl> {
         self.expect(TokenKind::Struct, "")?;
 
         // An anonymous struct has no name to point at, so the tag's span falls
@@ -320,6 +340,7 @@ impl<'a> Parser<'a> {
 
         Ok(self.mk_decl(
             DeclKind::Struct { name, members },
+            storage,
             start.to(self.prev_span()),
             name_span,
         ))
@@ -339,6 +360,9 @@ impl<'a> Parser<'a> {
                     name: declarator.name,
                     initializer: None,
                 },
+                // A member declares no storage of its own: it is part of the
+                // object the struct type describes.
+                StorageClass::None,
                 start.to(self.prev_span()),
                 declarator.name_span,
             ));
@@ -876,9 +900,19 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// Whether `kind` can begin a declaration.
+    ///
+    /// Wider than [`Self::starts_type`]: a declaration may open with a storage
+    /// class instead of with its type. The narrower question is the one the
+    /// specifier grammar and the cast lookahead ask, since neither a cast nor
+    /// the type in `unsigned <type>` may carry a storage class.
+    fn starts_declaration(kind: TokenKind) -> bool {
+        matches!(kind, TokenKind::Extern) || Self::starts_type(kind)
+    }
+
     /// Whether the cursor sits on a declaration rather than a statement.
     fn at_declaration(&self) -> bool {
-        Self::starts_type(self.current().kind)
+        Self::starts_declaration(self.current().kind)
     }
 
     /// Whether the cursor sits on a cast such as `(int)x`, as opposed to a
@@ -1079,10 +1113,17 @@ impl<'a> Parser<'a> {
     /// * `kind` - what is being declared
     /// * `span` - the declaration as written; see [`Decl::span`]
     /// * `name_span` - the declared identifier alone
-    fn mk_decl(&mut self, kind: DeclKind, span: Span, name_span: Span) -> Decl {
+    fn mk_decl(
+        &mut self,
+        kind: DeclKind,
+        storage: StorageClass,
+        span: Span,
+        name_span: Span,
+    ) -> Decl {
         Decl {
             id: self.allocate_id(),
             kind,
+            storage,
             span,
             name_span,
         }
@@ -1227,6 +1268,54 @@ mod tests {
                 assert!(params[0].name.is_none());
             }
             _ => panic!("expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn reads_extern_in_front_of_a_declaration() {
+        // Arrange / Act
+        let tu = parse_ok("extern int add(int a, int b);");
+
+        // Assert: the specifier is recorded on the declaration, and what
+        // follows it parses as it would on its own.
+        assert_eq!(tu[0].storage, StorageClass::Extern);
+        match &tu[0].kind {
+            DeclKind::Function {
+                name, params, body, ..
+            } => {
+                assert_eq!(name, "add");
+                assert_eq!(params.len(), 2);
+                assert!(body.is_none());
+            }
+            other => panic!("expected a function declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declaration_with_no_specifier_carries_no_storage_class() {
+        // Arrange / Act / Assert: the three kinds of declaration, none of
+        // which was written with one.
+        for source in ["int add(int a);", "int x = 1;", "struct Point { int x; };"] {
+            assert_eq!(parse_ok(source)[0].storage, StorageClass::None, "{source}");
+        }
+    }
+
+    #[test]
+    fn extern_reaches_the_declarations_the_grammar_gives_no_meaning_to() {
+        // Arrange / Act / Assert: a storage class is read before the parser
+        // knows what follows it, so it is accepted on a variable and inside a
+        // block, and rejecting it is left to semantic analysis. Were the
+        // grammar to refuse it here, the reader would get a syntax error
+        // instead of a diagnostic naming the unsupported feature.
+        assert_eq!(
+            parse_ok("extern int counter;")[0].storage,
+            StorageClass::Extern
+        );
+
+        let items = parse_function_body("int main() { extern int counter; return 0; }");
+        match &items[0] {
+            BlockItem::Decl(decl) => assert_eq!(decl.storage, StorageClass::Extern),
+            other => panic!("expected a declaration, got {other:?}"),
         }
     }
 

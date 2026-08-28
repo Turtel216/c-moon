@@ -121,7 +121,7 @@ pub fn run() -> ExitCode {
         return fatal(&format!("cannot write '{}': {}", asm_output, e));
     }
 
-    if let Err(message) = assamble_program(&cli.output_file, &asm_output) {
+    if let Err(message) = assamble_program(&cli.output_file, &asm_output, &cli.link) {
         return fatal(&message);
     }
 
@@ -170,14 +170,22 @@ fn optimize_through_ssa(ir: &mut ProgramIr, optimize: bool) {
 
 /// Invokes GCC on the ``asm_output`` file and produces the executable.
 ///
+/// # Arguments
+///
+/// * `output_path` - where the executable is written
+/// * `asm_output` - the assembly listing this compiler just emitted
+/// * `link` - further object or source files to link in, which is how the
+///   definitions an `extern` declaration names reach the executable
+///
 /// # Errors
 ///
 /// Returns a human readable message when GCC cannot be spawned or exits with
 /// a non-zero status; GCC's own stderr is forwarded so the assembler's
-/// complaint is not swallowed.
-fn assamble_program(output_path: &str, asm_output: &str) -> Result<(), String> {
+/// complaint -- an unresolved `extern` among them -- is not swallowed.
+fn assamble_program(output_path: &str, asm_output: &str, link: &[String]) -> Result<(), String> {
     let output = Command::new("gcc")
         .args(["-no-pie", "-o", output_path, asm_output])
+        .args(link)
         .output()
         .map_err(|e| format!("failed to run gcc: {}", e))?;
 

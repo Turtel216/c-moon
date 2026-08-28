@@ -16,6 +16,10 @@ impl AstPrinter {
     }
 
     pub fn print_decl(&mut self, decl: &Decl, w: &mut impl Write) -> fmt::Result {
+        // Empty unless a storage class was written, so an ordinary
+        // declaration prints exactly as it did before.
+        let storage = decl.storage.prefix();
+
         match &decl.kind {
             DeclKind::Variable {
                 ty,
@@ -23,7 +27,7 @@ impl AstPrinter {
                 initializer,
             } => {
                 self.indent(w)?;
-                write!(w, "{ty} {name}")?;
+                write!(w, "{storage}{ty} {name}")?;
                 if let Some(init) = initializer {
                     write!(w, " = ")?;
                     self.print_expr(init, w)?;
@@ -37,7 +41,7 @@ impl AstPrinter {
                 body,
             } => {
                 self.indent(w)?;
-                write!(w, "{return_ty} {name}(")?;
+                write!(w, "{storage}{return_ty} {name}(")?;
                 for (i, param) in params.iter().enumerate() {
                     if i > 0 {
                         write!(w, ", ")?;

@@ -27,6 +27,10 @@ pub struct Cli {
     /// Output Assembly
     #[arg(long, default_value_t = false)]
     pub asm: bool,
+
+    /// An object or source file to link in, repeatable
+    #[arg(long = "link", value_name = "FILE")]
+    pub link: Vec<String>,
 }
 
 /// Get command line arguments

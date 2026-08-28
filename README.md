@@ -41,7 +41,24 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
   zeroes, and a count past the width of the type -- undefined in C -- is read
   the way the hardware reads it, so the optimized and the unoptimized build of
   a program never disagree about it.
-* **Functions:** Declarations, definitions, and calls with arguments.
+* **Functions:** Declarations, definitions, and calls with arguments. A
+  function may be declared before it is defined -- a prototype above the call,
+  the definition below it -- and may be declared as often as the program likes
+  as long as every declaration describes the same function; only a second body
+  is a redefinition.
+* **`extern`:** A declaration without a body says the definition is somewhere
+  else and leaves the address to the linker, which is what lets a program call
+  into another translation unit or into the C library. `extern` says the same
+  thing explicitly, and on a definition it says what a definition already
+  says. Anything this compiler defines is given external linkage, so the
+  boundary is crossed in both directions: GCC-compiled code calls in as
+  readily as it is called. The System V argument registers, the stack
+  arguments past the sixth and the alignment at a `call` all have to agree
+  with a production compiler for that to work, and the test suite pins it down
+  by building companion translation units with GCC and linking them in. The
+  `--link` flag names the object or source files to link alongside. `extern`
+  on a *variable* is rejected: it would name storage nothing here reserves,
+  which needs the global variables below.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
 * **Structs:** definitions and forward declarations, member access with `.` and
@@ -63,8 +80,8 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
   array be a parameter.
 * [ ] Integer literal suffixes (`u`, `L`); a decimal literal too large for a `long int` is already an `unsigned long int`, as GCC makes it.
 * [ ] Pointer arithmetic.
-* [ ] Global variables.
-* [ ] `extern` keyword and linking against GCC-compiled C programs and the standard library.
+* [ ] Global variables, and with them `extern` on a variable rather than only
+  on a function.
 * [ ] The remaining operator the parser recognizes but nothing lowers yet (`%`), and the compound assignments (`+=`, `&=`, ...).
 
 ## Diagnostics
@@ -109,12 +126,13 @@ Arguments:
   <SOURCE_FILE>  The C source file
 
 Options:
-  -o <OUTPUT_FILE>  The output file [default: output]
-      --opt         Enable optimizations
-      --printast    Pretty print AST
-      --printir     Pretty print IR
-      --asm         Output Assembly
-  -h, --help        Print help
+  -o <OUTPUT_FILE>   The output file [default: output]
+      --opt          Enable optimizations
+      --printast     Pretty print AST
+      --printir      Pretty print IR
+      --asm          Output Assembly
+      --link <FILE>  An object or source file to link in, repeatable
+  -h, --help         Print help
 ```
 
 ## Test Suite
@@ -126,7 +144,9 @@ check the exit status), `codegen` (`CHECK` directives matched against the
 emitted assembly) and `ui` (diagnostics compared against checked-in `.stderr`
 snapshots). Every `run-pass` fixture runs against both the unoptimized and the
 optimized pipeline, and also against GCC as a ground truth for the expected
-exit code.
+exit code. A fixture may name companion translation units with `//@ aux-build`;
+they are compiled with GCC and linked in, which is what an `extern` declaration
+resolves against and what makes the ABI agreement testable.
 
 ```bash
 cargo test                                  # everything

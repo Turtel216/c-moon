@@ -98,6 +98,8 @@ pub enum BlockItem {
 pub struct Decl {
     pub id: NodeId,
     pub kind: DeclKind,
+    /// The storage class specifier written in front of the declaration.
+    pub storage: StorageClass,
     /// The declaration as written. A function's span stops at its parameter
     /// list: underlining a whole definition would quote the entire body.
     pub span: Span,
@@ -105,6 +107,41 @@ pub struct Decl {
     /// the *name* -- a redeclaration, say -- points at. An unnamed declaration
     /// repeats `span` here.
     pub name_span: Span,
+}
+
+/// The storage class specifier written in front of a declaration.
+///
+/// C spells out where a name is defined and how long its object lives; the
+/// subset here has the two cases that differ for a function. The specifier
+/// sits on the declaration rather than inside [`DeclKind`] because it is read
+/// before the parser knows which kind it is reading -- `extern` comes first,
+/// and only the declarator that follows says whether a variable or a function
+/// is being declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageClass {
+    /// No specifier written. A function declared this way still has external
+    /// linkage; what makes it different from `extern` is that a body may
+    /// follow, and for a variable that storage is reserved here.
+    #[default]
+    None,
+    /// `extern`: the name is defined elsewhere -- later in this translation
+    /// unit, in another one, or in a library -- so nothing is reserved for it
+    /// and the linker is left to find it.
+    Extern,
+}
+
+impl StorageClass {
+    /// The specifier as written, with the space that separates it from the
+    /// type, or the empty string when none was written.
+    ///
+    /// Mirrors [`Sign::prefix`], and for the same reason: a diagnostic or a
+    /// tree dump should quote the declaration the way the reader wrote it.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            StorageClass::None => "",
+            StorageClass::Extern => "extern ",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -279,6 +316,15 @@ mod tests {
             CType::Pointer(Box::new(CType::Long(Sign::Signed))).to_string(),
             "long int*"
         );
+    }
+
+    #[test]
+    fn a_storage_class_writes_the_specifier_that_names_it() {
+        // Arrange / Act / Assert: a declaration with nothing written in front
+        // of it prints exactly as it did before there was a storage class.
+        assert_eq!(StorageClass::Extern.prefix(), "extern ");
+        assert_eq!(StorageClass::None.prefix(), "");
+        assert_eq!(StorageClass::default(), StorageClass::None);
     }
 
     #[test]

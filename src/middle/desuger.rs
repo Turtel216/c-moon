@@ -132,10 +132,12 @@ impl<'a> LoweringContext<'a> {
         for decl in decls {
             match &decl.kind {
                 DeclKind::Function {
-                    name, body, params, ..
+                    name,
+                    body: Some(body),
+                    params,
+                    ..
                 } => {
                     self.return_width = width_of(&self.types.function(name).return_ty);
-                    let bod = body.clone().unwrap(); // TODO: Fix unsafe unwrap and clone
 
                     // Each parameter as the variable it binds and the width
                     // its declared type is held at.
@@ -150,8 +152,16 @@ impl<'a> LoweringContext<'a> {
                         })
                         .collect();
 
-                    self.lower_function(name, &parameters, &bod);
+                    self.lower_function(name, &parameters, body);
                 }
+
+                // A declaration without a body -- a prototype, with or without
+                // `extern` -- says only that the name exists and what its type
+                // is. The definition is elsewhere: further down this file, in
+                // another translation unit, or in a library. There is nothing
+                // to lower, and a call to it is the same `call` either way,
+                // which is what leaves the address to the linker.
+                DeclKind::Function { .. } => {}
 
                 // A struct definition declares no storage of its own: it fixes
                 // a layout, which semantic analysis already recorded.

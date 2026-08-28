@@ -37,6 +37,8 @@ pub mod codes {
     pub const UNKNOWN_MEMBER: &str = "E0209";
     /// A `break` or `continue` with no enclosing loop.
     pub const JUMP_OUTSIDE_LOOP: &str = "E0210";
+    /// Two declarations of one function that do not describe the same function.
+    pub const CONFLICTING_DECLARATION: &str = "E0211";
 }
 
 /// A span with something to say about it.

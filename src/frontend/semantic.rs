@@ -13,11 +13,12 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::iter::zip;
 
 use crate::driver::diagnostics::{CompilerError, Diagnostic, codes};
 use crate::frontend::ast::{
     BinaryOp, BlockItem, CType, Decl, DeclKind, Expr, ExprKind, Literal, NodeId, ParamDecl, Sign,
-    Stmt, StmtKind, UnaryOp,
+    Stmt, StmtKind, StorageClass, UnaryOp,
 };
 use crate::frontend::layout::StructTable;
 use crate::frontend::scope::ScopeStack;
@@ -53,6 +54,18 @@ pub enum SemanticError {
     RedeclaredFunction {
         name: String,
         span: Span,
+        previous: Span,
+    },
+    /// Two declarations of one function that do not agree on its type.
+    ///
+    /// C lets a function be declared as often as one likes -- a prototype
+    /// above the call, the definition below it -- provided every declaration
+    /// describes the same function. One that does not is not a second
+    /// function but a contradiction about the first.
+    ConflictingDeclaration {
+        name: String,
+        span: Span,
+        /// The declaration this one contradicts.
         previous: Span,
     },
     /// A struct tag defined twice.
@@ -166,6 +179,9 @@ impl fmt::Display for SemanticError {
                     _ => format!("{found} arguments were"),
                 }
             ),
+            SemanticError::ConflictingDeclaration { name, .. } => {
+                write!(f, "conflicting declarations of `{name}`")
+            }
             SemanticError::RedeclaredStruct { name, .. } => {
                 write!(f, "the struct `{name}` is defined multiple times")
             }
@@ -248,6 +264,17 @@ impl CompilerError for SemanticError {
                 .with_label(format!("`{name}` redefined here"))
                 .with_secondary(previous, format!("previous definition of `{name}` here"))
                 .with_note(format!("`{name}` must be defined only once")),
+
+            SemanticError::ConflictingDeclaration {
+                name,
+                span,
+                previous,
+            } => Diagnostic::error(codes::CONFLICTING_DECLARATION, message, span)
+                .with_label(format!("`{name}` declared with a different type here"))
+                .with_secondary(previous, format!("previous declaration of `{name}` here"))
+                .with_note(format!(
+                    "every declaration of `{name}` must describe the same function"
+                )),
 
             SemanticError::RedeclaredStruct {
                 name,
@@ -594,6 +621,23 @@ pub struct FunctionSig {
     pub span: Span,
 }
 
+impl FunctionSig {
+    /// Whether `other` declares the same function this signature does.
+    ///
+    /// The spans are deliberately left out of the comparison: two
+    /// declarations of one function stand in two places, which is the whole
+    /// point of a prototype, so only the types they state have to agree.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - a second declaration of the same name
+    fn describes_the_same_function_as(&self, other: &Self) -> bool {
+        self.return_ty == other.return_ty
+            && self.params.len() == other.params.len()
+            && zip(&self.params, &other.params).all(|(mine, theirs)| mine.ty == theirs.ty)
+    }
+}
+
 /// A variable's declared type and where it was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VarInfo {
@@ -715,13 +759,29 @@ impl SemanticAnalyzer {
     }
 
     /// Records every function's signature before any body is checked.
+    ///
+    /// A function may be declared as often as the program likes -- that is
+    /// what a prototype above the call, and what `extern`, are for -- so a
+    /// repeat declaration is accepted as long as it describes the same
+    /// function. Only a second *body* is a redefinition, and only a
+    /// disagreement about the types is a conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::RedeclaredFunction`] for a function defined
+    /// twice and [`SemanticError::ConflictingDeclaration`] for two
+    /// declarations that do not describe the same function.
     fn register_function_signatures(&mut self, decls: &[Decl]) -> SemanticResult<()> {
+        // Where each definition was seen, so a second one can point at the
+        // first. A declaration without a body records nothing here.
+        let mut defined: HashMap<&str, Span> = HashMap::new();
+
         for decl in decls {
             let DeclKind::Function {
                 return_ty,
                 name,
                 params,
-                ..
+                body,
             } = &decl.kind
             else {
                 continue;
@@ -736,12 +796,35 @@ impl SemanticAnalyzer {
                 span: decl.span,
             };
 
-            if let Some(previous) = self.types.functions.insert(name.clone(), sig) {
+            // `insert` hands back what was already there, so recording this
+            // definition and asking whether there was an earlier one are the
+            // same lookup. The `&&` inside `if let` is a let-chain: the
+            // pattern is only tried when the guard before it held.
+            if body.is_some()
+                && let Some(previous) = defined.insert(name.as_str(), decl.span)
+            {
                 return Err(SemanticError::RedeclaredFunction {
                     name: name.clone(),
                     span: decl.name_span,
-                    previous: previous.span,
+                    previous,
                 });
+            }
+
+            match self.types.functions.get(name) {
+                // The first declaration is the one kept, and so the one a
+                // later diagnostic quotes: it is where the reader was first
+                // told what the function takes.
+                Some(previous) if previous.describes_the_same_function_as(&sig) => {}
+                Some(previous) => {
+                    return Err(SemanticError::ConflictingDeclaration {
+                        name: name.clone(),
+                        span: decl.name_span,
+                        previous: previous.span,
+                    });
+                }
+                None => {
+                    self.types.functions.insert(name.clone(), sig);
+                }
             }
         }
 
@@ -771,7 +854,10 @@ impl SemanticAnalyzer {
                 ty,
                 name,
                 initializer,
-            } => self.analyze_variable_decl(decl, ty, name, initializer.as_ref()),
+            } => {
+                Self::expect_no_storage_class(decl, "a variable")?;
+                self.analyze_variable_decl(decl, ty, name, initializer.as_ref())
+            }
 
             DeclKind::Function {
                 return_ty,
@@ -781,8 +867,38 @@ impl SemanticAnalyzer {
             } => self.analyze_function_decl(decl, return_ty, params, body.as_ref()),
 
             DeclKind::Struct { name, members } => {
+                Self::expect_no_storage_class(decl, "a struct declaration")?;
                 self.analyze_struct_decl(decl, name.as_deref(), members.as_deref())
             }
+        }
+    }
+
+    /// Rejects a storage class on a declaration that cannot carry one yet.
+    ///
+    /// `extern` reaches the rest of the pipeline only on a function, where it
+    /// says the definition is somewhere else and the call is left to the
+    /// linker. On a variable it would have to name storage that no
+    /// translation unit reserves here, which is the global variables this
+    /// compiler does not have yet; on a struct declaration C gives it no
+    /// meaning at all.
+    ///
+    /// # Arguments
+    ///
+    /// * `decl` - the declaration, blamed as a whole
+    /// * `subject` - what it declares, e.g. `a variable`
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::Unsupported`] when a storage class was
+    /// written.
+    fn expect_no_storage_class(decl: &Decl, subject: &str) -> SemanticResult<()> {
+        match decl.storage {
+            StorageClass::None => Ok(()),
+            StorageClass::Extern => Err(SemanticError::Unsupported {
+                feature: format!("`extern` on {subject}"),
+                span: decl.span,
+                context: "in this declaration",
+            }),
         }
     }
 
@@ -1936,6 +2052,81 @@ mod tests {
         match analyze_err("int loop() { while (1) { break; } return 0; } int main() { break; }") {
             SemanticError::JumpOutsideLoop { keyword, .. } => assert_eq!(keyword, "break"),
             other => panic!("expected JumpOutsideLoop, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_function_may_be_declared_before_it_is_defined() {
+        // A prototype above the call and the definition below it, which is
+        // what `extern` and a plain forward declaration are both for.
+        analyze_ok(
+            "int square(int n); int main() { return square(2); } int square(int n) { return n * n; }",
+        );
+        analyze_ok("extern int square(int n); int main() { return square(2); }");
+        // Repeated as often as the program likes, as long as nothing changes.
+        analyze_ok("extern int f(int a); int f(int a); int main() { return f(1); }");
+    }
+
+    #[test]
+    fn a_repeated_declaration_must_describe_the_same_function() {
+        // Arrange / Act / Assert: a differing parameter type ...
+        match analyze_err("int f(int a); int f(long a); int main() { return 0; }") {
+            SemanticError::ConflictingDeclaration { name, .. } => assert_eq!(name, "f"),
+            other => panic!("expected ConflictingDeclaration, got: {other:?}"),
+        }
+        // ... a differing return type ...
+        match analyze_err("int f(int a); long f(int a); int main() { return 0; }") {
+            SemanticError::ConflictingDeclaration { name, .. } => assert_eq!(name, "f"),
+            other => panic!("expected ConflictingDeclaration, got: {other:?}"),
+        }
+        // ... and a differing parameter count.
+        match analyze_err("int f(int a); int f(int a, int b); int main() { return 0; }") {
+            SemanticError::ConflictingDeclaration { name, .. } => assert_eq!(name, "f"),
+            other => panic!("expected ConflictingDeclaration, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_second_body_is_a_redefinition() {
+        // Arrange / Act / Assert: two declarations of one function are fine,
+        // two definitions of it are not.
+        match analyze_err("int f() { return 1; } int f() { return 2; }") {
+            SemanticError::RedeclaredFunction { name, .. } => assert_eq!(name, "f"),
+            other => panic!("expected RedeclaredFunction, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_conflict_points_at_the_declaration_it_contradicts() {
+        // Arrange / Act / Assert: the first declaration is the one kept, so
+        // it is the one quoted however many follow it.
+        match analyze_err("int f(int a);\nint f(int a);\nlong f(int a);") {
+            SemanticError::ConflictingDeclaration { span, previous, .. } => {
+                assert_eq!(previous.line, 1);
+                assert_eq!(span.line, 3);
+            }
+            other => panic!("expected ConflictingDeclaration, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extern_is_accepted_only_on_a_function() {
+        // Arrange / Act / Assert: on a definition it says what a definition
+        // already says, so it changes nothing ...
+        analyze_ok("extern int twice(int x) { return x + x; } int main() { return twice(1); }");
+
+        // ... while on a variable it would name storage nothing here
+        // reserves, at file scope and inside a block alike.
+        for source in [
+            "extern int counter; int main() { return 0; }",
+            "int main() { extern int counter; return 0; }",
+        ] {
+            match analyze_err(source) {
+                SemanticError::Unsupported { feature, .. } => {
+                    assert_eq!(feature, "`extern` on a variable")
+                }
+                other => panic!("expected Unsupported, got: {other:?}"),
+            }
         }
     }
 
