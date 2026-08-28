@@ -132,6 +132,34 @@ impl ConditionCode {
     }
 }
 
+/// Which way a shift moves its operand, and what fills the bits it vacates.
+///
+/// Like an ordering, a right shift comes in two forms because the answer
+/// depends on how the operand reads: an arithmetic shift keeps a signed
+/// value's sign by copying it down, where a logical one shifts zeroes in. A
+/// left shift always vacates the bottom, which zeroes fill either way, so
+/// there is one of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftOp {
+    /// `shl` -- towards the top, zeroes in at the bottom.
+    Left,
+    /// `sar` -- towards the bottom, copies of the sign bit in at the top.
+    ArithmeticRight,
+    /// `shr` -- towards the bottom, zeroes in at the top.
+    LogicalRight,
+}
+
+impl ShiftOp {
+    /// The assembler mnemonic for this shift.
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Left => "shl",
+            Self::ArithmeticRight => "sar",
+            Self::LogicalRight => "shr",
+        }
+    }
+}
+
 /// A memory reference, `[base + index * scale + disp]`.
 ///
 /// The scaled index is what lets an array access be a single instruction; it
@@ -218,6 +246,18 @@ pub enum X86Instruction {
     /// the two are separate instructions: they read the same bits and give
     /// different answers.
     Div(RegisterWidth, X86Operand),
+    /// `and dst, src`
+    And(RegisterWidth, X86Operand, X86Operand),
+    /// `or dst, src`
+    Or(RegisterWidth, X86Operand, X86Operand),
+    /// `xor dst, src`
+    Xor(RegisterWidth, X86Operand, X86Operand),
+    /// `shl` / `sar` / `shr dst, count` -- shift `dst` by `count`, which the
+    /// hardware takes either as an immediate or from CL and nowhere else.
+    ///
+    /// The count is read as a byte however wide the operand shifted is, which
+    /// is why it is the one operand not written at the instruction's width.
+    Shift(ShiftOp, RegisterWidth, X86Operand, X86Operand),
     /// `cmp lhs, rhs` -- flags from `lhs - rhs`.
     Cmp(RegisterWidth, X86Operand, X86Operand),
     /// `test lhs, rhs` -- flags from `lhs & rhs`.

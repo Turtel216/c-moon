@@ -40,6 +40,14 @@ impl fmt::Display for Opcode {
                 Sign::Signed => "/",
                 Sign::Unsigned => "/u",
             },
+            Opcode::And => "&",
+            Opcode::Or => "|",
+            Opcode::Xor => "^",
+            Opcode::Shl => "<<",
+            Opcode::Shr(sign) => match sign {
+                Sign::Signed => ">>",
+                Sign::Unsigned => ">>u",
+            },
             Opcode::Eq => "==",
             Opcode::Neq => "!=",
             Opcode::Lt(sign) => match sign {
@@ -97,6 +105,11 @@ impl fmt::Display for TACInstruction {
             | Opcode::Sub
             | Opcode::Mul
             | Opcode::Div(_)
+            | Opcode::And
+            | Opcode::Or
+            | Opcode::Xor
+            | Opcode::Shl
+            | Opcode::Shr(_)
             | Opcode::Eq
             | Opcode::Neq
             | Opcode::Lt(_)
@@ -564,6 +577,12 @@ fn binary_symbol(operator: ssa::BinOp) -> &'static str {
         ssa::BinOp::Mul => "*",
         ssa::BinOp::Eq => "==",
         ssa::BinOp::Neq => "!=",
+        ssa::BinOp::And => "&",
+        ssa::BinOp::Or => "|",
+        ssa::BinOp::Xor => "^",
+        ssa::BinOp::Shl => "<<",
+        ssa::BinOp::Shr(Sign::Signed) => ">>",
+        ssa::BinOp::Shr(Sign::Unsigned) => ">>u",
         // The operations that read their operands' bits say how, so that two
         // instructions which are not the same operation do not print alike.
         ssa::BinOp::Div(Sign::Signed) => "/",

@@ -75,6 +75,40 @@ fn simplify(op: &Op) -> Option<Op> {
             _ => None,
         },
 
+        // A mask of zeroes selects nothing and a mask of ones selects
+        // everything -- and -1 is the constant whose bits are all ones at
+        // every width, since a narrower constant is held sign-extended.
+        BinOp::And => match (lhs, rhs) {
+            (Operand::Imm(0), _) | (_, Operand::Imm(0)) => Some(Op::Copy(Operand::Imm(0))),
+            (Operand::Imm(-1), other) | (other, Operand::Imm(-1)) => Some(Op::Copy(other)),
+            _ if same => Some(Op::Copy(lhs)),
+            _ => None,
+        },
+
+        BinOp::Or => match (lhs, rhs) {
+            (Operand::Imm(0), other) | (other, Operand::Imm(0)) => Some(Op::Copy(other)),
+            (Operand::Imm(-1), _) | (_, Operand::Imm(-1)) => Some(Op::Copy(Operand::Imm(-1))),
+            _ if same => Some(Op::Copy(lhs)),
+            _ => None,
+        },
+
+        // Every bit of a value differs from itself nowhere, so `x ^ x` is
+        // zero -- the exclusive-or counterpart of `x - x`.
+        BinOp::Xor => match (lhs, rhs) {
+            (Operand::Imm(0), other) | (other, Operand::Imm(0)) => Some(Op::Copy(other)),
+            _ if same => Some(Op::Copy(Operand::Imm(0))),
+            _ => None,
+        },
+
+        // Shifting by nothing moves nothing, and shifting zero leaves zero
+        // however far it goes. Neither identity cares which way the bits
+        // read, so both shifts share them.
+        BinOp::Shl | BinOp::Shr(_) => match (lhs, rhs) {
+            (_, Operand::Imm(0)) => Some(Op::Copy(lhs)),
+            (Operand::Imm(0), _) => Some(Op::Copy(Operand::Imm(0))),
+            _ => None,
+        },
+
         // A value equals itself, is not less than itself, and so on.
         BinOp::Eq | BinOp::Lte(_) | BinOp::Gte(_) if same => Some(Op::Copy(Operand::Imm(1))),
         BinOp::Neq | BinOp::Lt(_) | BinOp::Gt(_) if same => Some(Op::Copy(Operand::Imm(0))),
@@ -161,9 +195,49 @@ mod tests {
     }
 
     #[test]
+    fn masking_with_all_ones_or_all_zeroes_needs_no_mask() {
+        // A mask of zeroes selects nothing ...
+        for build in [|x| (Operand::Imm(0), x), |x| (x, Operand::Imm(0))] {
+            let (op, _) = simplified(BinOp::And, build);
+            assert_eq!(op, Op::Copy(Operand::Imm(0)));
+
+            // ... and is what an exclusive-or or an inclusive-or ignores.
+            let (op, opaque) = simplified(BinOp::Or, build);
+            assert_eq!(op, Op::Copy(opaque));
+            let (op, opaque) = simplified(BinOp::Xor, build);
+            assert_eq!(op, Op::Copy(opaque));
+        }
+
+        // A mask of ones selects everything, which -1 is at every width.
+        for build in [|x| (Operand::Imm(-1), x), |x| (x, Operand::Imm(-1))] {
+            let (op, opaque) = simplified(BinOp::And, build);
+            assert_eq!(op, Op::Copy(opaque));
+
+            let (op, _) = simplified(BinOp::Or, build);
+            assert_eq!(op, Op::Copy(Operand::Imm(-1)));
+        }
+    }
+
+    #[test]
+    fn a_shift_by_nothing_and_a_shift_of_nothing_move_nothing() {
+        for operator in [
+            BinOp::Shl,
+            BinOp::Shr(Sign::Signed),
+            BinOp::Shr(Sign::Unsigned),
+        ] {
+            let (op, opaque) = simplified(operator, |x| (x, Operand::Imm(0)));
+            assert_eq!(op, Op::Copy(opaque));
+
+            let (op, _) = simplified(operator, |x| (Operand::Imm(0), x));
+            assert_eq!(op, Op::Copy(Operand::Imm(0)));
+        }
+    }
+
+    #[test]
     fn an_operation_on_one_value_twice_is_decided_without_knowing_it() {
         for (operator, expected) in [
             (BinOp::Sub, 0),
+            (BinOp::Xor, 0),
             (BinOp::Div(Sign::Signed), 1),
             (BinOp::Eq, 1),
             (BinOp::Lte(Sign::Signed), 1),
@@ -174,6 +248,13 @@ mod tests {
         ] {
             let (op, _) = simplified(operator, |x| (x, x));
             assert_eq!(op, Op::Copy(Operand::Imm(expected)), "{operator:?}");
+        }
+
+        // Anding or oring a value with itself answers with the value rather
+        // than with a constant: every bit of it agrees with itself.
+        for operator in [BinOp::And, BinOp::Or] {
+            let (op, opaque) = simplified(operator, |x| (x, x));
+            assert_eq!(op, Op::Copy(opaque), "{operator:?}");
         }
     }
 

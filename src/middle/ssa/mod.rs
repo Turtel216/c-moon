@@ -201,17 +201,22 @@ impl Operand {
 /// produce 0 or 1.
 ///
 /// The operations whose answer depends on how the operands' bits read carry
-/// the [`Sign`] that says: an ordering and a division do, while an addition,
-/// a subtraction, a multiplication and an equality give the same bits either
-/// way and so are one operation rather than two. That also keeps them
-/// congruent for [`gvn`](passes::gvn), which would otherwise see the same sum
-/// twice and call it two expressions.
+/// the [`Sign`] that says: an ordering, a division and a right shift do, while
+/// an addition, a subtraction, a multiplication, an equality and every bitwise
+/// operation give the same bits either way and so are one operation rather
+/// than two. That also keeps them congruent for [`gvn`](passes::gvn), which
+/// would otherwise see the same sum twice and call it two expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div(Sign),
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr(Sign),
     Eq,
     Neq,
     Lt(Sign),

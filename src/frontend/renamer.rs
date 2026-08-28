@@ -164,7 +164,9 @@ impl Renamer {
 
     fn resolve_stmt(&mut self, stmt: &Stmt) -> RenameResult<()> {
         match &stmt.kind {
-            StmtKind::Empty => Ok(()),
+            // Neither an empty statement nor a jump out of a loop names
+            // anything, so there is nothing here to resolve.
+            StmtKind::Empty | StmtKind::Break | StmtKind::Continue => Ok(()),
 
             StmtKind::Expr(expr) => self.resolve_expr(expr),
 
@@ -399,7 +401,7 @@ mod tests {
 
         fn index_stmt(&mut self, stmt: &Stmt) {
             match &stmt.kind {
-                StmtKind::Empty => {}
+                StmtKind::Empty | StmtKind::Break | StmtKind::Continue => {}
                 StmtKind::Expr(expr) => self.index_expr(expr),
                 StmtKind::Return(value) => {
                     if let Some(expr) = value {

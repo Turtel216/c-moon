@@ -92,6 +92,30 @@ impl Width {
         }
     }
 
+    /// How far a shift of this width actually moves its operand.
+    ///
+    /// C leaves a shift by more than the width of the type undefined, and x86
+    /// resolves the question by looking at only the low bits of the count:
+    /// five of them for an operand up to 32 bits wide, six for a 64-bit one.
+    /// Stating that here is what keeps a shift folded at compile time and one
+    /// executed at run time from giving different answers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(Width::Bits32.shift_count(33), 1);
+    /// assert_eq!(Width::Bits64.shift_count(33), 33);
+    /// ```
+    pub const fn shift_count(self, count: i64) -> u32 {
+        let mask = match self {
+            // A byte shift reads the same five bits a 32-bit one does; the
+            // hardware has no narrower count.
+            Width::Bits8 | Width::Bits32 => 31,
+            Width::Bits64 => 63,
+        };
+        (count & mask) as u32
+    }
+
     /// The value of the low bits of `constant` when read with `sign`.
     ///
     /// This is what a widening conversion of a constant computes: the source's
@@ -152,6 +176,28 @@ pub enum Opcode {
     /// read: `-2 / 1` is -2 signed and a very large number unsigned, where an
     /// addition of the same bits gives the same bits either way.
     Div(Sign),
+
+    // Bitwise
+    /// TAC Bitwise and e.g. %r1 & %r2
+    And,
+    /// TAC Bitwise or e.g. %r1 | %r2
+    Or,
+    /// TAC Bitwise exclusive or e.g. %r1 ^ %r2
+    ///
+    /// Also what `~%r1` is: flipping every bit is exclusive-or against a mask
+    /// of ones, so the complement needs no opcode of its own.
+    Xor,
+    /// TAC Left shift e.g. %r1 << %r2
+    ///
+    /// The bits vacated at the bottom are zeroes whichever way the operands
+    /// read, which is why this is one operation where the right shift is two.
+    Shl,
+    /// TAC Right shift e.g. %r1 >> %r2
+    ///
+    /// The one shift whose answer depends on how its left operand reads: a
+    /// signed value keeps its sign, so the bits vacated at the top are copies
+    /// of it, where an unsigned one is filled with zeroes.
+    Shr(Sign),
 
     // Relational / equality (result is 0/1)
     /// TAC Equalality e.g. %r1 == %r2
@@ -444,6 +490,19 @@ mod tests {
         // are the same bits.
         assert_eq!(Width::Bits64.read(Sign::Unsigned, -1), -1);
         assert_eq!(Width::Bits32.unsigned(-1), 4294967295);
+    }
+
+    #[test]
+    fn a_shift_count_is_read_the_way_the_hardware_reads_it() {
+        // Arrange / Act / Assert: only the low five bits of the count reach a
+        // 32-bit shift, so shifting by 33 shifts by one ...
+        assert_eq!(Width::Bits32.shift_count(33), 1);
+        assert_eq!(Width::Bits8.shift_count(33), 1);
+        // ... while a 64-bit shift reads a sixth bit and so shifts by 33.
+        assert_eq!(Width::Bits64.shift_count(33), 33);
+        // A count that fits is left alone at either width.
+        assert_eq!(Width::Bits32.shift_count(4), 4);
+        assert_eq!(Width::Bits64.shift_count(63), 63);
     }
 
     #[test]

@@ -279,7 +279,10 @@ enum Step {
 
 /// Does the order of this operator's operands matter?
 fn commutative(operator: BinOp) -> bool {
-    matches!(operator, BinOp::Add | BinOp::Mul | BinOp::Eq | BinOp::Neq)
+    matches!(
+        operator,
+        BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Eq | BinOp::Neq
+    )
 }
 
 #[cfg(test)]

@@ -119,6 +119,12 @@ pub enum SemanticError {
         /// the operator the help line proposes instead.
         is_arrow: bool,
     },
+    /// `break` or `continue` written where there is no loop for it to act on.
+    JumpOutsideLoop {
+        /// The keyword as written, `break` or `continue`.
+        keyword: &'static str,
+        span: Span,
+    },
     /// A member the struct does not have.
     NoSuchMember {
         /// The struct the member was looked for in.
@@ -190,6 +196,9 @@ impl fmt::Display for SemanticError {
             SemanticError::NoSuchMember {
                 struct_ty, member, ..
             } => write!(f, "no member named `{member}` on type `{struct_ty}`"),
+            SemanticError::JumpOutsideLoop { keyword, .. } => {
+                write!(f, "`{keyword}` outside of a loop")
+            }
         }
     }
 }
@@ -335,6 +344,15 @@ impl CompilerError for SemanticError {
                         false => "not a struct",
                     })
                     .with_optional_help(help.map(str::to_owned))
+            }
+
+            SemanticError::JumpOutsideLoop { keyword, span } => {
+                Diagnostic::error(codes::JUMP_OUTSIDE_LOOP, message, span)
+                    .with_label(format!("cannot `{keyword}` outside of a loop"))
+                    .with_note(format!(
+                        "`{keyword}` acts on the innermost enclosing `while` or `for`, and there \
+                         is none here"
+                    ))
             }
 
             SemanticError::NoSuchMember {
@@ -660,6 +678,9 @@ pub struct SemanticAnalyzer {
     /// Return type of the function whose body is being checked, and the
     /// signature that declared it.
     current_function: Option<(Type, Span)>,
+    /// How many loops enclose the statement being checked, which is what says
+    /// whether a `break` or a `continue` has anything to act on.
+    loop_depth: usize,
     errors: Vec<SemanticError>,
 }
 
@@ -992,7 +1013,7 @@ impl SemanticAnalyzer {
 
             StmtKind::While { condition, body } => {
                 self.analyze_condition(condition, "a `while` condition must be an integer")?;
-                self.analyze_stmt(body)
+                self.in_loop(|analyzer| analyzer.analyze_stmt(body))
             }
 
             StmtKind::For {
@@ -1014,13 +1035,33 @@ impl SemanticAnalyzer {
                     if let Some(step) = step {
                         analyzer.analyze_expr(step)?;
                     }
-                    analyzer.analyze_stmt(body)
+                    analyzer.in_loop(|analyzer| analyzer.analyze_stmt(body))
                 })
             }
+
+            StmtKind::Break => self.check_inside_loop("break", stmt.span),
+            StmtKind::Continue => self.check_inside_loop("continue", stmt.span),
 
             StmtKind::Block(items) => {
                 self.in_new_scope(|analyzer| analyzer.analyze_block_items(items))
             }
+        }
+    }
+
+    /// Rejects a `break` or a `continue` that has no loop to act on.
+    ///
+    /// # Arguments
+    ///
+    /// * `keyword` - the jump as written, `break` or `continue`
+    /// * `span` - the statement, which is what the diagnostic underlines
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SemanticError::JumpOutsideLoop`] when no loop encloses it.
+    fn check_inside_loop(&self, keyword: &'static str, span: Span) -> SemanticResult<()> {
+        match self.loop_depth {
+            0 => Err(SemanticError::JumpOutsideLoop { keyword, span }),
+            _ => Ok(()),
         }
     }
 
@@ -1056,6 +1097,22 @@ impl SemanticAnalyzer {
             StmtKind::Block(items) => self.analyze_block_items(items),
             _ => self.analyze_stmt(init),
         }
+    }
+
+    /// Runs `analysis` with one more enclosing loop counted, so that a `break`
+    /// or a `continue` inside it is accepted.
+    ///
+    /// The count is restored even when the analysis fails, so that an error in
+    /// a loop body does not leave later statements looking as if they were
+    /// still inside it.
+    fn in_loop<T>(
+        &mut self,
+        analysis: impl FnOnce(&mut Self) -> SemanticResult<T>,
+    ) -> SemanticResult<T> {
+        self.loop_depth += 1;
+        let result = analysis(self);
+        self.loop_depth -= 1;
+        result
     }
 
     /// Runs `analysis` in a nested scope, closing it even when the analysis fails.
@@ -1304,15 +1361,16 @@ impl SemanticAnalyzer {
             return Ok(target_ty);
         }
 
-        // For the current subset every arithmetic, comparison, logical and
-        // bitwise operator takes two integers...
+        // For the current subset every arithmetic, comparison, logical,
+        // bitwise and shift operator takes two integers...
         let lhs_ty = self.analyze_expr(lhs)?;
         let rhs_ty = self.analyze_expr(rhs)?;
         Self::expect_integer(&lhs_ty, lhs.span, OPERANDS_MUST_BE_INTEGERS)?;
         Self::expect_integer(&rhs_ty, rhs.span, OPERANDS_MUST_BE_INTEGERS)?;
 
         // ... and yields the type they are both converted to, except that a
-        // comparison or a logical operator yields the 0 or 1 of an `int`.
+        // comparison or a logical operator yields the 0 or 1 of an `int`, and
+        // that a shift takes its type from its left operand alone.
         Ok(match op {
             BinaryOp::Eq
             | BinaryOp::Neq
@@ -1322,6 +1380,12 @@ impl SemanticAnalyzer {
             | BinaryOp::Gte
             | BinaryOp::LogicalAnd
             | BinaryOp::LogicalOr => Type::INT,
+            // A shift does not pair its operands off against each other the
+            // way the arithmetic operators do: each is promoted on its own,
+            // and the answer has the type of the left one. `1L << c` is a
+            // `long int` however wide `c` is, and `1 << c` an `int` even when
+            // `c` is a `long int`.
+            BinaryOp::Shl | BinaryOp::Shr => lhs_ty.promoted(),
             _ => Type::common(&lhs_ty, &rhs_ty),
         })
     }
@@ -1837,6 +1901,42 @@ mod tests {
     #[test]
     fn accepts_empty_statements() {
         analyze_ok("int main() { ; if (1) ; else ; while (0) ; return 0; }");
+    }
+
+    #[test]
+    fn accepts_a_jump_inside_the_loop_it_acts_on() {
+        // However deeply the jump is nested inside the body, and whichever
+        // kind of loop encloses it.
+        analyze_ok("int main() { while (1) { if (1) { break; } continue; } return 0; }");
+        analyze_ok("int main() { for (int i = 0; i < 1; i = i + 1) { continue; } return 0; }");
+    }
+
+    #[test]
+    fn rejects_a_break_with_no_loop_to_leave() {
+        match analyze_err("int main() { break; }") {
+            SemanticError::JumpOutsideLoop { keyword, .. } => assert_eq!(keyword, "break"),
+            other => panic!("expected JumpOutsideLoop, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_continue_after_the_loop_has_been_left() {
+        // The loop encloses the jump in the source text only up to its closing
+        // brace: what follows is outside it again.
+        match analyze_err("int main() { while (1) { break; } continue; }") {
+            SemanticError::JumpOutsideLoop { keyword, .. } => assert_eq!(keyword, "continue"),
+            other => panic!("expected JumpOutsideLoop, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_loop_in_one_function_does_not_reach_into_the_next() {
+        // The depth is restored on the way out of every loop, so a `break` in
+        // a later function is still outside one.
+        match analyze_err("int loop() { while (1) { break; } return 0; } int main() { break; }") {
+            SemanticError::JumpOutsideLoop { keyword, .. } => assert_eq!(keyword, "break"),
+            other => panic!("expected JumpOutsideLoop, got: {other:?}"),
+        }
     }
 
     #[test]

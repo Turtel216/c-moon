@@ -92,6 +92,8 @@ impl AstPrinter {
     fn print_stmt_inner(&mut self, stmt: &Stmt, w: &mut impl Write) -> fmt::Result {
         match &stmt.kind {
             StmtKind::Empty => write!(w, ";"),
+            StmtKind::Break => write!(w, "break;"),
+            StmtKind::Continue => write!(w, "continue;"),
             StmtKind::Expr(expr) => {
                 self.print_expr(expr, w)?;
                 write!(w, ";")

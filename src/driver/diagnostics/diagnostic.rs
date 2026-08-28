@@ -35,6 +35,8 @@ pub mod codes {
     pub const INCOMPLETE_TYPE: &str = "E0208";
     /// A member read from a struct that does not have one by that name.
     pub const UNKNOWN_MEMBER: &str = "E0209";
+    /// A `break` or `continue` with no enclosing loop.
+    pub const JUMP_OUTSIDE_LOOP: &str = "E0210";
 }
 
 /// A span with something to say about it.

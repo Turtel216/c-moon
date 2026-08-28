@@ -17,7 +17,7 @@ The compiler is a classic pipeline, with each stage handing off a representation
 All optimizations run on the SSA form, to a fixed point, in the following order:
 
 * **Sparse Conditional Constant Propagation (SCCP):** Propagates constants, folds the arithmetic they make constant, and prunes branches whose condition is known, all in one pass -- which is what lets each of the three make the others stronger.
-* **Algebraic Simplification:** Identities that hold regardless of the unknown operand's value, such as `x * 1 -> x` and `x - x -> 0`.
+* **Algebraic Simplification:** Identities that hold regardless of the unknown operand's value, such as `x * 1 -> x`, `x - x -> 0` and `x & -1 -> x`.
 * **Global Value Numbering (GVN):** Recognizes two instructions that compute the same operation over the same SSA values and reuses the first result instead of recomputing it, scoped by dominance.
 * **Copy Propagation:** Replaces every read of a copy with the value it copies, including resolving trivial phi nodes.
 * **Dead-Code Elimination (DCE):** A mark-and-sweep pass over the def-use graph that removes any instruction whose result is never observed.
@@ -27,9 +27,20 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 
 *Currently targeting an MVP subset of C to establish the full pipeline:*
 * **Data Types:** `char` (8-bit), `int` (32-bit) and `long int` (64-bit), each in a signed and an `unsigned` form, arrays of any of them, pointers, and `struct`.
-* **Control Flow:** `if` / `else`, `while` and `for` loops, `return`.
-* **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`)
-  and Logical (`&&`, `||`, `!`), the first two of which short-circuit.
+* **Control Flow:** `if` / `else`, `while` and `for` loops, `break` and
+  `continue`, `return`. `break` leaves the innermost enclosing loop and
+  `continue` starts its next iteration -- running a `for`'s step clause on
+  the way, as C requires. Either one outside a loop is a diagnostic, and
+  the statements after one are unreachable and never reach the assembly.
+* **Operators:** Arithmetic (`+`, `-`, `*`, `/`), Relational (`==`, `!=`, `<`, `>`),
+  Logical (`&&`, `||`, `!`), the first two of which short-circuit, and Bitwise
+  (`&`, `|`, `^`, `~`, `<<`, `>>`). A shift is the one operator whose operands
+  are not paired off against each other: each is promoted on its own and the
+  answer has the left one's type, so `1 << c` is an `int` however wide `c` is.
+  A right shift keeps a signed value's sign and fills an unsigned one with
+  zeroes, and a count past the width of the type -- undefined in C -- is read
+  the way the hardware reads it, so the optimized and the unoptimized build of
+  a program never disagree about it.
 * **Functions:** Declarations, definitions, and calls with arguments.
 * **Preprocessor macros:** object-like macros such as `#define X 5` and simple non-recursive function-like macros.
 * **Pointers:** referencing and dereferencing. Does not support pointer arithmetic yet.
@@ -42,7 +53,7 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
   test suite pins those offsets against GCC. A struct crosses a call boundary
   through a pointer: passing or returning one by value needs the ABI's
   argument-classification rules, which are not implemented.
-* **Integer conversions:** the integer promotions -- a `char` operand becomes an `int` before any operator sees it -- the usual arithmetic conversions, including the rule that an `int` and an `unsigned int` meet as `unsigned int`, the implicit conversion an assignment, argument or `return` performs, and casts between the integer types. Widening sign-extends a signed value and zero-extends an unsigned one; division and ordering select the instruction that matches.
+* **Integer conversions:** the integer promotions -- a `char` operand becomes an `int` before any operator sees it -- the usual arithmetic conversions, including the rule that an `int` and an `unsigned int` meet as `unsigned int`, the implicit conversion an assignment, argument or `return` performs, and casts between the integer types. Widening sign-extends a signed value and zero-extends an unsigned one; division, ordering and the right shift select the instruction that matches.
 
 ### Roadmap
 
@@ -54,7 +65,7 @@ All optimizations run on the SSA form, to a fixed point, in the following order:
 * [ ] Pointer arithmetic.
 * [ ] Global variables.
 * [ ] `extern` keyword and linking against GCC-compiled C programs and the standard library.
-* [ ] Remaining operators already recognized by the parser but not yet lowered (`%`, bitwise and shift operators).
+* [ ] The remaining operator the parser recognizes but nothing lowers yet (`%`), and the compound assignments (`+=`, `&=`, ...).
 
 ## Diagnostics
 

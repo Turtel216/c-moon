@@ -210,6 +210,11 @@ impl Builder {
             | Opcode::Sub
             | Opcode::Mul
             | Opcode::Div(_)
+            | Opcode::And
+            | Opcode::Or
+            | Opcode::Xor
+            | Opcode::Shl
+            | Opcode::Shr(_)
             | Opcode::Eq
             | Opcode::Neq
             | Opcode::Lt(_)
@@ -514,6 +519,11 @@ fn binary_operator(opcode: &Opcode) -> BinOp {
         Opcode::Sub => BinOp::Sub,
         Opcode::Mul => BinOp::Mul,
         Opcode::Div(sign) => BinOp::Div(sign),
+        Opcode::And => BinOp::And,
+        Opcode::Or => BinOp::Or,
+        Opcode::Xor => BinOp::Xor,
+        Opcode::Shl => BinOp::Shl,
+        Opcode::Shr(sign) => BinOp::Shr(sign),
         Opcode::Eq => BinOp::Eq,
         Opcode::Neq => BinOp::Neq,
         Opcode::Lt(sign) => BinOp::Lt(sign),

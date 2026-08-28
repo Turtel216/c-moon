@@ -517,6 +517,14 @@ impl<'a> Parser<'a> {
         if self.match_kind(TokenKind::Return) {
             return self.parse_return_stmt(start);
         }
+        if self.match_kind(TokenKind::Break) {
+            self.expect(TokenKind::Semicolon, "after `break`")?;
+            return Ok(self.mk_stmt(StmtKind::Break, start));
+        }
+        if self.match_kind(TokenKind::Continue) {
+            self.expect(TokenKind::Semicolon, "after `continue`")?;
+            return Ok(self.mk_stmt(StmtKind::Continue, start));
+        }
 
         let expr = self.parse_expr()?;
         self.expect(TokenKind::Semicolon, "after expression")?;
@@ -1422,6 +1430,43 @@ mod tests {
             other => panic!("expected for statement, got {other:?}"),
         };
         assert!(matches!(body.kind, StmtKind::Empty));
+    }
+
+    #[test]
+    fn parses_break_and_continue() {
+        let items = parse_function_body("int f(){ while (1) { break; continue; } return 0; }");
+
+        let body = match &items[0] {
+            BlockItem::Stmt(Stmt {
+                kind: StmtKind::While { body, .. },
+                ..
+            }) => body,
+            other => panic!("expected while statement, got {other:?}"),
+        };
+        let jumps = match &body.kind {
+            StmtKind::Block(items) => items,
+            other => panic!("expected a block body, got {other:?}"),
+        };
+        assert!(matches!(
+            jumps[0],
+            BlockItem::Stmt(Stmt {
+                kind: StmtKind::Break,
+                ..
+            })
+        ));
+        assert!(matches!(
+            jumps[1],
+            BlockItem::Stmt(Stmt {
+                kind: StmtKind::Continue,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_jump_without_its_semicolon() {
+        let (_, errors) = parse("int f(){ while (1) { break } return 0; }");
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]

@@ -74,6 +74,22 @@ impl fmt::Display for X86Instruction {
             Self::Imul(width, destination, source) => {
                 binary(f, "imul", *width, destination, source)
             }
+            Self::And(width, destination, source) => binary(f, "and", *width, destination, source),
+            Self::Or(width, destination, source) => binary(f, "or", *width, destination, source),
+            Self::Xor(width, destination, source) => binary(f, "xor", *width, destination, source),
+
+            // The two operands of a shift are read at different widths: the
+            // operand at the instruction's own, the count always as a byte,
+            // which is what makes the count register print as `cl`.
+            Self::Shift(operation, width, destination, count) => write!(
+                f,
+                "{}{} {}, {}",
+                INDENT,
+                operation.mnemonic(),
+                Sized(*width, destination),
+                Sized(RegisterWidth::Byte, count)
+            ),
+
             Self::Cmp(width, left, right) => binary(f, "cmp", *width, left, right),
             Self::Test(width, left, right) => binary(f, "test", *width, left, right),
 

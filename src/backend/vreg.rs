@@ -130,11 +130,16 @@ fn data_flow(opcode: &Opcode) -> DataFlow {
     }
 
     match opcode {
-        // Arithmetic and comparison: `dest = arg1 <op> arg2`.
+        // Arithmetic, bitwise and comparison: `dest = arg1 <op> arg2`.
         Opcode::Add
         | Opcode::Sub
         | Opcode::Mul
         | Opcode::Div(_)
+        | Opcode::And
+        | Opcode::Or
+        | Opcode::Xor
+        | Opcode::Shl
+        | Opcode::Shr(_)
         | Opcode::Eq
         | Opcode::Neq
         | Opcode::Lt(_)

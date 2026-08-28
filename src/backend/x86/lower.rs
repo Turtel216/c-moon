@@ -34,10 +34,10 @@ use crate::backend::frame::{FrameLayout, Home};
 use crate::backend::linear::LinearizedCfg;
 use crate::backend::x86::abi::{
     self, ARGUMENT_REGISTERS, DIVIDEND_HIGH, FRAME_POINTER, RETURN_VALUE, SCRATCH, SCRATCH2,
-    STACK_POINTER, WORD_SIZE,
+    SHIFT_COUNT, STACK_POINTER, WORD_SIZE,
 };
 use crate::backend::x86::isa::{
-    ConditionCode, RegisterWidth, X86Function, X86Instruction, X86Operand, X86Register,
+    ConditionCode, RegisterWidth, ShiftOp, X86Function, X86Instruction, X86Operand, X86Register,
 };
 use crate::middle::ir::{Opcode, Operand, Sign, TACInstruction, Width};
 
@@ -132,6 +132,21 @@ impl<'a> FunctionLowering<'a> {
             Opcode::Sub => self.lower_binary(instr, X86Instruction::Sub),
             Opcode::Mul => self.lower_binary(instr, X86Instruction::Imul),
             Opcode::Div(sign) => self.lower_division(instr, sign),
+
+            // The bitwise operations are two-operand and destructive like the
+            // arithmetic ones, and read no more than the bits in front of
+            // them, so one of each serves both signedness.
+            Opcode::And => self.lower_binary(instr, X86Instruction::And),
+            Opcode::Or => self.lower_binary(instr, X86Instruction::Or),
+            Opcode::Xor => self.lower_binary(instr, X86Instruction::Xor),
+            Opcode::Shl => self.lower_shift(instr, ShiftOp::Left),
+            // Only a right shift has to ask how its operand reads: what fills
+            // the bits it vacates at the top is the sign of a signed value and
+            // a zero otherwise.
+            Opcode::Shr(sign) => self.lower_shift(
+                instr,
+                ordering(sign, ShiftOp::ArithmeticRight, ShiftOp::LogicalRight),
+            ),
 
             // An equality reads no more than whether two bit patterns are the
             // same; an ordering has a condition code per signedness.
@@ -305,6 +320,57 @@ impl<'a> FunctionLowering<'a> {
 
         self.define(dest, width, |lowering, result| {
             lowering.copy(RETURN_VALUE, result)
+        });
+    }
+
+    /// Lower `dest = lhs << rhs` and the two right shifts.
+    ///
+    /// A shift is two-operand and destructive like an addition, but its count
+    /// is not an ordinary operand: the hardware takes it as an immediate or
+    /// from CL, and from nowhere else.
+    ///
+    /// A constant count therefore encodes into the instruction and costs
+    /// nothing.  A computed one has to be moved into CL -- which the allocator
+    /// is free to have given to a live value, so whatever is there is kept in
+    /// a scratch register and put back afterwards.  The result is built in the
+    /// other scratch register rather than in its own, so that restoring CL
+    /// cannot overwrite a result that was destined for it.
+    ///
+    /// # Arguments
+    ///
+    /// * `instr` - the shift
+    /// * `direction` - which way it moves and what fills the bits it vacates
+    fn lower_shift(&mut self, instr: &TACInstruction, direction: ShiftOp) {
+        let (dest, lhs, rhs) = three_operands(instr);
+        let width = view(instr.width);
+
+        // A count the compiler already knows is written into the instruction,
+        // read the way the hardware reads it so that a shift folded at compile
+        // time and one executed here agree.
+        if let Operand::ImmInt(constant) = rhs {
+            let count = X86Operand::Imm(instr.width.shift_count(*constant).into());
+            self.define(dest, width, |lowering, result| {
+                lowering.move_into(lhs, result, width);
+                lowering.emit(X86Instruction::Shift(direction, width, reg(result), count));
+            });
+            return;
+        }
+
+        // The operand being shifted is read first: it may itself be living in
+        // the count register, which the next instruction overwrites.
+        self.move_into(lhs, SCRATCH, width);
+        self.copy(SHIFT_COUNT, SCRATCH2);
+        self.move_into(rhs, SHIFT_COUNT, width);
+        self.emit(X86Instruction::Shift(
+            direction,
+            width,
+            reg(SCRATCH),
+            reg(SHIFT_COUNT),
+        ));
+        self.copy(SCRATCH2, SHIFT_COUNT);
+
+        self.define(dest, width, |lowering, result| {
+            lowering.copy(SCRATCH, result)
         });
     }
 
@@ -854,18 +920,20 @@ impl<'a> FunctionLowering<'a> {
 
 // ### Free helpers ###
 
-/// The condition code an ordering is answered by.
+/// Pick between the two forms of an operation that reads its operands' bits.
 ///
-/// x86 has one for each way the operands can read -- `setl` against `setb`,
-/// `jge` against `jae` -- because a signed ordering is decided by the sign and
-/// overflow flags and an unsigned one by the carry flag.
+/// x86 has one of each wherever the answer depends on how the bits read: a
+/// signed ordering is decided by the sign and overflow flags and an unsigned
+/// one by the carry flag (`setl` against `setb`, `jge` against `jae`), and a
+/// right shift either copies a sign down or shifts zeroes in (`sar` against
+/// `shr`).
 ///
 /// # Arguments
 ///
 /// * `sign` - how the operands read
-/// * `signed` - the condition to use when they are signed, e.g. `L`
-/// * `unsigned` - the condition to use when they are not, e.g. `B`
-const fn ordering(sign: Sign, signed: ConditionCode, unsigned: ConditionCode) -> ConditionCode {
+/// * `signed` - the form to use when they are signed, e.g. `L` or `sar`
+/// * `unsigned` - the form to use when they are not, e.g. `B` or `shr`
+const fn ordering<T: Copy>(sign: Sign, signed: T, unsigned: T) -> T {
     match sign {
         Sign::Signed => signed,
         Sign::Unsigned => unsigned,

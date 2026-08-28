@@ -29,6 +29,16 @@ pub const RETURN_VALUE: X86Register = X86Register::Rax;
 /// remainder is left.  Reserved for exactly that reason.
 pub const DIVIDEND_HIGH: X86Register = X86Register::Rdx;
 
+/// The register a shift takes a computed count from.  The hardware reads a
+/// variable count from CL and from nowhere else.
+///
+/// Unlike [`DIVIDEND_HIGH`] this one stays allocatable: reserving a register
+/// outright for an operator that most functions never use would cost every
+/// one of them a register.  The code generator instead puts back whatever it
+/// finds here, which is two moves and only on the shifts whose count is not a
+/// constant -- see `FunctionLowering::lower_shift`.
+pub const SHIFT_COUNT: X86Register = X86Register::Rcx;
+
 /// The frame pointer.  Every frame slot is addressed relative to it.
 pub const FRAME_POINTER: X86Register = X86Register::Rbp;
 

@@ -73,6 +73,20 @@ impl Place {
     }
 }
 
+/// Where the two loop jumps go, for one enclosing loop.
+///
+/// `break` and `continue` name no label of their own: each one means a block
+/// the loop's own lowering created, so the loop records them on its way in and
+/// the jump reads them back off the innermost entry.
+#[derive(Debug)]
+struct LoopTargets {
+    /// The block after the loop, which `break` jumps to.
+    after: String,
+    /// The block that leads back to the test -- the condition of a `while`,
+    /// the step of a `for` -- which `continue` jumps to.
+    next_iteration: String,
+}
+
 /// Context for AST to IR desugering
 pub struct LoweringContext<'a> {
     /// Complete ProgramIr
@@ -91,6 +105,8 @@ pub struct LoweringContext<'a> {
     label_counter: usize,
     /// Tracks the storage local aggregates need: var_id → bytes occupied.
     object_sizes: HashMap<usize, usize>,
+    /// The loops enclosing the statement being lowered, innermost last.
+    loops: Vec<LoopTargets>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -105,6 +121,7 @@ impl<'a> LoweringContext<'a> {
             temp_counter: 0,
             label_counter: 0,
             object_sizes: HashMap::new(),
+            loops: Vec::new(),
         }
     }
 
@@ -175,15 +192,8 @@ impl<'a> LoweringContext<'a> {
         self.lower_statement(body);
 
         // Fallthrough to exit if the last block didn't explicitly return
-        let cur = self.current_block.clone();
-        if cur != exit {
-            self.emit(TACInstruction::transfer(
-                Opcode::Jump,
-                None,
-                Some(Operand::Label(exit.clone())),
-                None,
-            ));
-            self.add_edge(&cur, &exit);
+        if self.current_block != exit {
+            self.jump_to(&exit);
         }
 
         // Save the finished CFG into the Program
@@ -231,6 +241,46 @@ impl<'a> LoweringContext<'a> {
         cfg.add_edge(from, to);
     }
 
+    /// Emits an unconditional jump to `target`, and records the edge to it.
+    ///
+    /// The edge leaves whichever block is current, which is not always the one
+    /// the construct started in: lowering a short-circuiting condition branches
+    /// on its way to a value, so it ends somewhere else.
+    fn jump_to(&mut self, target: &str) {
+        self.emit(TACInstruction::transfer(
+            Opcode::Jump,
+            None,
+            Some(Operand::Label(target.to_owned())),
+            None,
+        ));
+        let from = self.current_block.clone();
+        self.add_edge(&from, target);
+    }
+
+    /// Emits a conditional branch to `target`, and records the edge to it.
+    ///
+    /// Only the taken edge is recorded: control that does not branch falls out
+    /// of the block into whatever comes next, which is an edge the caller adds
+    /// itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `opcode` - [`Opcode::BranchIf`] or [`Opcode::BranchIfNot`]
+    /// * `width` - the width the condition is tested at
+    /// * `condition` - the value whose truth decides the branch
+    /// * `target` - the block reached when it does branch
+    fn branch_to(&mut self, opcode: Opcode, width: Width, condition: Operand, target: &str) {
+        self.emit(TACInstruction::new(
+            opcode,
+            width,
+            None,
+            Some(condition),
+            Some(Operand::Label(target.to_owned())),
+        ));
+        let from = self.current_block.clone();
+        self.add_edge(&from, target);
+    }
+
     fn lower_statement(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             // The empty statement produces no code.
@@ -252,51 +302,21 @@ impl<'a> LoweringContext<'a> {
 
                 let (cond, width) = self.lower_condition(condition);
 
-                let cur = self.current_block.clone();
-                // if !cond -> else
-                self.emit(TACInstruction::new(
-                    Opcode::BranchIfNot,
-                    width,
-                    None,
-                    Some(cond),
-                    Some(Operand::Label(else_label.clone())),
-                ));
-                self.add_edge(&cur, &else_label);
-
-                // otherwise -> then
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(then_label.clone())),
-                    None,
-                ));
-                self.add_edge(&cur, &then_label);
+                // if !cond -> else, otherwise -> then
+                self.branch_to(Opcode::BranchIfNot, width, cond, &else_label);
+                self.jump_to(&then_label);
 
                 // then branch
-                self.set_current_block(then_label.clone());
+                self.set_current_block(then_label);
                 self.lower_statement(then_branch);
-                let then_end = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(end_label.clone())),
-                    None,
-                ));
-                self.add_edge(&then_end, &end_label);
+                self.jump_to(&end_label);
 
                 // else branch (or empty else)
-                self.set_current_block(else_label.clone());
+                self.set_current_block(else_label);
                 if let Some(e) = else_branch {
                     self.lower_statement(e);
                 }
-                let else_end = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(end_label.clone())),
-                    None,
-                ));
-                self.add_edge(&else_end, &end_label);
+                self.jump_to(&end_label);
 
                 self.set_current_block(end_label);
             }
@@ -307,56 +327,26 @@ impl<'a> LoweringContext<'a> {
                 let end_label = self.create_block("while_end");
 
                 // preheader -> cond
-                let preheader = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(cond_label.clone())),
-                    None,
-                ));
-                self.add_edge(&preheader, &cond_label);
+                self.jump_to(&cond_label);
 
-                // cond block
+                // cond block. A short-circuiting condition branches on its way
+                // to a value, so the test is emitted into the block it left
+                // off in rather than the one it started in -- which is what
+                // `branch_to` and `jump_to` take the edge from.
                 self.set_current_block(cond_label.clone());
                 let (cond, width) = self.lower_condition(condition);
 
-                // A short-circuiting condition branches on its way to a value,
-                // so the test is reached in the block the condition left off
-                // in rather than in the one it started in.
-                let cond_end = self.current_block.clone();
+                // if !cond -> end, else -> body
+                self.branch_to(Opcode::BranchIfNot, width, cond, &end_label);
+                self.jump_to(&body_label);
 
-                // if !cond -> end
-                self.emit(TACInstruction::new(
-                    Opcode::BranchIfNot,
-                    width,
-                    None,
-                    Some(cond),
-                    Some(Operand::Label(end_label.clone())),
-                ));
-                self.add_edge(&cond_end, &end_label);
-
-                // else -> body
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(body_label.clone())),
-                    None,
-                ));
-                self.add_edge(&cond_end, &body_label);
-
-                // body block
-                self.set_current_block(body_label.clone());
-                self.lower_statement(body);
+                // body block. `continue` re-tests the condition and `break`
+                // leaves for good.
+                self.set_current_block(body_label);
+                self.lower_loop_body(body, &cond_label, &end_label);
 
                 // back-edge body -> cond
-                let body_end = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(cond_label.clone())),
-                    None,
-                ));
-                self.add_edge(&body_end, &cond_label);
+                self.jump_to(&cond_label);
 
                 // continue after loop
                 self.set_current_block(end_label);
@@ -393,8 +383,22 @@ impl<'a> LoweringContext<'a> {
                 let cur = self.current_block.clone();
                 self.add_edge(&cur, &exit_label);
 
-                let dead_block = self.create_block("unreachable_after_ret");
-                self.set_current_block(dead_block);
+                self.open_unreachable_block("unreachable_after_ret");
+            }
+
+            // `break` leaves the innermost loop and `continue` starts its next
+            // iteration. Semantic analysis has already rejected either one
+            // written outside a loop, so there is always an entry to read.
+            StmtKind::Break => {
+                let target = self.innermost_loop().after.clone();
+                self.jump_to(&target);
+                self.open_unreachable_block("unreachable_after_break");
+            }
+
+            StmtKind::Continue => {
+                let target = self.innermost_loop().next_iteration.clone();
+                self.jump_to(&target);
+                self.open_unreachable_block("unreachable_after_continue");
             }
 
             // A `for` is lowered like a `while` with the init clause hoisted
@@ -402,8 +406,14 @@ impl<'a> LoweringContext<'a> {
             //
             //   <init>; goto cond
             //   cond: if !condition goto end; goto body
-            //   body: <body>; <step>; goto cond
+            //   body: <body>; goto step
+            //   step: <step>; goto cond
             //   end:
+            //
+            // The step gets a block of its own because `continue` has to run
+            // it before the next test: jumping straight to the condition would
+            // skip the `i = i + 1` of `for (i = 0; i < n; i = i + 1)` and loop
+            // for ever. Merging it back into the body is the optimiser's job.
             StmtKind::For {
                 init,
                 condition,
@@ -412,74 +422,87 @@ impl<'a> LoweringContext<'a> {
             } => {
                 let cond_label = self.create_block("for_cond");
                 let body_label = self.create_block("for_body");
+                let step_label = self.create_block("for_step");
                 let end_label = self.create_block("for_end");
 
                 // preheader: the init clause runs once, before the loop
                 if let Some(init) = init {
                     self.lower_statement(init);
                 }
-                let preheader = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(cond_label.clone())),
-                    None,
-                ));
-                self.add_edge(&preheader, &cond_label);
+                self.jump_to(&cond_label);
 
                 // cond block
                 self.set_current_block(cond_label.clone());
                 if let Some(condition) = condition {
                     let (cond, width) = self.lower_condition(condition);
 
-                    // As in a `while`, a condition that branches on its way to
-                    // a value is tested in the block it left off in.
-                    let cond_end = self.current_block.clone();
-
                     // if !cond -> end
-                    self.emit(TACInstruction::new(
-                        Opcode::BranchIfNot,
-                        width,
-                        None,
-                        Some(cond),
-                        Some(Operand::Label(end_label.clone())),
-                    ));
-                    self.add_edge(&cond_end, &end_label);
+                    self.branch_to(Opcode::BranchIfNot, width, cond, &end_label);
                 }
                 // An omitted condition is always true, so `for (;;)` falls
                 // straight through to the body.
 
                 // else -> body
-                let cond_end = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(body_label.clone())),
-                    None,
-                ));
-                self.add_edge(&cond_end, &body_label);
+                self.jump_to(&body_label);
 
-                // body block, with the step at its end
+                // body block. `continue` skips the rest of it and goes on to
+                // the step, `break` leaves the loop for good.
                 self.set_current_block(body_label);
-                self.lower_statement(body);
+                self.lower_loop_body(body, &step_label, &end_label);
+                self.jump_to(&step_label);
+
+                // step block, then the back-edge to the condition
+                self.set_current_block(step_label);
                 if let Some(step) = step {
                     let _ = self.lower_expression(step);
                 }
-
-                // back-edge body -> cond
-                let body_end = self.current_block.clone();
-                self.emit(TACInstruction::transfer(
-                    Opcode::Jump,
-                    None,
-                    Some(Operand::Label(cond_label.clone())),
-                    None,
-                ));
-                self.add_edge(&body_end, &cond_label);
+                self.jump_to(&cond_label);
 
                 // continue after loop
                 self.set_current_block(end_label);
             }
         }
+    }
+
+    /// Lowers a loop's body with the blocks its `break` and `continue` mean.
+    ///
+    /// # Arguments
+    ///
+    /// * `body` - the loop body
+    /// * `next_iteration` - where `continue` goes: the condition of a `while`,
+    ///   the step of a `for`
+    /// * `after` - the block following the loop, where `break` goes
+    fn lower_loop_body(&mut self, body: &Stmt, next_iteration: &str, after: &str) {
+        self.loops.push(LoopTargets {
+            after: after.to_owned(),
+            next_iteration: next_iteration.to_owned(),
+        });
+        self.lower_statement(body);
+        self.loops.pop();
+    }
+
+    /// The loop a `break` or a `continue` acts on: the innermost one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when there is no enclosing loop, which semantic analysis rejects
+    /// long before lowering runs.
+    fn innermost_loop(&self) -> &LoopTargets {
+        self.loops
+            .last()
+            .expect("Compiler Bug: a jump outside any loop reached lowering")
+    }
+
+    /// Opens a fresh block for the statements after one that leaves for good.
+    ///
+    /// A `return`, a `break` and a `continue` all end their block, yet the
+    /// statements written after them still have to be lowered somewhere. They
+    /// go here, into a block nothing jumps to, which SSA construction deletes
+    /// along with everything in it -- see
+    /// [`retain_reachable`](crate::middle::ssa::Function::retain_reachable).
+    fn open_unreachable_block(&mut self, prefix: &str) {
+        let dead_block = self.create_block(prefix);
+        self.set_current_block(dead_block);
     }
 
     /// Lower one declaration inside a block.
@@ -1006,16 +1029,26 @@ impl<'a> LoweringContext<'a> {
                 self.lower_short_circuit(*operator, lhs, rhs)
             }
 
-            // Arithmetic + comparisons used by if/while conditions.
+            // Arithmetic, bitwise and comparisons used by if/while conditions.
             ExprKind::Binary(op, lhs, rhs) => {
                 // C's usual arithmetic conversions: both operands are brought
                 // to the type they have in common, and the operation is
                 // computed at its width. A comparison narrows again on its own
                 // -- its result is the 0 or 1 of an `int` -- which is why the
                 // width recorded here is the one the operands are compared at.
+                //
+                // A shift is the exception: its operands are promoted apart
+                // from each other and the answer has the left one's type, so
+                // that is the type the analyzer gave the whole expression.
+                // The count is converted to it as well, which costs nothing --
+                // only its low bits are ever read -- and leaves every binary
+                // instruction in the IR with both operands at one width.
                 let types = self.types;
-                let common = Type::common(types.expr(lhs.id), types.expr(rhs.id));
-                let (width, sign) = (width_of(&common), sign_of(&common));
+                let operands_ty = match op {
+                    BinaryOp::Shl | BinaryOp::Shr => types.expr(expr.id).clone(),
+                    _ => Type::common(types.expr(lhs.id), types.expr(rhs.id)),
+                };
+                let (width, sign) = (width_of(&operands_ty), sign_of(&operands_ty));
                 let l = self.lower_converted(lhs, width);
                 let r = self.lower_converted(rhs, width);
                 let t = self.fresh_temp();
@@ -1028,6 +1061,11 @@ impl<'a> LoweringContext<'a> {
                     BinaryOp::Sub => Opcode::Sub,
                     BinaryOp::Mul => Opcode::Mul,
                     BinaryOp::Div => Opcode::Div(sign),
+                    BinaryOp::BitAnd => Opcode::And,
+                    BinaryOp::BitOr => Opcode::Or,
+                    BinaryOp::BitXor => Opcode::Xor,
+                    BinaryOp::Shl => Opcode::Shl,
+                    BinaryOp::Shr => Opcode::Shr(sign),
                     BinaryOp::Eq => Opcode::Eq,
                     BinaryOp::Neq => Opcode::Neq,
                     BinaryOp::Lt => Opcode::Lt(sign),
@@ -1165,6 +1203,30 @@ impl<'a> LoweringContext<'a> {
                     Some(dest.clone()),
                     Some(operand),
                     Some(Operand::ImmInt(0)),
+                ));
+
+                dest
+            }
+
+            // ~x -- every bit of `x` the other way round, which is what
+            // exclusive-or against a mask of ones does. Like a negation and a
+            // logical not it therefore needs no opcode of its own, and every
+            // pass that already folds, simplifies and selects an exclusive-or
+            // handles it as it stands.
+            ExprKind::Unary(UnaryOp::BitNot, inner) => {
+                // The operand is promoted before the operator sees it, so the
+                // mask is as wide as the promoted type: -1 is the constant
+                // whose low bits are ones at every width.
+                let width = self.width_of_expr(expr);
+                let operand = self.lower_converted(inner, width);
+                let dest = self.fresh_temp();
+
+                self.emit(TACInstruction::new(
+                    Opcode::Xor,
+                    width,
+                    Some(dest.clone()),
+                    Some(operand),
+                    Some(Operand::ImmInt(-1)),
                 ));
 
                 dest
@@ -1313,23 +1375,8 @@ impl<'a> LoweringContext<'a> {
         // Lowering the left operand may itself have branched, so the block the
         // test belongs to is the one it left off in rather than the one it
         // started in.
-        let tested = self.current_block.clone();
-        self.emit(TACInstruction::new(
-            settles,
-            left_width,
-            None,
-            Some(left),
-            Some(Operand::Label(end_label.clone())),
-        ));
-        self.add_edge(&tested, &end_label);
-
-        self.emit(TACInstruction::transfer(
-            Opcode::Jump,
-            None,
-            Some(Operand::Label(rhs_label.clone())),
-            None,
-        ));
-        self.add_edge(&tested, &rhs_label);
+        self.branch_to(settles, left_width, left, &end_label);
+        self.jump_to(&rhs_label);
 
         // Otherwise the answer is whether the right operand is non-zero,
         // which an operand that already answers 0 or 1 says by itself.
@@ -1351,14 +1398,7 @@ impl<'a> LoweringContext<'a> {
             zero,
         ));
 
-        let rhs_end = self.current_block.clone();
-        self.emit(TACInstruction::transfer(
-            Opcode::Jump,
-            None,
-            Some(Operand::Label(end_label.clone())),
-            None,
-        ));
-        self.add_edge(&rhs_end, &end_label);
+        self.jump_to(&end_label);
 
         self.set_current_block(end_label);
         result
@@ -1470,6 +1510,126 @@ pub fn sign_of(ty: &Type) -> Sign {
 mod tests {
     use super::*;
 
+    use crate::frontend::lexer::Lexer;
+    use crate::frontend::parser::Parser;
+    use crate::frontend::renamer::resolve_names;
+    use crate::frontend::semantic::SemanticAnalyzer;
+
+    /// Lowers an accepted translation unit and returns the IR of `main`.
+    fn lower_main(source: &str) -> CFG {
+        let mut parser = Parser::from_lexer(Lexer::new(source)).expect("lexing should succeed");
+        let (decls, parse_errors) = parser.parse_translation_unit();
+        assert!(parse_errors.is_empty(), "unexpected: {parse_errors:?}");
+
+        let mut analyzer = SemanticAnalyzer::new();
+        let errors = analyzer.analyze_program(&decls);
+        assert!(errors.is_empty(), "unexpected: {errors:?}");
+
+        let resolution = resolve_names(&decls).expect("name resolution should succeed");
+        let types = analyzer.into_types();
+        let program = LoweringContext::new(&resolution, &types).lower_program(&decls);
+
+        program.functions["main"].clone()
+    }
+
+    /// The labels the block `label` jumps or branches to.
+    fn successors_of(cfg: &CFG, label: &str) -> Vec<String> {
+        cfg.blocks[label].successors.clone()
+    }
+
+    /// The one instruction of `cfg` with this opcode.
+    fn only_instruction(cfg: &CFG, opcode: Opcode) -> TACInstruction {
+        let mut matches = cfg
+            .blocks
+            .values()
+            .flat_map(|block| &block.instructions)
+            .filter(|instr| instr.opcode == opcode);
+        let found = matches
+            .next()
+            .unwrap_or_else(|| panic!("no `{opcode:?}` instruction"));
+        assert!(matches.next().is_none(), "more than one `{opcode:?}`");
+        found.clone()
+    }
+
+    /// The one block whose label starts with `prefix`.
+    fn block_named(cfg: &CFG, prefix: &str) -> String {
+        let mut matches = cfg.blocks.keys().filter(|label| label.starts_with(prefix));
+        let found = matches
+            .next()
+            .unwrap_or_else(|| panic!("no `{prefix}` block"));
+        assert!(matches.next().is_none(), "more than one `{prefix}` block");
+        found.clone()
+    }
+
+    #[test]
+    fn a_break_leaves_for_the_block_after_the_loop() {
+        // Arrange / Act
+        let cfg = lower_main("int main() { while (1) { break; } return 0; }");
+
+        // Assert: the body's only successor is the block past the loop, so
+        // nothing takes the back-edge to the condition on that path.
+        let body = block_named(&cfg, "while_body");
+        assert_eq!(
+            successors_of(&cfg, &body),
+            vec![block_named(&cfg, "while_end")]
+        );
+    }
+
+    #[test]
+    fn a_continue_in_a_for_leaves_for_the_step_rather_than_the_condition() {
+        // Arrange / Act: the `continue` is the whole body, so the body block
+        // is where it jumps from.
+        let cfg =
+            lower_main("int main() { for (int i = 0; i < 1; i = i + 1) continue; return 0; }");
+
+        // Assert: jumping to the condition instead would skip `i = i + 1` and
+        // spin for ever.
+        let body = block_named(&cfg, "for_body");
+        assert_eq!(
+            successors_of(&cfg, &body),
+            vec![block_named(&cfg, "for_step")]
+        );
+    }
+
+    #[test]
+    fn a_jump_acts_on_the_innermost_loop_only() {
+        // Arrange / Act
+        let cfg = lower_main(
+            "int main() {
+                 while (1) { while (1) { break; } }
+                 return 0;
+             }",
+        );
+
+        // Assert: the inner loop is the one whose condition a body block
+        // branches into -- the outer body is its preheader -- and the `break`
+        // in that inner body leaves for that loop's exit, not the outer one's.
+        let inner_cond = cfg
+            .blocks
+            .values()
+            .find(|block| {
+                block.label.starts_with("while_cond")
+                    && block
+                        .predecessors
+                        .iter()
+                        .any(|pred| pred.starts_with("while_body"))
+            })
+            .expect("the inner loop's condition is entered from the outer body")
+            .label
+            .clone();
+
+        let target = |prefix: &str| {
+            successors_of(&cfg, &inner_cond)
+                .into_iter()
+                .find(|label| label.starts_with(prefix))
+                .unwrap_or_else(|| panic!("the condition reaches a `{prefix}` block"))
+        };
+        assert_eq!(
+            successors_of(&cfg, &target("while_body")),
+            vec![target("while_end")]
+        );
+    }
+
     #[test]
     fn a_type_is_held_at_the_width_its_size_calls_for() {
         // Arrange / Act / Assert: `sizeof(char)` is 1 and `sizeof(int)` is 4,
@@ -1501,6 +1661,44 @@ mod tests {
         assert_eq!(widest_chunk(7), Width::Bits32);
         assert_eq!(widest_chunk(3), Width::Bits8);
         assert_eq!(widest_chunk(1), Width::Bits8);
+    }
+
+    #[test]
+    fn a_shift_is_as_wide_as_its_left_operand_alone() {
+        // Arrange / Act: a count wider than the value being shifted, which
+        // under the usual arithmetic conversions would have dragged the whole
+        // expression up to 64 bits.
+        let cfg = lower_main("int main() { int a = 2; long int c = 1; return a << c; }");
+
+        // Assert: C promotes a shift's operands apart from each other and
+        // gives the answer the left one's type, so this shifts an `int`. The
+        // count comes down to that width with it, which leaves both operands
+        // of every binary instruction in the IR at one width.
+        let shift = only_instruction(&cfg, Opcode::Shl);
+        assert_eq!(shift.width, Width::Bits32);
+        assert_eq!(
+            only_instruction(
+                &cfg,
+                Opcode::Convert {
+                    from: Width::Bits64,
+                    sign: Sign::Signed
+                }
+            )
+            .width,
+            Width::Bits32
+        );
+    }
+
+    #[test]
+    fn a_complement_is_an_exclusive_or_against_a_mask_of_ones() {
+        // Arrange / Act
+        let cfg = lower_main("int main() { int a = 2; return ~a; }");
+
+        // Assert: `~a` needs no opcode of its own, and -1 is the constant
+        // whose low bits are ones at every width.
+        let complement = only_instruction(&cfg, Opcode::Xor);
+        assert_eq!(complement.width, Width::Bits32);
+        assert_eq!(complement.arg2, Some(Operand::ImmInt(-1)));
     }
 
     #[test]

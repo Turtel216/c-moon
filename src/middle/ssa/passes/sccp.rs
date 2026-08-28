@@ -380,6 +380,24 @@ fn fold(operator: BinOp, width: Width, lhs: i64, rhs: i64) -> Option<i64> {
             }
             width.narrow((width.unsigned(lhs) / divisor) as i64)
         }
+        // The bitwise operations work a bit at a time, so they never carry
+        // anything into the bits above the width; narrowing is what keeps the
+        // answer in the one form a constant is stored in.
+        BinOp::And => width.narrow(lhs & rhs),
+        BinOp::Or => width.narrow(lhs | rhs),
+        BinOp::Xor => width.narrow(lhs ^ rhs),
+        // A shift by more than the width is undefined in C, so folding is free
+        // to answer with whatever the machine would have: `Width::shift_count`
+        // is that rule, and using it here is what keeps the optimised and the
+        // unoptimised build of the same program in agreement.
+        BinOp::Shl => width.narrow(lhs.wrapping_shl(width.shift_count(rhs))),
+        // The left operand's signedness decides what fills the vacated top
+        // bits: reading it signed shifts its sign down, reading it unsigned
+        // shifts zeroes in.
+        BinOp::Shr(Sign::Signed) => width.narrow(lhs.wrapping_shr(width.shift_count(rhs))),
+        BinOp::Shr(Sign::Unsigned) => {
+            width.narrow((width.unsigned(lhs) >> width.shift_count(rhs)) as i64)
+        }
         // Equality asks whether the bits are the same, which they either are
         // or are not however they read.
         BinOp::Eq => i64::from(lhs == rhs),
@@ -411,6 +429,52 @@ mod tests {
         function
             .block_ids()
             .find(|&block| function.block(block).label == label)
+    }
+
+    #[test]
+    fn a_folded_shift_agrees_with_the_one_the_hardware_would_have_run() {
+        // Arrange: the bits an `int` holds -1 in.
+        let all_ones = -1;
+
+        // Act / Assert: a right shift is where the two readings part company.
+        // Signed, the sign is shifted down and -1 stays -1 ...
+        assert_eq!(
+            fold(BinOp::Shr(Sign::Signed), Width::Bits32, all_ones, 1),
+            Some(-1)
+        );
+        // ... unsigned, zeroes come in at the top of the 32-bit value.
+        assert_eq!(
+            fold(BinOp::Shr(Sign::Unsigned), Width::Bits32, all_ones, 1),
+            Some(2147483647)
+        );
+
+        // A left shift is one operation: what leaves the top of the width is
+        // gone whichever way the operand reads.
+        assert_eq!(
+            fold(BinOp::Shl, Width::Bits32, 1, 31),
+            Some(i64::from(i32::MIN))
+        );
+        assert_eq!(fold(BinOp::Shl, Width::Bits64, 1, 31), Some(2147483648));
+
+        // A count past the width is undefined in C, and the answer here is
+        // the one the machine gives: only the low five bits of it are read.
+        assert_eq!(fold(BinOp::Shl, Width::Bits32, 1, 33), Some(2));
+        assert_eq!(fold(BinOp::Shl, Width::Bits64, 1, 33), Some(8589934592));
+    }
+
+    #[test]
+    fn folding_a_bitwise_operation_leaves_a_constant_of_its_own_width() {
+        // Arrange / Act / Assert: the answer is stored the way every constant
+        // is -- the low bits, sign-extended -- so an `int` whose top bit the
+        // operation set comes out negative.
+        assert_eq!(fold(BinOp::And, Width::Bits32, 12, 10), Some(8));
+        assert_eq!(fold(BinOp::Or, Width::Bits32, 12, 10), Some(14));
+        assert_eq!(fold(BinOp::Xor, Width::Bits32, 12, 10), Some(6));
+        assert_eq!(fold(BinOp::Xor, Width::Bits32, 0, -1), Some(-1));
+        assert_eq!(
+            fold(BinOp::Or, Width::Bits32, 0, i64::from(i32::MIN)),
+            Some(i64::from(i32::MIN))
+        );
     }
 
     #[test]

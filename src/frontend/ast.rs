@@ -79,6 +79,10 @@ pub enum StmtKind {
         step: Option<Expr>,
         body: Box<Stmt>,
     },
+    /// e.g., `break;`
+    Break,
+    /// e.g., `continue;`
+    Continue,
     /// e.g., `{ stmt1; stmt2; }`
     Block(Vec<BlockItem>),
 }
